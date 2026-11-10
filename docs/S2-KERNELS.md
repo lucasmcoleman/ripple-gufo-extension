@@ -113,4 +113,19 @@ windows 8 and 16, full layers, groups 1 and 2, both cache types, every row check
 `real-full-f32|f16` (80 heads, 8 KV heads, window 1024 / full, T = 3300 positions, 32-row ring chunks so the 1055-row
 ring wraps 3.1 times, rows sampled around window, ring and 128-multiple boundaries).
 
-RESULTS_PLACEHOLDER
+## Results (2026-11-10)
+
+- Compiled: `hip/kernels.hip.cpp` (gfx1151, strict FP, no warnings) and all three test binaries, built with
+  `nice -n 10 ... -j2` into `/server/staging/ripple-gufo/s2-kernels/build`. Register use: attention group 10 F32 131
+  VGPRs, no scratch spill reported for any kernel.
+- Host math test `ricursive_kernels_math_test`: PASS, 983,027 exhaustive checks (windows 0/1/2/8/16/1024, ring
+  capacities window..window+1024, positions to 5 capacities, visibility, first key, tiles, MinCapacity tight both
+  ways, GQA, RoPE pairing and angle vs the rotate_half form to 1.5e-16 per (1+pos), 100000 positions included).
+- GPU tests: **NOT RUN.** Every binary was tried twice through `gpu-lock-exec -w 120` (13:3x-13:43 and 13:43-14:03,
+  logs `/server/staging/ripple-gufo/s2-kernels/gpu-try1.log`, `gpu-try2.log`) and refused with exit 75, "GPU admission
+  lock held (Scriberr GPU job or another heavy model)". Recorded as: not run on GPU: lock held. No error numbers or twin
+  margins exist yet. All kernels are therefore UNVERIFIED on hardware.
+- Desk check: an independent Opus review (read only) found one test defect (GQA twin identical when kv_heads = 1;
+  fixed, guard `c.kv > 1`) and no kernel defects. This is not a substitute for running the tests.
+- To run later: `tests/kernels/run-gpu-tests.sh build-kernels` (table: PASS / FAIL / SKIP(lock) / SKIP(no GPU)).
+  The table logic was exercised with a fake lock wrapper only.
