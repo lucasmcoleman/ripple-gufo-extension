@@ -189,7 +189,10 @@ Tested paths: `tests/run-gpu-gates-selftest.sh` (fake wrapper and fake binaries,
 the dependent gates; one executor invocation FAIL; SKIP(77); lock refused on the first call (one wrapper call, no retry);
 lock lost mid-run; timeout; ONLY; missing binary; LIST). The real wrapper was exercised once on the refused path
 (`ONLY='^kernel_ops:' GPU_LOCK_WAIT=5`, 14:33): exit 75 after 6.0 s, table showed LOCKED(75) with the wrapper's line,
-exit status 2 (log `/server/staging/ripple-gufo/gpu-gates/20261110-143349`).
+exit status 2 (log `/server/staging/ripple-gufo/gpu-gates/20261110-143349`). The whole script was then run once at 14:43 with the
+default 120 s wait: **not run on GPU: lock held** (kernel_ops LOCKED(75) after 120.0 s, "GPU admission lock held (Scriberr GPU
+job or another heavy model)", the other 36 invocations LOCKED "not tried" or NOT-RUN, exit 2, log
+`/server/staging/ripple-gufo/gpu-gates/20261110-144344`). Nothing else was attempted.
 
 ## 7. Notes for other owners (nothing in `src/**` or other owners' files was edited)
 
@@ -219,7 +222,7 @@ the gate script against the real wrapper on the refused path, `kernels_math_test
 Compiled for the GPU but **never run**: `hip/kernels.hip.cpp` (gfx1151, strict flags, no warnings), `hip/ops_gpu.cpp`,
 `hip/device_model.cpp` (both as ordinary C++ against the HIP headers, like Gemma's executor), the three kernel test programs,
 `ricursive_executor_gpu_test`, `ricursive_executor_contract_gpu_test`. GPU lock: refused (exit 75, "Scriberr GPU job or
-another heavy model") at 14:33; nothing was loaded, unloaded or killed.
+another heavy model") at 14:33 and 14:43; nothing was loaded, unloaded or killed.
 
 Everything below is unverified until a GPU run:
 - all of `GpuOps` and `DeviceModel` (stream creation, hipMalloc, async copies and stream order against the null-stream upload
