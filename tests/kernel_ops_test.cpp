@@ -196,8 +196,9 @@ void TestScaleRows() {
 void TestValueMix() {
   std::cout << "ValueMix\n";
   const std::uint32_t rows = 6, dim = 5120;
+  std::uint64_t seed = 4000;
   for (float lambda : {0.37F, -3.2F, 1.9F, 6.0F, -100.0F, 100.0F, 0.0F}) {
-    Rng rng(4000 + static_cast<std::uint64_t>(lambda * 100 + 1000));
+    Rng rng(seed++);
     auto x0 = Normal(rng, std::size_t{rows} * dim, 1.5);
     auto a = Normal(rng, std::size_t{rows} * dim, 0.8, 0.3);
     DevBuf<float> dx0(x0.size()), da(a.size()), dout(a.size()), dl(1);

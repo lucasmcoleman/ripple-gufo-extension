@@ -114,11 +114,10 @@ __device__ __forceinline__ void LoadKeys8(const float* row, int c,
 
 // ---- norms and elementwise kernels ------------------------------------------
 
-/// grid (rows), block kNormThreads.
-__global__ void RmsNormKernel(const float* __restrict__ x,
-                              const float* __restrict__ w,
-                              float* __restrict__ out, std::uint32_t dim,
-                              float eps) {
+/// grid (rows), block kNormThreads. x and out may be the same buffer (no
+/// restrict): each thread reads its element before it writes it.
+__global__ void RmsNormKernel(const float* x, const float* __restrict__ w,
+                              float* out, std::uint32_t dim, float eps) {
   const std::size_t base = std::size_t{blockIdx.x} * dim;
   const float total = BlockSumSquares(x + base, dim);
   const float scale = 1.0F / sqrtf(total / static_cast<float>(dim) + eps);

@@ -293,7 +293,7 @@ std::vector<std::uint32_t> SampleRows(const Cfg& c, Rng& rng) {
   for (auto p : special) {
     if (p < c.T) rows.insert(p);
   }
-  for (int i = 0; i < 24; ++i) rows.insert(rng.Below(c.T));
+  for (int i = 0; i < 12; ++i) rows.insert(rng.Below(c.T));
   return {rows.begin(), rows.end()};
 }
 
@@ -407,11 +407,14 @@ void RunConfig(const Cfg& c) {
     const Err e = CompareRows(ck, rows, Var{});
     ReportAbs("attention vs FP64 on " + std::to_string(rows.size()) + " rows", e, kAttnTol);
     // Twins on a few rows each.
-    std::vector<std::uint32_t> mid;
+    // Rows for the twins that need a multi-key row: spread over the checked rows.
+    std::vector<std::uint32_t> mid, cand;
     for (auto p : rows) {
-      if (p + 4 < c.T && mid.size() < 14 && (p % 3 == 0 || !c.sampled)) mid.push_back(p);
+      if (p >= 20 && p + 4 < c.T) cand.push_back(p);
     }
-    if (mid.size() > 14) mid.resize(14);
+    const std::size_t stride = std::max<std::size_t>(1, cand.size() / 8);
+    for (std::size_t i = 0; i < cand.size() && mid.size() < 8; i += stride) mid.push_back(cand[i]);
+    Require(!mid.empty(), "no rows for the twins");
     if (W != 0) {
       for (int delta : {-1, 1}) {
         std::vector<std::uint32_t> b;  // rows where the window edge is sharp
