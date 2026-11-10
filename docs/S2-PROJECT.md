@@ -161,9 +161,11 @@ GPU invocations: `tests/project/run-gpu-tests.sh` runs each case (and `embed_tes
   RMS relative error 0.0043..0.0056, max|diff|/row RMS 0.021..0.025 (limit 0.06), rms z 0.94..1.14 (the
   sigma_o model matches), excess 0.43..0.58 (limit 1). Twins on the CPU backend: type confusion non finite,
   transposed dims error 0.057..0.069 against 2e-9 correct, row/output off-by-one detected as unwritten.
-- GPU: NOT RUN. The admission lock was held by a Scriberr job (`gpu.lock.owner`: parakeet_rocm_transcribe.py,
-  pid 489, since 2026-09-30) at 13:35 and 13:37-13:39 (`gpu-lock-exec -w 30` and `-w 120` on the `reject`
-  invocation: exit 75 both times). Per the brief nothing else was tried. Not run on GPU: lock held.
+- GPU: NOT RUN. The admission lock was refused (exit 75, "GPU admission lock held") on `reject` at 13:35
+  (`-w 30`) and 13:37-13:39 (`-w 120`), and on `f32-tiny` at 13:41 (`-w 60`). `gpu.lock.owner` names a
+  Scriberr job (pid 489, since 2026-09-30) but says "last-holder metadata only" and pid 489 is gone, so the
+  real holder (a resident model) is unknown. Nothing was unloaded or run outside the lock.
+  Not run on GPU: lock held.
 
 ## Unverified
 
