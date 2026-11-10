@@ -6,12 +6,18 @@
 #include <string>
 #include <vector>
 
+#include <gufo/ext/json.hpp>
+#include <gufo/ext/sampling.hpp>
+
 #include "src/output_parser.hpp"
+#include "src/text/chat_template.hpp"
 #include "tests/check.hpp"
 
 using namespace ricursive_test;
 using namespace gufo::models::ricursive;
 namespace ext = gufo::ext;
+namespace sampling = gufo::sampling;
+namespace rt = ::ricursive::text;
 
 namespace {
 
@@ -294,6 +300,58 @@ void ScannerChecks() {
             << " with a call, " << saw_open << " with an open string, all growth-only\n";
 }
 
+// ---- the dialect's grammar against the template's own call text -----------------
+
+/// Index of the first byte of `text` the grammar refuses, or npos when it
+/// accepts all of it and is complete.
+std::size_t FirstRefusedByte(const sampling::JsonConstraint::ToolSyntax& syntax, std::string_view text) {
+  using gufo::sampling::JsonConstraint;
+  const auto schema = gufo::json::parse(
+      R"({"type":"object","properties":{"command":{"type":"string"},"n":{"type":"integer"}},"required":["command"],"additionalProperties":false})");
+  const auto parameters = JsonConstraint::ToolParameters(schema, false, syntax);
+  const auto grammar =
+      JsonConstraint::WithTools(nullptr, {{"execute_bash", parameters}}, true, false, syntax);
+  auto state = grammar->Start();
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    state = grammar->Advance(state, static_cast<unsigned char>(text[i]));
+    if (state.empty()) return i;
+  }
+  return grammar->Complete(state) ? std::string_view::npos : text.size();
+}
+
+void GrammarChecks() {
+  rt::JsonValue messages;
+  Require(rt::ParseJson(
+              R"([{"role":"user","content":"x"},{"role":"assistant","content":"","tool_calls":[{"function":{"name":"execute_bash","arguments":{"command":"pwd","n":3}}}]}])",
+              &messages),
+          "messages json");
+  std::string error;
+  const auto rendered = rt::RenderChat(messages, nullptr, {}, &error);
+  Require(rendered.has_value(), error);
+  const std::size_t open = rendered->find(kToolCallOpen);
+  const std::size_t close = rendered->find(kToolCallClose);
+  Require(open != std::string::npos && close != std::string::npos, "rendered call");
+  const std::string call = rendered->substr(open, close + kToolCallClose.size() - open);
+  const auto dialect = MakeToolDialect();
+  const std::size_t refused = FirstRefusedByte(*dialect.syntax, call);
+  Require(refused == std::string_view::npos,
+          "the grammar refuses the template's own call at byte " + std::to_string(refused) + " of: " + call);
+  // The host scanner reads the same text back.
+  std::vector<ext::ScannedToolCall> calls;
+  const std::string_view markers[] = {kToolCallOpen};
+  ScanToolCalls(call, markers, &calls, nullptr, false);
+  Require(calls.size() == 1 && calls[0].name == "execute_bash" && calls[0].complete && calls[0].valid &&
+              calls[0].arguments.size() == 2 && calls[0].arguments[1].value == "3",
+          "scanner reads the rendered call");
+  // Twin: no space after the comma in the call header; the template writes one.
+  auto broken = *dialect.syntax;
+  broken.name_suffix = "\",\"arguments\": ";
+  const std::size_t twin = FirstRefusedByte(broken, call);
+  std::cout << "  grammar: accepts the template's call (" << call.size() << " bytes, `" << call.substr(0, 40)
+            << "...`); twin header without the space refuses at byte " << twin << '\n';
+  Require(twin != std::string_view::npos, "the broken header twin must be refused");
+}
+
 }  // namespace
 
 int main() {
@@ -337,6 +395,7 @@ int main() {
             "ReadCallBlock twin must misread the nested call");
 
     ScannerChecks();
+    GrammarChecks();
     PrintTwinSummary();
   });
 }
