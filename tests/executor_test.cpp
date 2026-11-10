@@ -75,15 +75,10 @@ std::unique_ptr<Executor> Make(const Fixture& f, const ExecutorConfig& c,
   return g_backend.make(f.model, c, faults, lenient);
 }
 
-/// Max abs difference; NaN or a size mismatch is infinite.
+/// Max abs difference; NaN, Inf or a size mismatch is infinite (tests/check.hpp).
 double MaxAbs(std::span<const float> a, std::span<const float> b) {
   if (a.size() != b.size()) return INFINITY;
-  double m = 0;
-  for (std::size_t i = 0; i < a.size(); ++i) {
-    const double d = std::abs(static_cast<double>(a[i]) - b[i]);
-    if (!(d <= m)) m = std::isnan(d) ? INFINITY : d;
-  }
-  return m;
+  return MaxAbsDiff(a, b);
 }
 
 /// Feeds t[from, to) in chunks of `sizes` (the last repeats), all-row logits.

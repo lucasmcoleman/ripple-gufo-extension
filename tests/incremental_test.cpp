@@ -15,13 +15,10 @@ constexpr double kTol = 1e-5;
 constexpr std::size_t kMaxRewind = 64;
 constexpr std::size_t kBroken = 100;  // sentinel: "must differ"
 
+// NaN or Inf in either input gives +infinity (tests/check.hpp); the old loop kept
+// the last difference seen once a NaN had been stored, so a NaN could be lost.
 double MaxDiff(const float* a, const float* b, std::size_t n) {
-  double m = 0;
-  for (std::size_t i = 0; i < n; ++i) {
-    const double d = std::abs(static_cast<double>(a[i]) - b[i]);
-    if (!(d <= m)) m = d;  // also propagates NaN
-  }
-  return m;
+  return MaxAbsDiff(std::span<const float>(a, n), std::span<const float>(b, n));
 }
 
 using Tokens = std::vector<std::int32_t>;
@@ -236,7 +233,7 @@ void Taps(const Fixture& f) {
     const auto it = inc_taps.find(key);
     Require(it != inc_taps.end() && it->second.size() == vals.size(),
             "missing tap " + key.first + "-" + std::to_string(key.second));
-    worst = std::max(worst, MaxDiff(vals.data(), it->second.data(), vals.size()));
+    worst = MaxKeepNaN(worst, MaxDiff(vals.data(), it->second.data(), vals.size()));
   }
   // The last tap is the logits themselves; the first global tap is the scaled
   // embedding (not all-zero: taps carry data).

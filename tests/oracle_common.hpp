@@ -8,6 +8,8 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
+#include <span>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -69,8 +71,12 @@ struct Stats {
 
 /// Compares `ref` against `base` (llama.cpp): |difference|, mean KL(base ||
 /// ref) over positions, and the fraction of positions with equal argmax.
+/// A NaN or Inf anywhere in either input makes the result unmistakably bad:
+/// finite = false, max_abs = mean_abs = mean_kl = +inf, top1 = 0 (an all-NaN row
+/// has no argmax and must not agree with one).
 inline Stats Compare(const std::vector<float>& ref, const std::vector<float>& base,
                      std::size_t vocab) {
+  Require(vocab > 0 && !ref.empty(), "Compare: empty logits");
   Require(ref.size() == base.size() && ref.size() % vocab == 0,
           "logit size mismatch: " + std::to_string(ref.size()) + " vs " +
               std::to_string(base.size()));
@@ -79,19 +85,19 @@ inline Stats Compare(const std::vector<float>& ref, const std::vector<float>& ba
   double sum_abs = 0, sum_kl = 0;
   std::size_t agree = 0;
   for (std::size_t t = 0; t < T; ++t) {
-    const float* a = &ref[t * vocab];
-    const float* b = &base[t * vocab];
-    std::size_t am = 0, bm = 0;
-    double amax = a[0], bmax = b[0];
+    const std::span<const float> a(&ref[t * vocab], vocab);
+    const std::span<const float> b(&base[t * vocab], vocab);
+    const auto am = StrictArgMax(a);
+    const auto bm = StrictArgMax(b);
+    if (!am || !bm) {  // a NaN/Inf row: no argmax, no meaningful statistics
+      s.finite = false;
+      continue;
+    }
+    const double amax = a[*am], bmax = b[*bm];
     for (std::size_t i = 0; i < vocab; ++i) {
-      if (!std::isfinite(a[i]) || !std::isfinite(b[i])) s.finite = false;
       const double d = std::abs(static_cast<double>(a[i]) - b[i]);
       s.max_abs = std::max(s.max_abs, d);
       sum_abs += d;
-      if (a[i] > a[am]) am = i;
-      if (b[i] > b[bm]) bm = i;
-      amax = std::max<double>(amax, a[i]);
-      bmax = std::max<double>(bmax, b[i]);
     }
     double za = 0, zb = 0;
     for (std::size_t i = 0; i < vocab; ++i) {
@@ -105,12 +111,16 @@ inline Stats Compare(const std::vector<float>& ref, const std::vector<float>& ba
       kl += std::exp(lpb) * (lpb - lpa);
     }
     sum_kl += kl;
-    if (am == bm) ++agree;
+    if (*am == *bm) ++agree;
   }
   s.mean_abs = sum_abs / static_cast<double>(ref.size());
   s.mean_kl = sum_kl / static_cast<double>(T);
   s.top1 = static_cast<double>(agree) / static_cast<double>(T);
-  if (s.max_abs != s.max_abs) s.finite = false;
+  if (!s.finite || !std::isfinite(s.max_abs) || !std::isfinite(s.mean_kl)) {
+    s.finite = false;
+    s.max_abs = s.mean_abs = s.mean_kl = std::numeric_limits<double>::infinity();
+    s.top1 = 0;
+  }
   return s;
 }
 

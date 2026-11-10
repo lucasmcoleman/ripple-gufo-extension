@@ -8,6 +8,8 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -76,6 +78,71 @@ class Rng {
   double spare_ = 0;
 };
 
+// ---- NaN / Inf safe comparison helpers ------------------------------------------------
+// A NaN compares false with everything: `d > tol` is false, std::max(0, NaN) is 0,
+// `a[i] > a[best]` never selects a NaN row. A check written with those idioms accepts
+// a device result that is NaN everywhere. Every comparison in the tests goes through
+// the helpers below (or the `!(d <= tol)` idiom), and tests/nan_guard_test.cpp feeds
+// them NaN and Inf.
+
+/// True when every value is finite (not NaN, not +-Inf).
+inline bool AllFinite(std::span<const float> v) {
+  for (const float x : v)
+    if (!std::isfinite(x)) return false;
+  return true;
+}
+
+/// Max |a[i] - b[i]|, or +infinity when any value of either input is NaN or +-Inf (so
+/// two runs that agree on a non-finite value still fail). Never NaN. Sizes must match.
+inline double MaxAbsDiff(std::span<const float> a, std::span<const float> b) {
+  if (a.size() != b.size()) throw std::runtime_error("compared spans differ in size");
+  double m = 0;
+  bool bad = false;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+      bad = true;
+      continue;
+    }
+    const double d = std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
+    if (d > m) m = d;
+  }
+  return bad ? std::numeric_limits<double>::infinity() : m;
+}
+
+/// Maximum that keeps a NaN: NaN if either argument is NaN (std::max drops it).
+inline double MaxKeepNaN(double a, double b) {
+  if (std::isnan(a) || std::isnan(b)) return std::numeric_limits<double>::quiet_NaN();
+  return a > b ? a : b;
+}
+
+/// True when the measure `d` is NOT within `tol`; NaN is not within any tolerance.
+inline bool Exceeds(double d, double tol) { return !(d <= tol); }
+
+/// Index of the largest logit, or nullopt when the span is empty or holds a NaN/Inf
+/// (an all-NaN row must not agree with any reference argmax).
+inline std::optional<std::size_t> StrictArgMax(std::span<const float> v) {
+  if (v.empty() || !AllFinite(v)) return std::nullopt;
+  std::size_t best = 0;
+  for (std::size_t i = 1; i < v.size(); ++i)
+    if (v[i] > v[best]) best = i;
+  return best;
+}
+
+/// max(0, |got - ref| - allow) with +infinity for any non-finite input
+/// (std::max(0.0, NaN) is 0.0).
+inline double ExcessOver(double got, double ref, double allow) {
+  if (!std::isfinite(got) || !std::isfinite(ref) || !std::isfinite(allow))
+    return std::numeric_limits<double>::infinity();
+  return std::max(0.0, std::fabs(got - ref) - allow);
+}
+
+/// Bytes equal AND every float finite (two runs that are NaN in the same place are
+/// not "equal" in any sense a test cares about).
+inline bool BitEqualFinite(const std::vector<float>& a, const std::vector<float>& b) {
+  return a.size() == b.size() && AllFinite(a) && AllFinite(b) &&
+         std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+}
+
 // ---- error statistics -------------------------------------------------------------
 
 /// Max abs error of `got` against `ref`, and the largest |ref| seen. A NaN in
@@ -109,17 +176,19 @@ inline std::string Sci(double v) {
 
 /// Prints one result line and requires max abs error <= tol_abs.
 inline void ReportAbs(const std::string& what, const Err& e, double tol_abs) {
+  Require(e.n > 0, what + ": nothing was compared");
   std::cout << "  " << what << ": max abs " << Sci(e.max_abs) << ", rel to max|ref| "
             << Sci(e.Rel()) << " (n=" << e.n << "), tolerance " << Sci(tol_abs) << "\n";
-  Require(e.max_abs <= tol_abs, what + ": max abs error " + Sci(e.max_abs) +
+  Require(!Exceeds(e.max_abs, tol_abs), what + ": max abs error " + Sci(e.max_abs) +
                                     " exceeds " + Sci(tol_abs));
 }
 
 /// Prints one result line and requires the error relative to max|ref| <= tol.
 inline void ReportRel(const std::string& what, const Err& e, double tol_rel) {
+  Require(e.n > 0, what + ": nothing was compared");
   std::cout << "  " << what << ": max abs " << Sci(e.max_abs) << ", rel to max|ref| "
             << Sci(e.Rel()) << " (n=" << e.n << "), tolerance " << Sci(tol_rel) << " rel\n";
-  Require(e.Rel() <= tol_rel, what + ": relative error " + Sci(e.Rel()) + " exceeds " +
+  Require(!Exceeds(e.Rel(), tol_rel), what + ": relative error " + Sci(e.Rel()) + " exceeds " +
                                   Sci(tol_rel));
 }
 
@@ -143,6 +212,8 @@ inline std::vector<TwinRecord>& Twins() {
 /// meaningless. Records the achieved factor.
 inline void RequireTwinFails(const std::string& name, double good, double twin,
                              double floor = 1e-7, double factor = 100.0) {
+  Require(std::isfinite(good), "twin '" + name + "': the correct kernel's error is not finite (" +
+                                   Sci(good) + "), so the comparison proves nothing");
   const double ratio = twin / std::max(good, floor);
   std::cout << "  twin '" << name << "': error " << Sci(twin) << " vs correct "
             << Sci(good) << " (floor " << Sci(floor) << "), factor " << Sci(ratio)

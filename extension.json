@@ -203,6 +203,19 @@
         "testing"
       ],
       "role": "test"
+    },
+    "ricursive_nan_guard_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_gpu_logits": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
     }
   },
   "licenses": [

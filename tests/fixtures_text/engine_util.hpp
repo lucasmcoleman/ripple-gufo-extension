@@ -2,6 +2,7 @@
 #ifndef RICURSIVE_TESTS_ENGINE_UTIL_HPP_
 #define RICURSIVE_TESTS_ENGINE_UTIL_HPP_
 
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <memory>
@@ -34,7 +35,26 @@ inline std::vector<TinyFixture> TinyFixtures() {
   return {{"tinyA", FixtureDir() + "/tinyA.gguf", 8}, {"tinyB", FixtureDir() + "/tinyB.gguf", 16}};
 }
 
-/// A CPU-backend model (template check off: the tiny files have none).
+/// Backend of the engine tests: RICURSIVE_TEST_BACKEND = cpu (default, the scalar
+/// executor), gpu-exact (the GPU executor with F32 caches and no activation
+/// rounding: comparable with the Reference to about 1e-5; only through the GPU
+/// lock, tests/run-gpu-gates.sh) or gpu (production F16 caches). Twins built from
+/// CpuExecutor::Faults always run on the CPU executor.
+inline BackendChoice TestBackend() {
+  const char* env = std::getenv("RICURSIVE_TEST_BACKEND");
+  const std::string name = env != nullptr ? env : "cpu";
+  if (name == "cpu") return CpuBackend();
+  BackendChoice choice = GpuBackend();
+  if (name == "gpu-exact") {
+    choice.kv_type = KvType::kF32;
+    choice.exact = true;
+    return choice;
+  }
+  Require(name == "gpu", "RICURSIVE_TEST_BACKEND must be cpu, gpu-exact or gpu, not " + name);
+  return choice;
+}
+
+/// A model on TestBackend() (template check off: the tiny files have none).
 /// `faults` builds every session's executor with deliberate defects.
 inline std::shared_ptr<EngineModel> LoadCpu(const std::string& path, std::uint32_t context,
                                       std::uint32_t rows, std::uint32_t chunk = 4,
@@ -44,7 +64,7 @@ inline std::shared_ptr<EngineModel> LoadCpu(const std::string& path, std::uint32
   options.prefill_rows = rows;
   options.window_chunk_rows = chunk;
   options.allow_template_mismatch = true;
-  options.backend = CpuBackend();
+  options.backend = TestBackend();
   if (faults != nullptr) {
     const CpuExecutor::Faults f = *faults;
     options.executor_override = [f](const ModelWeights& w, const ExecutorConfig& c,
@@ -65,23 +85,14 @@ inline std::unique_ptr<Session> NewSession(const std::shared_ptr<EngineModel>& m
   return session;
 }
 
+/// Greedy token; a NaN or Inf in the logits is a failure, not "token 0".
 inline std::int32_t Argmax(std::span<const float> logits) {
-  std::size_t best = 0;
-  for (std::size_t i = 1; i < logits.size(); ++i) {
-    if (logits[i] > logits[best]) best = i;
-  }
-  return static_cast<std::int32_t>(best);
+  const auto best = StrictArgMax(logits);
+  Require(best.has_value(), "Argmax: empty or non-finite logits");
+  return static_cast<std::int32_t>(*best);
 }
 
-inline double MaxAbsDiff(std::span<const float> a, std::span<const float> b) {
-  Require(a.size() == b.size(), "compared spans differ in size");
-  double m = 0;
-  for (std::size_t i = 0; i < a.size(); ++i) {
-    const double d = std::abs(static_cast<double>(a[i]) - b[i]);
-    if (!(d <= m)) m = d;  // NaN propagates
-  }
-  return m;
-}
+// MaxAbsDiff (NaN/Inf give +infinity) comes from tests/check.hpp.
 
 /// Greedy continuation after `prompt`, by running the scalar Reference's full
 /// forward on the whole sequence for every token (no cache, no ring).

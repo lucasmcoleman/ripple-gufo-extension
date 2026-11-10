@@ -644,8 +644,8 @@ void RunShape(Backend& b, const ShapeCase& c, const Options& opt) {
         const double d = double{fast[r * m + o]} - single[r * m + o];
         err2 += d * d;
         ref2 += double{single[r * m + o]} * single[r * m + o];
-        worst_ratio = std::max(worst_ratio, std::fabs(d) / rms);
-        if (std::fabs(d) > 0.06 * rms) {
+        worst_ratio = std::isnan(d) ? d : std::max(worst_ratio, std::fabs(d) / rms);
+        if (!(std::fabs(d) <= 0.06 * rms)) {  // NaN is not within the limit
           throw std::runtime_error(name + ": rows=" + std::to_string(rows) + " normal mode: row " +
                                    std::to_string(r) + " column " + std::to_string(o) + " differs from the exact result by " +
                                    std::to_string(d) + " (> 0.06 x row RMS " + std::to_string(rms) + ")");

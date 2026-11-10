@@ -397,3 +397,38 @@ if(TARGET ricursive_chat_e2e_test)
     FIXTURES_REQUIRED ricursive_chat_fixture)
 endif()
 # --- WP-D engine end ---
+
+# --- integration begin ---
+# GPU factory glue (hip/gpu_executor_factory.*, docs/INTEGRATION.md): provides
+# CreateGpuExecutor, which the engine (src/executor_factory.cpp) calls when
+# RICURSIVE_HAVE_GPU_EXECUTOR is defined. HIP builds only. gufo_ricursive and
+# gufo_ricursive_gpuexec reference each other (static libraries, CMake repeats
+# them on the link line).
+if(TARGET gufo_ricursive AND TARGET gufo_ricursive_gpuexec)
+  target_sources(gufo_ricursive_gpuexec PRIVATE
+    ${GUFO_EXTENSION_BUILD_ROOT}/hip/gpu_executor_factory.cpp)
+  target_compile_definitions(gufo_ricursive_gpuexec PRIVATE
+    RICURSIVE_HAVE_GPU_EXECUTOR=1)
+  target_compile_definitions(gufo_ricursive PRIVATE RICURSIVE_HAVE_GPU_EXECUTOR=1)
+  target_link_libraries(gufo_ricursive PUBLIC gufo_ricursive_gpuexec)
+endif()
+
+# NaN/Inf guard for every comparison helper in tests/ (CPU).
+_ricursive_test(nan_guard
+  SOURCES tests/nan_guard_test.cpp LINK_LIBRARIES gufo_ricursive)
+
+# Tool, built on request: ricursive_gpu_logits MODEL.gguf TOKENS.i32 OUT.f32
+#   [--rows N] [--kv f16|f32] [--exact] [--context-cap N] [--last-only]
+# Teacher-forced logits through the production executor (GPU, or the CPU
+# backend with RICURSIVE_BACKEND=cpu). Executables are `test` role targets, so
+# it needs BUILD_TESTING (the release build for the real run sets it).
+gufo_extension_target(
+  NAME ricursive_gpu_logits
+  SOURCES tools/gpu_logits.cpp
+  LINK_LIBRARIES gufo_ricursive gufo_ricursive_gpuexec gufo_ext_runtime
+    gufo_ext_core gufo_ext_hip
+)
+if(TARGET ricursive_gpu_logits)
+  set_target_properties(ricursive_gpu_logits PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+# --- integration end ---

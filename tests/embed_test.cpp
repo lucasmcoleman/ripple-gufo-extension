@@ -446,6 +446,7 @@ void CheckDevice(const std::string& path) {
   std::vector<float> got(want.size());
   Require(hipMemcpy(got.data(), dev, got.size() * 4, hipMemcpyDeviceToHost) == hipSuccess, "copy back");
   (void)hipFree(dev);
+  for (const float x : got) Require(std::isfinite(x), "device rows hold a NaN or Inf (unwritten 0xFF pattern?)");
   Require(std::memcmp(got.data(), want.data(), got.size() * 4) == 0, "device rows differ from host rows");
   std::cout << "device copy: " << ids.size() << " rows of " << path << " round-trip bit-equal\n";
 }

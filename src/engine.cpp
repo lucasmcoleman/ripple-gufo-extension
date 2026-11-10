@@ -8,6 +8,10 @@
 
 #include "text/chat_template.hpp"
 
+#if defined(RICURSIVE_HAVE_GPU_EXECUTOR)
+#include "hip/gpu_executor_factory.hpp"
+#endif
+
 namespace gufo::models::ricursive {
 namespace {
 
@@ -111,6 +115,11 @@ std::shared_ptr<Model> Model::Load(const std::string& path, const ModelOptions& 
       return nullptr;
     }
     auto model = std::shared_ptr<Model>(new Model(*weights, reader));
+#if defined(RICURSIVE_HAVE_GPU_EXECUTOR)
+    // CreateGpuExecutor receives only the weights table; the device upload needs
+    // the reader it was resolved from (docs/INTEGRATION.md, mismatch 1).
+    RegisterGpuWeightsReader(model->weights_, reader);
+#endif
     const Config& c = model->config();
 
     // The renderer implements one template; another one would silently give

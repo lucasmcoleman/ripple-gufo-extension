@@ -14,6 +14,17 @@
 #   embed             -                   (embed_test gpu: host lookup + device copy)
 #   executor_test     kernel_ops attention_ops projection_ops embed   (every filter)
 #   executor_contract executor_test       (contract suite on the GPU backend)
+#   engine_tests      executor_contract   (engine_test, continuation_test with the GPU backend,
+#                                          RICURSIVE_TEST_BACKEND=gpu-exact: F32 caches, no activation
+#                                          rounding, so they stay comparable with the scalar Reference;
+#                                          their twins still run on the CPU executor. output_parser,
+#                                          chat_e2e and the rest are CPU-only by design)
+#   engine_logits     executor_contract   (ricursive_gpu_logits on tinyA/tinyB, 4 sequences each:
+#                                          --kv f32 --exact vs llama.cpp F32 (2e-3, top-1 100%) and
+#                                          --kv f16 vs llama.cpp --kv-f16 (2e-2, top-1 100%), scored by
+#                                          tools/score_logits.py; tests/gate-logits.sh)
+#   engine_prompt     engine_logits      (`gufo prompt` smoke with the GPU backend on the tiny chat
+#                                          fixture; tests/gate-prompt.sh)
 #
 # Rules: never a GPU program outside the lock wrapper:
 #   GPU_ADMISSION_LOCK=/server/state/gpu-admission/gpu.lock gpu-lock-exec -w WAIT -- CMD
@@ -32,7 +43,10 @@
 # NOT-RUN (a prerequisite did not PASS).
 # Exit: 0 all PASS; 1 at least one FAIL; 2 no FAIL but something unverified.
 set -u
-BUILD_DIR=${BUILD_DIR:-/server/programming/gufo-ripple/build-test/extensions/build/ricursive/build}
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+export BUILD_DIR=${BUILD_DIR:-/server/programming/gufo-ripple/build-test/extensions/build/ricursive/build}
+export GUFO_BIN=${GUFO_BIN:-/server/programming/gufo-ripple/build-ric-release/gufo}
+export CHAT_FIXTURE=${CHAT_FIXTURE:-$BUILD_DIR/chat-tiny.gguf}
 WAIT=${GPU_LOCK_WAIT:-120}
 INV_TIMEOUT=${INVOCATION_TIMEOUT:-180}
 LOCK_EXEC=${GPU_LOCK_EXEC:-/server/staging/gpu-serialization-20260929/gpu-lock-exec}
@@ -40,7 +54,8 @@ export GPU_ADMISSION_LOCK=${GPU_ADMISSION_LOCK:-/server/state/gpu-admission/gpu.
 OUT_ROOT=${GATES_OUT:-/server/staging/ripple-gufo/gpu-gates}
 ONLY=${ONLY:-}
 
-GATES=(kernel_ops attention_ops projection_ops embed executor_test executor_contract)
+GATES=(kernel_ops attention_ops projection_ops embed executor_test executor_contract
+       engine_tests engine_logits engine_prompt)
 declare -A DEPS=(
   [kernel_ops]=""
   [attention_ops]="kernel_ops"
@@ -48,9 +63,13 @@ declare -A DEPS=(
   [embed]=""
   [executor_test]="kernel_ops attention_ops projection_ops embed"
   [executor_contract]="executor_test"
+  [engine_tests]="executor_contract"
+  [engine_logits]="executor_contract"
+  [engine_prompt]="engine_logits"
 )
 
-# gate -> lines "label|binary|arguments|NAME=value ..." (the lists are fixed here on
+# gate -> lines "label|binary|arguments|NAME=value ..." ("binary" is relative to BUILD_DIR,
+# "@name" is a helper script next to this one, an absolute path is used as is; the lists are fixed here on
 # purpose: asking a GPU binary for its list would run it outside the lock).
 invocations() {
   case $1 in
@@ -79,6 +98,16 @@ invocations() {
       for b in gpu-f32-exact gpu-f16; do
         echo "$b|ricursive_executor_contract_gpu_test||RICURSIVE_CONTRACT_BACKEND=$b"
       done ;;
+    engine_tests)
+      echo "engine|ricursive_engine_test||RICURSIVE_TEST_BACKEND=gpu-exact"
+      echo "continuation|ricursive_continuation_test||RICURSIVE_TEST_BACKEND=gpu-exact" ;;
+    engine_logits)
+      for m in f32 f16; do
+        echo "tinyA-$m|@gate-logits.sh|tinyA.gguf tinyA $m|"
+        echo "tinyB-$m|@gate-logits.sh|tinyB.gguf tinyB $m|"
+      done ;;
+    engine_prompt)
+      echo "gufo-prompt|@gate-prompt.sh||" ;;
   esac
 }
 
@@ -141,9 +170,14 @@ for gate in "${GATES[@]}"; do
     fi
     n=$((n + 1))
     log="$LOGDIR/$(printf '%02d' "$n")-$gate-${label//[^A-Za-z0-9._-]/_}.log"
-    if [ ! -x "$BUILD_DIR/$bin" ]; then
-      echo "binary not built: $BUILD_DIR/$bin" >"$log"
-      add_row "$gate" "$label" FAIL 0 "binary not built: $BUILD_DIR/$bin"
+    case $bin in
+      /*) exe=$bin ;;
+      @*) exe=${GATE_HELPER_DIR:-$HERE}/${bin#@} ;;
+      *)  exe=$BUILD_DIR/$bin ;;
+    esac
+    if [ ! -x "$exe" ]; then
+      echo "binary not built: $exe" >"$log"
+      add_row "$gate" "$label" FAIL 0 "binary not built: $exe"
       gate_fail=1
       any_fail=1
       continue
@@ -151,7 +185,7 @@ for gate in "${GATES[@]}"; do
     start=$(date +%s%N)
     # shellcheck disable=SC2086
     env OMP_NUM_THREADS=${OMP_NUM_THREADS:-4} $envs "$LOCK_EXEC" -w "$WAIT" -- \
-      timeout --kill-after=10 "$INV_TIMEOUT" "$BUILD_DIR/$bin" $args >"$log" 2>&1
+      timeout --kill-after=10 "$INV_TIMEOUT" "$exe" $args >"$log" 2>&1
     rc=$?
     secs=$(awk -v a="$start" -v b="$(date +%s%N)" 'BEGIN{printf "%.1f", (b-a)/1e9}')
     case $rc in

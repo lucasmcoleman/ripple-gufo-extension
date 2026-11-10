@@ -236,9 +236,8 @@ Result RunPlan(const Cfg& c, const Data& d, std::uint32_t capacity, const Chunks
   return r;
 }
 
-bool BitEqual(const std::vector<float>& a, const std::vector<float>& b) {
-  return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
-}
+// Bytes equal and every value finite (tests/check.hpp).
+bool BitEqual(const std::vector<float>& a, const std::vector<float>& b) { return BitEqualFinite(a, b); }
 
 void Upd(double& m, double e) {
   if (std::isnan(e)) e = std::numeric_limits<double>::infinity();
@@ -352,9 +351,10 @@ void RunConfig(const Cfg& c) {
         RefNormRope(x, d.gk, p, c.rotary == 0, table, twin);
         for (std::uint32_t i = 0; i < D; ++i) {
           const double g = ck.Kst[(std::size_t{p} * c.kv + h) * D + i];
-          const double allow = f16 ? 0.5 * std::max(Ulp16(ref[i]), Ulp16(g)) : 0.0;
-          Upd(kq_good, std::max(0.0, std::fabs(g - ref[i]) - allow) / hm);
-          Upd(kq_twin, std::max(0.0, std::fabs(g - twin[i]) - allow) / hm);
+          // ExcessOver: +inf for a NaN/Inf g (std::max(0.0, NaN) would be 0.0).
+          const double allow = f16 ? 0.5 * std::max(Ulp16(ref[i]), Ulp16(std::isfinite(g) ? g : 0.0)) : 0.0;
+          Upd(kq_good, ExcessOver(g, ref[i], allow) / hm);
+          Upd(kq_twin, ExcessOver(g, twin[i], allow) / hm);
           Upd(k_raw, std::fabs(g - ref[i]));
         }
       }

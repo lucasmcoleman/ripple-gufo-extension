@@ -40,9 +40,8 @@ std::vector<float> Normal(Rng& rng, std::size_t n, double sigma, double mean = 0
   return v;
 }
 
-bool BitEqual(const std::vector<float>& a, const std::vector<float>& b) {
-  return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
-}
+// Bytes equal and every value finite (tests/check.hpp).
+bool BitEqual(const std::vector<float>& a, const std::vector<float>& b) { return BitEqualFinite(a, b); }
 
 // ---- RmsNorm -----------------------------------------------------------------------
 

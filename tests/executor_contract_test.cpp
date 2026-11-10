@@ -63,14 +63,10 @@ struct Outcome {
   }
 };
 
+// NaN or Inf in either input gives +infinity (tests/check.hpp), so two runs that are
+// NaN in the same place no longer "agree".
 double MaxDiff(std::span<const float> a, std::span<const float> b) {
-  Require(a.size() == b.size(), "compared spans differ in size");
-  double m = 0;
-  for (std::size_t i = 0; i < a.size(); ++i) {
-    const double d = std::abs(static_cast<double>(a[i]) - b[i]);
-    if (!(d <= m)) m = d;  // NaN propagates
-  }
-  return m;
+  return MaxAbsDiff(a, b);
 }
 
 ExecutorConfig Config(const Ctx& c, std::uint32_t max_rows) {
@@ -187,8 +183,8 @@ Outcome ChunkedVsOneShot(const Ctx& c) {
     std::size_t widest = 0;
     const auto logits = Feed(*e, c.f.t, 0, kSeq, plan, &widest);
     const double d = MaxDiff(logits, whole);
-    o.measure = std::max(o.measure, d);
-    if (d > std::max(Tol(c, *one, kSeq), Tol(c, *e, widest)))
+    o.measure = MaxKeepNaN(o.measure, d);
+    if (Exceeds(d, std::max(Tol(c, *one, kSeq), Tol(c, *e, widest))))
       o.Fail("plan starting " + std::to_string(plan[0]) + " differs by " +
              std::to_string(d));
   }
@@ -209,9 +205,9 @@ Outcome DecodeVsPrefill(const Ctx& c) {
   std::vector<float> row(V);
   for (std::uint32_t p = P; p < kSeq; ++p) {
     e->Forward(std::span(c.f.t).subspan(p, 1), p, LogitRows::kLast, row);
-    o.measure = std::max(o.measure, MaxDiff(row, Rows(whole, V, p, p + 1)));
+    o.measure = MaxKeepNaN(o.measure, MaxDiff(row, Rows(whole, V, p, p + 1)));
   }
-  if (o.measure > std::max(Tol(c, *one, kSeq), Tol(c, *e, widest)))
+  if (Exceeds(o.measure, std::max(Tol(c, *one, kSeq), Tol(c, *e, widest))))
     o.Fail("decode differs from prefill by " + std::to_string(o.measure));
   return o;
 }
@@ -229,9 +225,9 @@ Outcome AgainstLlama(const Ctx& c) {
     auto e = c.make(Config(c, c.f.Rows()));
     const auto logits = Feed(*e, t, 0, t.size(), {c.f.Rows()});
     const Stats s = Compare(logits, llama, V);
-    o.measure = std::max(o.measure, s.max_abs);
+    o.measure = MaxKeepNaN(o.measure, s.max_abs);
     top1 = std::min(top1, s.top1);
-    if (!s.finite || s.max_abs > c.backend.llama_max_abs || s.top1 < 1)
+    if (!s.finite || Exceeds(s.max_abs, c.backend.llama_max_abs) || !(s.top1 >= 1))
       o.Fail("seq" + std::to_string(seq) + " max_abs " +
              std::to_string(s.max_abs) + " top1 " + std::to_string(s.top1));
   }
@@ -281,7 +277,7 @@ Outcome Restore(const Ctx& c, std::uint32_t n, ImportDefect defect) {
   const auto la = Feed(*a, c.f.t, n, kSeq, {3}, &widest);
   const auto lb = Feed(*b, c.f.t, n, kSeq, {3}, &widest);
   o.measure = MaxDiff(la, lb);
-  if (o.measure > Tol(c, *a, widest))
+  if (Exceeds(o.measure, Tol(c, *a, widest)))
     o.Fail("continuation differs by " + std::to_string(o.measure));
   if (ExportAll(*a, from()) != ExportAll(*b, from()))
     o.Fail("rows after the continuation differ");
@@ -334,8 +330,8 @@ Outcome Rewinds(const Ctx& c) {
   if (!threw) o.Fail("rewind beyond the position not refused");
   const double d = MaxDiff(Feed(*b, c.f.u, b->Position(), kSeq, {5}, &widest),
                            fresh(b->Position()));
-  o.measure = std::max(o.measure, d);
-  if (o.measure > Tol(c, *a, widest))
+  o.measure = MaxKeepNaN(o.measure, d);
+  if (Exceeds(o.measure, Tol(c, *a, widest)))
     o.Fail("continuation after rewind differs by " + std::to_string(o.measure));
   return o;
 }
@@ -410,8 +406,8 @@ Outcome Failure(const Ctx& c) {
   a->Reset();
   if (a->State() != ExecState::kReady || a->Position() != 0)
     o.Fail("Reset did not make the executor ready and empty");
-  o.measure = std::max(o.measure, MaxDiff(Feed(*a, c.f.t, 0, kSeq, {M}), whole));
-  if (o.measure > std::max(Tol(c, *one, kSeq), Tol(c, *a, widest)))
+  o.measure = MaxKeepNaN(o.measure, MaxDiff(Feed(*a, c.f.t, 0, kSeq, {M}), whole));
+  if (Exceeds(o.measure, std::max(Tol(c, *one, kSeq), Tol(c, *a, widest))))
     o.Fail("recovered run differs by " + std::to_string(o.measure));
   return o;
 }
@@ -488,7 +484,7 @@ Outcome TapsAndRows(const Ctx& c, int layer_shift) {
     const int at = key.second < 0 ? key.second : key.second + layer_shift;
     const auto it = want.find({key.first, at});
     if (it == want.end() || it->second.size() != values.size()) continue;
-    o.measure = std::max(o.measure, MaxDiff(values, it->second));
+    o.measure = MaxKeepNaN(o.measure, MaxDiff(values, it->second));
     ++compared;
   }
   for (std::uint32_t l = 0; l < info.layers; ++l)
@@ -503,7 +499,7 @@ Outcome TapsAndRows(const Ctx& c, int layer_shift) {
                                      std::pair{KvPart::kValue, "Vcur"}}) {
       const auto rows = Decode(Export(*e, l, part, {first, kSeq}), info.kv_type);
       const auto& full = want.at({name, ref_layer});
-      o.measure = std::max(
+      o.measure = MaxKeepNaN(
           o.measure,
           MaxDiff(rows, std::span(full).subspan(std::size_t{first} * info.kv_width,
                                                 rows.size())));
@@ -511,7 +507,7 @@ Outcome TapsAndRows(const Ctx& c, int layer_shift) {
     }
   }
   o.detail = std::to_string(compared) + " taps/row sets compared";
-  if (o.measure > c.backend.tap_tol)
+  if (Exceeds(o.measure, c.backend.tap_tol))
     o.Fail("taps or rows differ from the Reference by " +
            std::to_string(o.measure) + "; " + o.detail);
   return o;
