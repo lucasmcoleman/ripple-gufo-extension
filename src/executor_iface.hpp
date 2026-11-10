@@ -23,7 +23,7 @@
 // - Every call is synchronous: when it returns, its device work has finished,
 //   so no error can surface later against a state already committed.
 // Calls on one Executor, and on Executors that share device scratch, must be
-// serialized by the caller (Gemma 4 engine.cpp:430 holds the model mutex).
+// serialized by the caller (Gemma 4 engine.cpp:436 holds the model mutex).
 
 #include <cstddef>
 #include <cstdint>
