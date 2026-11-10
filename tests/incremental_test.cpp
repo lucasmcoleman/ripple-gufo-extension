@@ -228,8 +228,8 @@ void Taps(const Fixture& f) {
     done += n;
   }
   Require(done == f.a.size(), "tap chunks");
-  // 18 per-layer taps + 3 global taps.
-  Require(full_taps.size() == 18 * cfg.block_count + 3,
+  // 17 per-layer taps + 3 global taps (embd_scaled, result_norm, result_output).
+  Require(full_taps.size() == 17 * cfg.block_count + 3,
           "tap count " + std::to_string(full_taps.size()));
   double worst = 0;
   for (const auto& [key, vals] : full_taps) {

@@ -24,7 +24,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr std::uint32_t kLayers = 5, kE = 256, kFF = 512, kH = 4, kKV = 2,
+constexpr std::uint32_t kLayers = 5, kE = 512, kFF = 1280, kH = 6, kKV = 2,
                         kD = 128, kV = 64;
 
 Metadata BaseMetadata() {
@@ -127,9 +127,6 @@ Resolved Resolve(const Metadata& m, const Tensors& t) {
   return r;
 }
 
-void Good(const Resolved& r, const std::string& what) {
-  Require(r.weights.has_value(), what + ": expected success, got " + r.error);
-}
 void Bad(const Resolved& r, const std::vector<std::string>& needles,
          const std::string& what) {
   Require(!r.weights.has_value(), what + ": expected failure");
