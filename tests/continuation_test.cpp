@@ -391,7 +391,8 @@ GuardOutcome Guarding(const TinyFixture& f, ContinuationAdapter::Faults faults) 
     ++out.window_row_reads_in_guard;
     evicted_ranges.push_back({id.value, {first, end}});
   };
-  const auto tokens = Slice(t, 0, 3 * (W + 4) + 5);
+  // Three full passes and a 4-row remainder: 64 tokens on tinyB (window 16), all the token file holds.
+  const auto tokens = Slice(t, 0, 3 * (W + 4) + 4);
   r.Sync(tokens);
   out.calls = r.guard.overwrites.size();
   // The written ranges of the token component are the prefill passes.

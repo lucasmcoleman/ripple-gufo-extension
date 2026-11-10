@@ -239,3 +239,34 @@ Everything below is unverified until a GPU run:
 - sticky-error recovery (`DeviceUsable`), `exit 77` of the GPU test programs without a device, the real-size path (uploading
   40 GB, W8A8 at 2048 rows and K = 40960, per-executor memory), and the gate script's behaviour with an admitted lock
   (only the refused path ran for real).
+
+## First GPU run (2026-11-10, gfx1151, `tests/run-gpu-gates.sh`, logs `/server/staging/ripple-gufo/gpu-gates/20261110-184256`)
+
+All 44 invocations pass (9 gates). Nothing here used the real weights.
+
+Measured, tiny fixtures:
+- Exact mode (F32 KV) against llama.cpp F32: worst max abs 2.05e-5 (tinyA), 1.11e-5 (tinyB), top-1 100% on all 8
+  sequences. F16 KV against llama.cpp `--kv-f16`: 3.53e-3 (tinyA), 1.03e-3 (tinyB), top-1 100%.
+- Quantized tinyB files (Q4_K_M, Q5_K_M, Q6_K, Q8_0), exact mode against the Reference: max abs <= 1.38e-5, top-1 100%.
+- Open question 1 is answered: in production mode 16-row passes equal 1-row passes bit for bit on all four quantized
+  files (`batch_invariant_rows` 16 holds).
+- W8A8 envelope, first end-to-end measurement: production with 20-row passes against the Reference has max abs
+  0.188-0.21, mean KL 7.58e-4..8.31e-4, top-1 90.6-96.9%. Production with 1-row passes (F16 caches only): max abs
+  2.93e-3..3.18e-3, mean KL about 2e-7. So the 0.2 is the int8 activation rounding of wide passes, nothing else.
+
+What the first run found (all in test code; kernels and executor needed no change):
+1. `attention_ops small`: the twin "GQA mapping h % kv_heads" equals the right mapping when group == 1 (4/4 heads), so it
+   could not be rejected. Guard is now `kv > 1 && kv < heads`.
+2. `executor_test quant:*`: a top-1 limit of 0.95 for production mode was set before any measurement. On this random
+   fixture a 0.003 change already flips one of 64 positions, so top-1 under W8A8 measures the fixture's ties. The gate is
+   now error size: wide passes mean KL <= 2e-2 and max abs <= 0.5; 1-row passes max abs <= 2e-2. Top-1 is reported.
+3. `executor_contract` (segfault in `EmbedRowsHost` on the second fixture): `tests/executor_backends_gpu.cpp` cached the
+   device model in a process-wide map keyed by the reader's address; tinyB's reader reused tinyA's address and got tinyA's
+   upload, whose host embedding table pointed into an unmapped file. The upload now lives in the test `Model`
+   (`backend_state`) and dies with it. `hip/gpu_executor_factory.cpp` (production) already resets on re-registration.
+4. `continuation` on tinyB: `Slice(t, 0, 3 * (W + 4) + 5)` asked for 65 of 64 tokens and read past the vector; the CPU run
+   passed on whatever followed. `Slice` now checks its range; the test uses 64 tokens.
+
+Build note: build the extension's own targets (`ninja ricursive_...`). A bare `ninja` also builds upstream's
+`qwen_image_21_weight_upload_test`, which fails here (system HIP headers without the platform macro) and stops the build
+before later ricursive targets are relinked.

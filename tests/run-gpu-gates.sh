@@ -136,7 +136,8 @@ first_line() {  # log, status -> the first telling line, one line, trimmed
   local log=$1 status=$2 line=""
   case $status in
     LOCKED*) line=$(grep -m1 'gpu-lock-exec' "$log") ;;
-    FAIL*)   line=$(grep -m1 -E 'FAIL|rror|what\(\)|terminate|Segmentation|timed out' "$log")
+    FAIL*)   line=$(grep -m1 -E '^FAIL' "$log")  # the test's own verdict first: "error" also appears in passing lines
+             [ -z "$line" ] && line=$(grep -m1 -E 'FAIL|rror|what\(\)|terminate|Segmentation|timed out' "$log")
              [ -z "$line" ] && line=$(tail -n 1 "$log") ;;
     SKIP*)   line=$(grep -m1 -i 'skip' "$log") ;;
   esac
@@ -193,7 +194,9 @@ for gate in "${GATES[@]}"; do
       75)  status="LOCKED(75)"; locked_seen=1; any_unverified=1 ;;
       77)  status="SKIP(77)"; any_unverified=1 ;;
       124|137) status=FAIL; gate_fail=1; any_fail=1; echo "timed out after ${INV_TIMEOUT}s" >>"$log" ;;
-      *)   status=FAIL; gate_fail=1; any_fail=1 ;;
+      *)   status=FAIL; gate_fail=1; any_fail=1
+           # a crash prints nothing: say so, or the table shows the lock line
+           [ "$rc" -gt 128 ] && echo "FAIL: killed by signal $((rc - 128)) (exit $rc)" >>"$log" ;;
     esac
     note=$(first_line "$log" "$status")
     add_row "$gate" "$label" "$status" "$secs" "$note"

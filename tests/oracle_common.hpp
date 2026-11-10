@@ -39,6 +39,9 @@ std::vector<T> ReadBinary(const std::string& path) {
 struct Model {
   std::unique_ptr<gufo::core::GgufReader> reader;
   gufo::models::ricursive::ModelWeights weights;
+  /// Whatever a backend keeps per opened model (the GPU backend: its device copy, which holds host pointers
+  /// into this reader's mapping). Declared last, so it is released before the weights and the mapping.
+  mutable std::shared_ptr<const void> backend_state;
 };
 
 inline Model OpenModel(const std::string& path) {

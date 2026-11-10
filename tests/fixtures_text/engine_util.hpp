@@ -124,6 +124,9 @@ inline std::vector<std::int32_t> SessionChain(Session& session, std::span<const 
 }
 
 inline std::vector<std::int32_t> Slice(const std::vector<std::int32_t>& v, std::size_t a, std::size_t b) {
+  // Checked: a slice past the end used to read whatever followed the vector as token ids.
+  Require(a <= b && b <= v.size(), "Slice [" + std::to_string(a) + ", " + std::to_string(b) + ") of " +
+                                       std::to_string(v.size()) + " tokens");
   return {v.begin() + static_cast<std::ptrdiff_t>(a), v.begin() + static_cast<std::ptrdiff_t>(b)};
 }
 

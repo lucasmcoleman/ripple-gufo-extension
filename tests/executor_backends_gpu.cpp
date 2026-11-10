@@ -7,7 +7,7 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <map>
+#include <memory>
 
 #include "hip/device_model.hpp"
 #include "hip/executor.hpp"
@@ -25,21 +25,22 @@ bool HaveDevice() {
   return hipGetDeviceCount(&n) == hipSuccess && n > 0;
 }
 
-/// One upload per opened fixture, shared by every executor built on it.
+/// One upload per opened fixture, shared by every executor built on it. The
+/// copy lives in the Model: it holds host pointers into that model's mapping
+/// (the embedding table), so it must die with it. A process-wide map keyed by
+/// the reader's address handed tinyA's upload to tinyB when the allocator
+/// reused the address (first GPU run of the contract suite, 2026-11-10:
+/// segfault in EmbedRowsHost). Fixtures are locals of main, so the hipFree
+/// runs while the HIP runtime is alive, never during static destruction.
 std::shared_ptr<const DeviceModel> ModelFor(const Model& m) {
-  // Never destroyed: the device memory is released by process exit, and a
-  // hipFree during static destruction can run after the HIP runtime is gone.
-  static auto* uploaded =
-      new std::map<const void*, std::shared_ptr<const DeviceModel>>();
-  auto& slot = (*uploaded)[m.reader.get()];
-  if (!slot) {
+  if (!m.backend_state) {
     std::string error;
     std::shared_ptr<const DeviceModel> d =
         DeviceModel::Upload(m.weights, *m.reader, &error);
     if (!d) throw std::runtime_error("device model upload: " + error);
-    slot = std::move(d);
+    m.backend_state = std::move(d);
   }
-  return slot;
+  return std::static_pointer_cast<const DeviceModel>(m.backend_state);
 }
 
 std::unique_ptr<Executor> MakeGpu(const Model& m, ExecutorConfig c, const ExecFaults& f,

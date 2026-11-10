@@ -446,7 +446,8 @@ void RunConfig(const Cfg& c) {
       v.swap_kv = true;
       RequireTwinFails("K and V swapped", good.max_abs, CompareRows(ck, mid, v).max_abs);
     }
-    if (c.kv > 1) {  // with one KV head h % 1 == h / group == 0: not a different mapping
+    // h % kv == h / group for every head when kv == 1 (both 0) or group == 1 (both h): not a different mapping
+    if (c.kv > 1 && c.kv < c.heads) {
       Var v;
       v.gqa_mod = true;
       RequireTwinFails("GQA mapping h % kv_heads", good.max_abs, CompareRows(ck, mid, v).max_abs);
