@@ -105,6 +105,26 @@
         "testing"
       ],
       "role": "test"
+    },
+    "gufo_ricursive_exec": {
+      "requires": []
+    },
+    "gufo_ricursive_hostops": {
+      "requires": [
+        "testing"
+      ]
+    },
+    "ricursive_executor_contract_host_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_executor_host_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
     }
   },
   "licenses": [

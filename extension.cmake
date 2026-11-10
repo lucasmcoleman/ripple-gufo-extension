@@ -186,6 +186,45 @@ if(TARGET ricursive_projection_ops_test)
   endforeach()
 endif()
 
+# --- WP-C executor begin ---
+# Executor orchestration (HIP-free, docs/S2-EXECUTOR.md) and its two op back
+# ends: host (CPU test backend, OpenMP) and GPU (kernels, device model).
+gufo_extension_target(
+  NAME gufo_ricursive_exec
+  SOURCES
+    hip/executor.cpp
+  LINK_LIBRARIES
+    gufo_ricursive
+    gufo_ext_runtime
+    gufo_ext_core
+)
+gufo_extension_target(
+  NAME gufo_ricursive_hostops
+  SOURCES
+    hip/ops_host.cpp
+  LINK_LIBRARIES
+    gufo_ricursive_exec
+    gufo_ricursive
+    gufo_ext_runtime
+    gufo_ext_core
+)
+if(TARGET gufo_ricursive_hostops)
+  target_compile_options(gufo_ricursive_hostops PRIVATE -O2)
+  find_package(OpenMP REQUIRED)
+  target_link_libraries(gufo_ricursive_hostops PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+# CPU tests: the contract suite and the executor test on the host ops.
+_ricursive_test(executor_contract_host TIMEOUT 1800
+  SOURCES tests/executor_contract_test.cpp tests/executor_backends_host.cpp
+  LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
+    gufo_ricursive_reference gufo_ricursive)
+_ricursive_test(executor_host TIMEOUT 1800
+  SOURCES tests/executor_test.cpp tests/executor_backends_host.cpp
+  LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
+    gufo_ricursive_reference gufo_ricursive)
+# --- WP-C executor end ---
+
 # Tool, built on request: ricursive_ref_logits MODEL.gguf TOKENS.i32 OUT.f32
 gufo_extension_target(
   NAME ricursive_ref_logits
