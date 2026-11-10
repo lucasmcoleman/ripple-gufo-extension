@@ -1,33 +1,11 @@
-#include <gufo/ext/generated/ricursive_constants.hpp>
 #include <gufo/ext/registry.hpp>
 #include <gufo/ext/text.hpp>
-#include <memory>
-#include <string>
 
-#include "probe.hpp"
+#include "output_parser.hpp"
 
-namespace {
-
-std::shared_ptr<gufo::ext::TextModelRunner> CreateRicursiveRunner(
-    const gufo::ext::TextRunnerOptions&, std::string* error) {
-  if (error != nullptr) {
-    *error = "ricursive: runner not implemented (extension skeleton)";
-  }
-  return nullptr;
+// The provider (probe, runner factory, drivers) registers from provider.cpp.
+// The tool dialect is host-side and must exist before any runner is created.
+void ricursive_register(gufo::ext::Registry& registry) {
+  (void)registry;
+  gufo::ext::RegisterToolDialect(gufo::models::ricursive::MakeToolDialect());
 }
-
-}  // namespace
-
-void ricursive_provider_register(gufo::ext::Registry& registry) {
-  namespace r = gufo::models::ricursive;
-  registry.AddProvider(
-      gufo::ext::generated::extension_ricursive::kProvider_ricursive);
-  registry.AddTextProvider({
-      .id = "ricursive",
-      .probe = &r::ProbeRicursive,
-      .probe_gguf = &r::ProbeRicursiveGguf,
-      .create = &CreateRicursiveRunner,
-  });
-}
-
-void ricursive_register(gufo::ext::Registry& registry) { (void)registry; }

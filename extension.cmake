@@ -336,3 +336,64 @@ endif()
 
 install(FILES "${GUFO_EXTENSION_BUILD_ROOT}/LICENSE"
   DESTINATION share/licenses/gufo/extensions/ricursive)
+
+# --- WP-D engine begin ---
+# Engine (Model/Session), component-cache adapter, runner, provider, drivers,
+# output parser (docs/S2-ENGINE.md). The sources join gufo_ricursive; the CPU
+# executor (gufo_ricursive_reference) is linked in so `gufo prompt` can run a
+# tiny model with RICURSIVE_BACKEND=cpu. It is for tests and tiny models only.
+option(RICURSIVE_CPU_BACKEND
+  "Build the scalar CPU executor into gufo_ricursive (tests and tiny models)"
+  ${BUILD_TESTING})
+if(TARGET gufo_ricursive)
+  target_sources(gufo_ricursive PRIVATE
+    ${GUFO_EXTENSION_BUILD_ROOT}/src/chat_prompt.cpp
+    ${GUFO_EXTENSION_BUILD_ROOT}/src/chat_request.cpp
+    ${GUFO_EXTENSION_BUILD_ROOT}/src/continuation_adapter.cpp
+    ${GUFO_EXTENSION_BUILD_ROOT}/src/drivers.cpp
+    ${GUFO_EXTENSION_BUILD_ROOT}/src/engine.cpp
+    ${GUFO_EXTENSION_BUILD_ROOT}/src/executor_factory.cpp
+    ${GUFO_EXTENSION_BUILD_ROOT}/src/output_parser.cpp
+    ${GUFO_EXTENSION_BUILD_ROOT}/src/provider.cpp
+    ${GUFO_EXTENSION_BUILD_ROOT}/src/runner.cpp)
+  target_link_libraries(gufo_ricursive PUBLIC gufo_ext_cache)
+  if(TARGET gufo_ext_hip)
+    # The component cache's pinned-host backing is HIP only.
+    target_compile_definitions(gufo_ricursive PRIVATE RICURSIVE_HIP_CACHE=1)
+    target_link_libraries(gufo_ricursive PUBLIC gufo_ext_hip)
+  endif()
+  if(RICURSIVE_CPU_BACKEND AND TARGET gufo_ricursive_reference)
+    target_compile_definitions(gufo_ricursive PRIVATE RICURSIVE_WITH_CPU_BACKEND=1)
+    target_link_libraries(gufo_ricursive PUBLIC gufo_ricursive_reference)
+  endif()
+  # The GPU executor (separate work package) defines
+  # RICURSIVE_HAVE_GPU_EXECUTOR and provides CreateGpuExecutor, see
+  # src/executor_factory.hpp.
+endif()
+
+_ricursive_test(output_parser
+  SOURCES tests/output_parser_test.cpp LINK_LIBRARIES gufo_ricursive)
+_ricursive_test(engine TIMEOUT 1800
+  SOURCES tests/engine_test.cpp
+  LINK_LIBRARIES gufo_ricursive gufo_ricursive_reference gufo_ext_cache)
+_ricursive_test(continuation TIMEOUT 1800
+  SOURCES tests/continuation_test.cpp
+  LINK_LIBRARIES gufo_ricursive gufo_ricursive_reference gufo_ext_cache)
+# The chat fixture (real tokenizer and template, tiny random weights) is
+# generated into the build directory by a committed script, as a ctest fixture.
+set(RICURSIVE_CHAT_FIXTURE "${CMAKE_CURRENT_BINARY_DIR}/chat-tiny.gguf")
+_ricursive_test(chat_e2e TIMEOUT 1800
+  SOURCES tests/chat_e2e_test.cpp
+  LINK_LIBRARIES gufo_ricursive gufo_ricursive_reference gufo_ext_cache
+  ARGS "${RICURSIVE_CHAT_FIXTURE}" "${RICURSIVE_STAGE}/oracle/chat-goldens.jsonl"
+       "${RICURSIVE_STAGE}/fixtures/vocab-only.gguf")
+if(TARGET ricursive_chat_e2e_test)
+  add_test(NAME ricursive.chat_fixture
+    COMMAND python3 "${GUFO_EXTENSION_BUILD_ROOT}/tests/fixtures_text/make_chat_fixture.py"
+            "${RICURSIVE_STAGE}/fixtures/vocab-only.gguf" "${RICURSIVE_CHAT_FIXTURE}")
+  set_tests_properties(ricursive.chat_fixture PROPERTIES
+    FIXTURES_SETUP ricursive_chat_fixture LABELS "ricursive;cpu")
+  set_tests_properties(ricursive.chat_e2e PROPERTIES
+    FIXTURES_REQUIRED ricursive_chat_fixture)
+endif()
+# --- WP-D engine end ---
