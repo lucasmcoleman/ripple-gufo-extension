@@ -23,7 +23,22 @@
       "entry": "ricursive_provider_register"
     }
   ],
-  "options": [],
+  "options": [
+    {
+      "name": "--context-cap",
+      "type": "integer",
+      "commands": ["serve", "bench", "prompt", "chat"],
+      "providers": ["ricursive"],
+      "help": "ricursive context cap in tokens (default 32768; the model's nominal 2,097,152 is never used). Full-attention layers cost 64 KiB per token at F16"
+    },
+    {
+      "name": "--allow-chat-template-mismatch",
+      "type": "boolean",
+      "commands": ["serve", "bench", "prompt", "chat"],
+      "providers": ["ricursive"],
+      "help": "accept a GGUF whose chat template differs from the pinned Ripple template (prompts may then be wrong)"
+    }
+  ],
   "targets": {
     "gufo_ricursive": {
       "requires": []
@@ -87,6 +102,30 @@
       "role": "test"
     },
     "ricursive_executor_contract_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_output_parser_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_engine_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_continuation_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_chat_e2e_test": {
       "requires": [
         "testing"
       ],

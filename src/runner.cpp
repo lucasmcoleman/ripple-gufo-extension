@@ -1,0 +1,357 @@
+// The serving runner. Base class: ext::TextModelRunner, not HipTextModelRunner:
+// that one owns a DeviceProbe, which allocates device memory on construction,
+// and the CPU backend must never touch the GPU. The runner creates a probe
+// itself only when the backend uses the device (PollDevice / DeviceUsable).
+
+#include "runner.hpp"
+
+#include <algorithm>
+#include <cstdint>
+#include <gufo/ext/gguf_identity.hpp>
+#include <gufo/ext/host.hpp>
+#include <gufo/ext/host_budget.hpp>
+#include <limits>
+#include <optional>
+#include <span>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "chat_request.hpp"
+#include "continuation_adapter.hpp"
+#include "output_parser.hpp"
+
+#if defined(RICURSIVE_HIP_CACHE)
+#include <gufo/ext/component_cache_resources.hpp>
+#endif
+
+namespace gufo::models::ricursive {
+namespace {
+
+using ext::TextRunnerToken;
+
+constexpr std::string_view kStateAbi = "ricursive-session-v1";
+
+std::int32_t EngineToken(TextRunnerToken token) {
+  if (token > static_cast<TextRunnerToken>(std::numeric_limits<std::int32_t>::max())) {
+    throw std::invalid_argument("ricursive token ID exceeds engine range");
+  }
+  return static_cast<std::int32_t>(token);
+}
+
+std::vector<std::int32_t> EngineTokens(std::span<const TextRunnerToken> tokens) {
+  std::vector<std::int32_t> converted;
+  converted.reserve(tokens.size());
+  for (const auto token : tokens) converted.push_back(EngineToken(token));
+  return converted;
+}
+
+bool IsSha256Hex(std::string_view value) {
+  return value.size() == 64 && value.find_first_not_of("0123456789abcdef") == std::string_view::npos;
+}
+
+class State final : public ext::TextRunnerState {
+ public:
+  State(Session& session, cache::Adapter& adapter, cache::Slot& slot)
+      : session_(&session), adapter_(&adapter), slot_(&slot) {}
+  void Invalidate() noexcept override { (void)adapter_->Invalidate(*slot_); }
+  [[nodiscard]] ext::TextRunnerMeasuredResources MeasuredResources() const noexcept override {
+    return {.per_request_state_bytes = session_->model().SessionBytes(session_->model().MaxContext()),
+            .temporary_scratch_bytes = 0};
+  }
+  [[nodiscard]] Session& session() const { return *session_; }
+
+ private:
+  Session* session_;
+  cache::Adapter* adapter_;
+  cache::Slot* slot_;
+};
+
+State& Get(ext::TextRunnerState& state) {
+  auto* ours = dynamic_cast<State*>(&state);
+  if (ours == nullptr) throw std::logic_error("text runner state is not ricursive");
+  return *ours;
+}
+const State& Get(const ext::TextRunnerState& state) {
+  const auto* ours = dynamic_cast<const State*>(&state);
+  if (ours == nullptr) throw std::logic_error("text runner state is not ricursive");
+  return *ours;
+}
+
+class Runner final : public ext::TextModelRunner {
+ public:
+  Runner(std::shared_ptr<Model> model, const std::string& artifact_fingerprint)
+      : model_(std::move(model)) {
+    std::ostringstream identity;
+    if (!artifact_fingerprint.empty()) {
+      identity << "schema=gufo-text-continuation-v2\n"
+               << "model_kind=ricursive\n"
+               << "artifact_id=" << ext::kGgufIdentityScheme << ':' << artifact_fingerprint << '\n'
+               << "tokenizer=embedded-in-artifact\n"
+               << "chat_template_sha256=" << model_->TemplateSha256() << '\n'
+               << "state_abi=" << kStateAbi << '\n'
+               << "kv_layout=token-major-global+sliding-ring-logical\n"
+               << "position_policy=absolute-v1\n"
+               << "adapters=none\n";
+    } else {
+      // Without an artifact fingerprint checkpoints stay in this process.
+      identity << "schema=gufo-process-text-continuation-v1\n"
+               << "model_instance=" << model_.get() << '\n';
+    }
+    const std::string canonical = identity.str();
+    identity_.assign(canonical.begin(), canonical.end());
+    if (model_->backend().uses_device) probe_ = std::make_unique<ext::DeviceProbe>();
+  }
+
+  [[nodiscard]] DeviceProbeStatus PollDevice() const override {
+    return probe_ ? probe_->Poll() : DeviceProbeStatus::kUsable;
+  }
+  [[nodiscard]] bool DeviceUsable() const override {
+    return probe_ ? probe_->WaitUsable(std::chrono::seconds(5), "scheduler") : true;
+  }
+
+  [[nodiscard]] std::unique_ptr<ext::ComponentCacheResources> CreateComponentCacheResources(
+      cache::ResourceLedger& ledger, std::size_t) const override {
+    if (!model_->backend().uses_device) {
+      throw std::runtime_error(
+          "the ricursive CPU backend serves no component cache (prompt, chat and bench only); " +
+          BackendHelp());
+    }
+#if defined(RICURSIVE_HIP_CACHE)
+    auto adapter = std::make_unique<ContinuationAdapter>(model_, identity_);
+    hip::ComponentCacheHooks hooks{
+        [] { return ext::HostSnapshotCeilingBytes(); },
+        [](std::string_view message) { server::Logger::Warn("cache", message); },
+        [](std::string_view message) { server::Logger::Info("cache", message); }};
+    auto resources = hip::CreateHipComponentCacheResources(std::move(adapter), ledger, hooks);
+    // Durable captures need this hook, but the adapter lends no rows
+    // (BorrowRowsView is empty), so persistence never reads a slot through it.
+    resources->copy_observed_rows = [](auto, auto, cache::Stream&) -> cache::Completion {
+      throw std::logic_error("ricursive lends no rows");
+    };
+    return resources;
+#else
+    (void)ledger;
+    throw std::runtime_error("this build has no HIP component cache");
+#endif
+  }
+  [[nodiscard]] std::unique_ptr<ext::TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override {
+    auto& ours = dynamic_cast<ContinuationAdapter&>(adapter);
+    return std::make_unique<State>(ours.GetSession(slot), adapter, slot);
+  }
+  void ReconcileComponentState(ext::TextRunnerState& state, std::size_t position) const override {
+    if (Get(state).session().Position() != position) {
+      throw std::logic_error("ricursive component state position differs");
+    }
+  }
+
+  [[nodiscard]] ext::TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = model_->ModelName(),
+        .state_abi = std::string(kStateAbi),
+        .max_context = model_->MaxContext(),
+        .capabilities =
+            ext::TextRunnerCapabilities{
+                .supports_vision = false,
+                .incremental_prefill = true,
+                // Every token is evaluated when it is advanced.
+                .final_token_advance_required = true,
+                // Chunked prefill and single-token decode agree bit for bit
+                // only on a backend that never rounds activations by width.
+                .incremental_text_is_exact = model_->backend().exact,
+                .multi_token_decode = false,
+                .batched_multi_token_decode = false,
+                .prefix_reuse = true,
+                .in_pass_checkpoint = false,
+                .partial_prefill_retention = false,
+                .prefill_rollback = false,
+                .prefill_alignment = 1,
+            },
+        // The model card gives no sampling recommendation: gufo's defaults.
+        .sampling_defaults = std::nullopt,
+    };
+  }
+
+  [[nodiscard]] ext::TextRunnerResourceClaim ResourceClaim() const override {
+    return {
+        .resident_weights_bytes = model_->reader().GetSize(),
+        .state_capacity_bytes = std::nullopt,
+        .per_request_state_bytes = model_->SessionBytes(model_->MaxContext()),
+        .temporary_scratch_bytes = 0,
+        .retained_snapshot_capacity_bytes = ext::HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = ext::HostSnapshotCeilingBytes(),
+        .requires_device_runtime_lock = model_->backend().uses_device,
+    };
+  }
+
+  [[nodiscard]] std::vector<ext::TextExecutionPlan> SupportedPlans() const override {
+    return {{.kind = ext::TextExecutionPlanKind::kSerial, .physical_width = 1}};
+  }
+
+  [[nodiscard]] std::string ToolDialectId() const override { return std::string(kToolDialectId); }
+  [[nodiscard]] ReasoningMarkup ReasoningDelimiters() const override {
+    return MakeReasoningDelimiters();
+  }
+  // `<think>` is plain text of several tokens, not one control token, and
+  // there is no switch to turn reasoning off or limit it: no budget tags.
+  [[nodiscard]] ReasoningTags ReasoningBudgetTags() const override { return {}; }
+  [[nodiscard]] std::uint32_t VocabularySize() const override { return model_->VocabSize(); }
+
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(std::string_view text) const override {
+    const auto tokens = model_->Tokenize(text);
+    return {tokens.begin(), tokens.end()};
+  }
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ext::ChatRequest& request) const override {
+    auto prepared = PreparePrompt(request);
+    if (!prepared) return std::nullopt;
+    return std::move(prepared->tokens);
+  }
+  [[nodiscard]] std::optional<ext::TextPreparedPrompt> PreparePrompt(
+      const ext::ChatRequest& request) const override {
+    const ChatPrompt prompt = PrepareRequest(*model_, request);
+    ext::TextPreparedPrompt prepared;
+    prepared.tokens.assign(prompt.tokens.begin(), prompt.tokens.end());
+    prepared.cache_prefix_tokens = prompt.stable_prefix_tokens;
+    return prepared;
+  }
+  [[nodiscard]] std::optional<std::string> RenderPrompt(const ext::ChatRequest& request) const override {
+    return RenderRequest(request);
+  }
+  [[nodiscard]] ext::InitialOutputState InitialOutputState(const ext::ChatRequest&) const override {
+    // The generation prompt never opens <think>: the model decides.
+    return ext::InitialOutputState::kAuto;
+  }
+
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary> BuildConstraintVocabulary()
+      const override {
+    return std::make_shared<const sampling::ConstraintVocabulary>(
+        model_->VocabSize(), [this](std::uint32_t id) {
+          const auto token = static_cast<std::int32_t>(id);
+          return sampling::ConstraintVocabulary::Piece{model_->TokenText(token),
+                                                       model_->IsStopToken(token)};
+        });
+  }
+
+  [[nodiscard]] std::string Decode(std::span<const TextRunnerToken> tokens) const override {
+    return model_->Decode(EngineTokens(tokens));
+  }
+
+  void PreparePrefixReuse(ext::TextRunnerState& state,
+                          std::span<const TextRunnerToken> prefix) const override {
+    if (Get(state).session().Position() != prefix.size()) {
+      throw std::logic_error("ricursive reused prefix does not match checkpoint");
+    }
+  }
+
+  // One pass per call: at most Model::PrefillRows() tokens, the same
+  // boundaries ContinuationAdapter::PlanPrefill reports.
+  [[nodiscard]] ext::TextPrefillStep Prefill(ext::TextRunnerState& state,
+                                             std::span<const TextRunnerToken> prompt,
+                                             std::size_t offset,
+                                             std::size_t max_input_tokens) const override {
+    auto& ours = Get(state);
+    auto& session = ours.session();
+    if (offset != session.Position() || offset >= prompt.size()) {
+      throw std::logic_error("ricursive prefill offset does not match state");
+    }
+    const std::size_t step = std::min({std::max<std::size_t>(max_input_tokens, 1),
+                                       std::size_t{model_->PrefillRows()}, prompt.size() - offset});
+    const auto prefix = EngineTokens(prompt.first(offset + step));
+    std::string error;
+    if (!session.Sync(prefix, &error)) {
+      ours.Invalidate();
+      throw std::runtime_error("ricursive prefill failed: " + error);
+    }
+    return {.consumed_tokens = step, .decode_ready = offset + step == prompt.size()};
+  }
+
+  [[nodiscard]] ext::TextDecodeSelection SelectNext(ext::TextRunnerState& state,
+                                                    sampling::SamplerState& sampler) const override {
+    auto& session = Get(state).session();
+    if (session.Position() >= model_->MaxContext()) return {.stop = true, .piece = {}};
+    const auto logits = session.Logits();
+    if (logits.empty()) throw std::runtime_error("ricursive token selection has no logits");
+    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    auto logprobs = sampling::CollectLogprobs(logits, static_cast<sampling::TokenId>(token),
+                                              sampler.config().logprobs);
+    if (state.stop_at_eos() && model_->IsStopToken(token)) {
+      return {.stop = true, .token = 0, .piece = {}, .logprobs = std::move(logprobs)};
+    }
+    return {.stop = false,
+            .token = static_cast<TextRunnerToken>(token),
+            .piece = model_->TokenText(token),
+            .logprobs = std::move(logprobs)};
+  }
+
+  void Advance(ext::TextRunnerState& state, TextRunnerToken token) const override {
+    auto& ours = Get(state);
+    std::string error;
+    if (!ours.session().Evaluate(EngineToken(token), &error)) {
+      ours.Invalidate();
+      throw std::runtime_error("ricursive decode failed: " + error);
+    }
+  }
+
+  [[nodiscard]] std::optional<ext::TextDecodeSelection> PreviewFirstToken(
+      ext::TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    return SelectNext(state, sampler);
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(const ext::TextRunnerState& state) const override {
+    return Get(state).session().Position();
+  }
+
+ private:
+  std::shared_ptr<Model> model_;
+  cache::Identity identity_;
+  std::unique_ptr<ext::DeviceProbe> probe_;
+};
+
+void SetError(std::string* error, std::string message) {
+  if (error != nullptr) *error = std::move(message);
+}
+
+}  // namespace
+
+std::shared_ptr<ext::TextModelRunner> CreateRicursiveTextRunner(const ext::TextRunnerOptions& options,
+                                                                std::string* error) {
+  if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled) {
+    SetError(error, "ricursive does not support speculative decoding");
+    return nullptr;
+  }
+  ModelOptions model_options;
+  model_options.reader = options.reader;
+  model_options.max_context = options.max_context;
+  try {
+    ApplyProviderOptions(options.provider_options, model_options);
+  } catch (const std::invalid_argument& e) {
+    SetError(error, e.what());
+    return nullptr;
+  }
+  std::string load_error;
+  auto model = Model::Load(options.model_path, model_options, &load_error);
+  if (!model) {
+    SetError(error, "Failed to create ricursive model: " + load_error);
+    return nullptr;
+  }
+  std::string artifact = options.disk_cache.model_artifact_fingerprint;
+  try {
+    if (!options.disk_cache.directory.empty()) {
+      if (artifact.empty()) artifact = core::GgufIdentityHex(model->reader());
+      if (!IsSha256Hex(artifact) || options.disk_cache.capacity_bytes == 0) {
+        SetError(error, "ricursive persistent disk cache configuration is invalid");
+        return nullptr;
+      }
+    }
+    return std::make_shared<Runner>(std::move(model), artifact);
+  } catch (const std::exception& e) {
+    SetError(error, e.what());
+    return nullptr;
+  }
+}
+
+}  // namespace gufo::models::ricursive
