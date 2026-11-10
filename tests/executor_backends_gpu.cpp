@@ -84,7 +84,21 @@ std::vector<ContractBackend> ContractBackends() {
   exact.llama_suffix = ".llama.f32";
   exact.llama_max_abs = 2e-3;
   exact.tap_tol = 2e-4;
-  return {exact, prod};
+  // The contract test's main() takes no filter; the gate script runs one
+  // backend per invocation through this variable.
+  const char* only = std::getenv("RICURSIVE_CONTRACT_BACKEND");
+  std::vector<ContractBackend> all = {exact, prod};
+  if (only != nullptr && *only != '\0') {
+    std::vector<ContractBackend> picked;
+    for (auto& b : all)
+      if (b.name == only) picked.push_back(std::move(b));
+    if (picked.empty()) {
+      std::printf("FAIL: RICURSIVE_CONTRACT_BACKEND=%s matches no backend (gpu-f32-exact, gpu-f16)\n", only);
+      std::exit(1);
+    }
+    return picked;
+  }
+  return all;
 }
 
 ExecBackend TestBackend() {

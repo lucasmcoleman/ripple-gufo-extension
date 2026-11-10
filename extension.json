@@ -125,6 +125,45 @@
         "testing"
       ],
       "role": "test"
+    },
+    "ricursive_kernels_math_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "gufo_ricursive_gpuexec": {
+      "requires": [
+        "hip"
+      ]
+    },
+    "ricursive_kernel_ops_test": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_attention_ops_test": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_executor_contract_gpu_test": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_executor_gpu_test": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
     }
   },
   "licenses": [

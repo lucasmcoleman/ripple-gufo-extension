@@ -223,6 +223,104 @@ _ricursive_test(executor_host TIMEOUT 1800
   SOURCES tests/executor_test.cpp tests/executor_backends_host.cpp
   LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
     gufo_ricursive_reference gufo_ricursive)
+
+# GPU side: the S2 kernels (strict floating point, docs/S2-KERNELS.md), the
+# device model and the GPU ops, in their own target on top of
+# gufo_ricursive_hip (projections, embedding). GPU tests are labelled `gpu`,
+# skip with 77 and must only run through the admission lock
+# (tests/run-gpu-gates.sh).
+gufo_extension_target(
+  NAME gufo_ricursive_gpuexec
+  SOURCES
+    hip/device_model.cpp
+    hip/ops_gpu.cpp
+  LINK_LIBRARIES
+    gufo_ricursive_exec
+    gufo_ricursive_hip
+    gufo_ricursive
+    gufo_ext_runtime
+    gufo_ext_core
+    gufo_ext_hip
+)
+if(TARGET gufo_ricursive_gpuexec)
+  gufo_extension_hip_sources(gufo_ricursive_gpuexec
+    SOURCES
+      hip/kernels.hip.cpp
+    OPTIONS -O3 -fno-fast-math -ffp-contract=off
+      -Wno-unused-command-line-argument
+  )
+  target_compile_options(gufo_ricursive_gpuexec PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3>
+  )
+endif()
+
+# A test whose source needs HIP language mode (tests/check.hpp's device
+# helpers sit behind __HIPCC__): kernel_ops, attention_ops.
+function(_ricursive_hip_test name)
+  set(target ricursive_${name}_test)
+  gufo_extension_target(
+    NAME ${target}
+    SOURCES tests/${name}_test.cpp
+    LINK_LIBRARIES gufo_ricursive_gpuexec gufo_ricursive_hip gufo_ricursive
+      gufo_ext_runtime gufo_ext_core gufo_ext_hip
+  )
+  if(NOT TARGET ${target})
+    return()
+  endif()
+  set_source_files_properties(
+    "${GUFO_EXTENSION_BUILD_ROOT}/tests/${name}_test.cpp"
+    PROPERTIES LANGUAGE HIP)
+  target_compile_options(${target} PRIVATE -O2)
+  add_dependencies(ricursive_tests ${target})
+endfunction()
+
+_ricursive_test(kernels_math
+  SOURCES tests/kernels_math_test.cpp LINK_LIBRARIES gufo_ricursive)
+_ricursive_hip_test(kernel_ops)
+_ricursive_hip_test(attention_ops)
+if(TARGET ricursive_kernel_ops_test)
+  add_test(NAME ricursive.kernel_ops COMMAND ricursive_kernel_ops_test)
+  set_tests_properties(ricursive.kernel_ops PROPERTIES
+    LABELS "ricursive;gpu" SKIP_RETURN_CODE 77 RESOURCE_LOCK ricursive_gpu)
+endif()
+if(TARGET ricursive_attention_ops_test)
+  foreach(mode small real-sliding-f32 real-sliding-f16 real-full-f32
+      real-full-f16)
+    add_test(NAME ricursive.attention_ops.${mode}
+      COMMAND ricursive_attention_ops_test ${mode})
+    set_tests_properties(ricursive.attention_ops.${mode} PROPERTIES
+      LABELS "ricursive;gpu" SKIP_RETURN_CODE 77 RESOURCE_LOCK ricursive_gpu)
+  endforeach()
+endif()
+
+_ricursive_test(executor_contract_gpu NO_TEST
+  SOURCES tests/executor_contract_test.cpp tests/executor_backends_gpu.cpp
+  LINK_LIBRARIES gufo_ricursive_gpuexec gufo_ricursive_exec
+    gufo_ricursive_hip gufo_ricursive_reference gufo_ricursive gufo_ext_hip)
+_ricursive_test(executor_gpu NO_TEST
+  SOURCES tests/executor_test.cpp tests/executor_backends_gpu.cpp
+  LINK_LIBRARIES gufo_ricursive_gpuexec gufo_ricursive_exec
+    gufo_ricursive_hip gufo_ricursive_reference gufo_ricursive gufo_ext_hip)
+if(TARGET ricursive_executor_contract_gpu_test)
+  add_test(NAME ricursive.executor_contract_gpu
+    COMMAND ricursive_executor_contract_gpu_test)
+  set_tests_properties(ricursive.executor_contract_gpu PROPERTIES
+    LABELS "ricursive;gpu" SKIP_RETURN_CODE 77 RESOURCE_LOCK ricursive_gpu
+    ENVIRONMENT "OMP_NUM_THREADS=4")
+endif()
+if(TARGET ricursive_executor_gpu_test)
+  # One invocation per fixture or check group (each under 20 s and 4 GB).
+  foreach(inv taps:tinyA taps:tinyB llama-f32:tinyA llama-f32:tinyB
+      llama-f16:tinyA llama-f16:tinyB chunk:tinyA chunk:tinyB rewind:tinyA
+      rewind:tinyB twins:tinyA twins:tinyB limits:tinyA quant:tinyB-Q4_K_M
+      quant:tinyB-Q5_K_M quant:tinyB-Q6_K quant:tinyB-Q8_0)
+    add_test(NAME ricursive.executor_gpu.${inv}
+      COMMAND ricursive_executor_gpu_test ${inv})
+    set_tests_properties(ricursive.executor_gpu.${inv} PROPERTIES
+      LABELS "ricursive;gpu" SKIP_RETURN_CODE 77 RESOURCE_LOCK ricursive_gpu
+      ENVIRONMENT "OMP_NUM_THREADS=4")
+  endforeach()
+endif()
 # --- WP-C executor end ---
 
 # Tool, built on request: ricursive_ref_logits MODEL.gguf TOKENS.i32 OUT.f32
