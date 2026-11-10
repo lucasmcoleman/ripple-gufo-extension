@@ -14,6 +14,8 @@
 //   quant:Q       quantized tinyB files against the Reference on dequantized weights
 //   twins:F       orchestration-level broken twins (each must fail the llama comparison)
 //   limits:F      refusals: clamp 0, context cap default, bad rows
+//   half:F        binary16 helpers against _Float16 (CPU only, identical in every mode)
+//   guards:F      host-ops buffer guards (skipped on the GPU backend)
 // Exit 0 pass, 1 fail, 77 backend unavailable (no GPU).
 #include <chrono>
 #include <cmath>
@@ -332,6 +334,25 @@ void Quant(const Fixture& f) {
        f.name.c_str(), worst_prod, kl_prod, top1_prod);
   Line("  %s: exact vs llama.cpp on the same file: worst max abs %.3g, worst mean KL %.3g, min top-1 %.4f (reported; S1 Reference had 0.2-0.29 / 7.8e-4..1.5e-3 / 95-98%%)",
        f.name.c_str(), worst_llama, kl_llama, top1_llama);
+  // Batch invariance (EXECUTOR-CONTRACT open question 1): in production mode a
+  // Forward of at most 16 rows equals the one-row Forward bit for bit; wider
+  // passes (W8A8 on the GPU) may round, reported here.
+  {
+    const Tokens t = LoadTokens(f.base, 0);
+    auto one = Make(f, Cfg(16, true, false));
+    auto sixteen = Make(f, Cfg(16, true, false));
+    auto wide = Make(f, Cfg(20, true, false));
+    const auto a = Feed(*one, t, 0, kSeq, {1});
+    const double d16 = MaxAbs(a, Feed(*sixteen, t, 0, kSeq, {16}));
+    const double d20 = MaxAbs(a, Feed(*wide, t, 0, kSeq, {20}));
+    Line("  %s production: 16-row passes vs 1-row passes %.3g (batch_invariant_rows %u, tolerance %.3g); "
+         "20-row passes vs 1-row passes %.3g (batch_invariant_rows %u)",
+         f.name.c_str(), d16, sixteen->Info().batch_invariant_rows, g_backend.exact_equal_tol, d20,
+         wide->Info().batch_invariant_rows);
+    Require(d16 <= g_backend.exact_equal_tol, "a pass of 16 rows differs from 1-row passes");
+    Require(d20 <= (wide->Info().batch_invariant_rows >= 20 ? g_backend.exact_equal_tol : 0.5),
+            "a pass of 20 rows is further from 1-row passes than a sanity bound of 0.5 (provisional: W8A8 envelope not measured end to end yet)");
+  }
   Require(worst_exact <= g_backend.quant_exact_max_abs && top1_exact >= 1.0,
           "exact mode differs from the Reference on the same file");
   Require(kl_prod <= 2e-2 && top1_prod >= 0.95, "production mode too far from the Reference");
@@ -484,6 +505,62 @@ void Limits(const Fixture& f) {
   Line("  refusals leave the executor ready at position 0: ok");
 }
 
+// ---- binary16 helpers and host-ops guards ------------------------------------------
+void Half(const Fixture&) {
+  // HalfToFloat/FloatToHalf (hip/ops.hpp) against the compiler's _Float16 on
+  // a strided sweep of all 2^32 float bit patterns, and every binary16 value.
+  std::size_t checked = 0;
+  for (std::uint64_t bits = 0; bits < (1ULL << 32); bits += 251) {
+    const auto u = static_cast<std::uint32_t>(bits);
+    float f;
+    std::memcpy(&f, &u, 4);
+    if (std::isnan(f)) continue;
+    const _Float16 ref = static_cast<_Float16>(f);
+    std::uint16_t want;
+    std::memcpy(&want, &ref, 2);
+    Require(FloatToHalf(f) == want, "FloatToHalf(" + std::to_string(f) + ") = " +
+                                        std::to_string(FloatToHalf(f)) + ", compiler " +
+                                        std::to_string(want));
+    ++checked;
+  }
+  for (std::uint32_t h = 0; h < 65536; ++h) {
+    const auto half = static_cast<std::uint16_t>(h);
+    _Float16 ref;
+    std::memcpy(&ref, &half, 2);
+    if (std::isnan(static_cast<float>(ref))) continue;
+    Require(HalfToFloat(half) == static_cast<float>(ref), "HalfToFloat mismatch");
+    Require(FloatToHalf(HalfToFloat(half)) == half, "binary16 does not round-trip");
+  }
+  Line("  FloatToHalf equals _Float16 on %zu floats (every 251st bit pattern); every binary16 round-trips", checked);
+}
+
+void Guards(const Fixture& f) {
+  if (g_backend.gpu) {
+    Line("  host-ops guards: skipped on the GPU backend");
+    return;
+  }
+  auto e = Make(f, Cfg(f.Rows(), false, true));
+  Ops& ops = dynamic_cast<OpsExecutor&>(*e).ops();
+  auto* p = static_cast<float*>(ops.Allocate(16 * sizeof(float)));
+  // Poisoned on allocation: reading what was never written shows as NaN.
+  std::vector<float> host(16);
+  ops.CopyOut(host.data(), p, 64);
+  Require(std::isnan(host[0]) && std::isnan(host[15]), "fresh buffer is not poisoned");
+  // An operator that would touch more than the buffer holds is refused.
+  const std::string over = Throws([&] { ops.ScaleRows(p, p, 17, 1, 2.0F); });
+  Line("  oversized ScaleRows: \"%s\"", over.c_str());
+  RequireContains(over, "needs", "oversized operator");
+  const std::string alias = Throws([&] { ops.ResidualPostNorm(p, p, p, 1, 16, 1e-6F); });
+  RequireContains(alias, "alias", "aliased ResidualPostNorm");
+  const std::string foreign = Throws([&] { ops.ScaleRows(host.data(), p, 1, 1, 2.0F); });
+  RequireContains(foreign, "not inside any live buffer", "pointer outside every buffer");
+  // A stray write past the end is caught at the next Synchronize.
+  reinterpret_cast<unsigned char*>(p)[64] = 0;
+  const std::string guard = Throws([&] { ops.Synchronize(); });
+  Line("  stray write past a buffer: \"%s\"", guard.c_str());
+  RequireContains(guard, "past its end", "guard bytes");
+}
+
 // ---- driver ------------------------------------------------------------------------
 }  // namespace
 
@@ -497,10 +574,12 @@ int main(int argc, char** argv) {
       {"chunk", GroupFn(Chunk)},
       {"rewind", GroupFn(Rewind)},
       {"twins", GroupFn(OrchestrationTwins)},
-      {"limits", GroupFn(Limits)}};
+      {"limits", GroupFn(Limits)},
+      {"half", GroupFn(Half)},
+      {"guards", GroupFn(Guards)}};
   std::vector<std::pair<std::string, std::string>> all;  // group, fixture
   for (const auto& [g, fn] : groups) {
-    if (g == "limits") {
+    if (g == "limits" || g == "half" || g == "guards") {
       all.emplace_back(g, "tinyA");
       continue;
     }

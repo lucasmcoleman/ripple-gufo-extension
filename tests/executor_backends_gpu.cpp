@@ -27,8 +27,11 @@ bool HaveDevice() {
 
 /// One upload per opened fixture, shared by every executor built on it.
 std::shared_ptr<const DeviceModel> ModelFor(const Model& m) {
-  static std::map<const void*, std::shared_ptr<const DeviceModel>> uploaded;
-  auto& slot = uploaded[m.reader.get()];
+  // Never destroyed: the device memory is released by process exit, and a
+  // hipFree during static destruction can run after the HIP runtime is gone.
+  static auto* uploaded =
+      new std::map<const void*, std::shared_ptr<const DeviceModel>>();
+  auto& slot = (*uploaded)[m.reader.get()];
   if (!slot) {
     std::string error;
     std::shared_ptr<const DeviceModel> d =
