@@ -68,6 +68,43 @@
         "testing"
       ],
       "role": "test"
+    },
+    "gufo_ricursive_hip": {
+      "requires": [
+        "hip"
+      ]
+    },
+    "ricursive_tokenizer_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_chat_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_executor_contract_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_embed_test": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_projection_ops_test": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
     }
   },
   "licenses": [
