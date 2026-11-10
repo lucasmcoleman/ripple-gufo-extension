@@ -38,7 +38,20 @@ std::vector<ContractBackend> ContractBackends() {
   };
   host.kv_type = KvType::kF32;
   host.tap_tol = 2e-4;  // measured 2.1e-5 (docs/S2-EXECUTOR.md); the twin moves taps by 9.9
-  return {host};
+  // Production precision on the host ops (F16 KV, no twins): what the GPU
+  // production entry's thresholds are derived from.
+  ContractBackend f16;
+  f16.name = "hostops-f16";
+  f16.make = [](const Model& m, const ExecutorConfig& c) {
+    ExecutorConfig x = c;
+    x.kv_type = KvType::kF16;
+    return std::make_unique<HostOpsExecutor>(m.weights, x);
+  };
+  f16.kv_type = KvType::kF16;
+  f16.llama_suffix = ".llama-kvf16.f32";
+  f16.llama_max_abs = 2e-2;
+  f16.tap_tol = 5e-2;
+  return {host, f16};
 }
 
 ExecBackend TestBackend() {
