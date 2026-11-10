@@ -258,13 +258,11 @@ void EnsureStandin(const fs::path& head, const fs::path& out, std::uint64_t size
   fs::resize_file(out, size);
 }
 
-void RealHeader(const std::string& label, const fs::path& head, std::uint64_t size,
-                const std::string& dir) {
-  const fs::path file = fs::path(dir) / (label + ".gguf");
-  EnsureStandin(head, file, size);
+/// Config + weight table checks on an opened real-model reader (metadata and
+/// tensor infos only; no tensor data is touched).
+void CheckRealReader(const std::string& label, const gufo::core::GgufReader& rd) {
   std::string error;
-  auto reader = gufo::core::GgufReader::OpenFile(file, &error);
-  Require(reader != nullptr, label + ": cannot open stand-in: " + error);
+  auto* reader = &rd;
   const auto config = ParseConfig(*reader, &error);
   Require(config.has_value(), label + ": config: " + error);
   const Config& c = *config;
@@ -316,6 +314,28 @@ void RealHeader(const std::string& label, const fs::path& head, std::uint64_t si
   std::cout << "  ok  " << label << ": 1203/1203 tensors resolved; types";
   for (const auto& [k, v] : types) std::cout << ' ' << k << '=' << v;
   std::cout << '\n';
+  // Per-role type counts (layer index stripped from the name).
+  std::map<std::string, std::map<std::string, int>> roles;
+  for (const auto& t : reader->GetTensors()) {
+    std::string n(t.name);
+    if (n.rfind("blk.", 0) == 0) n = n.substr(n.find('.', 4) + 1);
+    ++roles[n][std::string(gufo::core::ToString(t.type))];
+  }
+  for (const auto& [role, m] : roles) {
+    std::cout << "      " << role << ':';
+    for (const auto& [k, v] : m) std::cout << ' ' << k << '=' << v;
+    std::cout << '\n';
+  }
+}
+
+void RealHeader(const std::string& label, const fs::path& head, std::uint64_t size,
+                const std::string& dir) {
+  const fs::path file = fs::path(dir) / (label + ".gguf");
+  EnsureStandin(head, file, size);
+  std::string error;
+  auto reader = gufo::core::GgufReader::OpenFile(file, &error);
+  Require(reader != nullptr, label + ": cannot open stand-in: " + error);
+  CheckRealReader(label, *reader);
 
   // Broken twin: the same header with one tensor's type byte changed to Q2_K
   // must fail naming that tensor and type. The header is patched in a copy.
@@ -375,5 +395,19 @@ int main() {
     fs::create_directories(dir);
     RealHeader("standin-plain-q4km", head_a, 38798820576ULL, dir);
     RealHeader("standin-ad-q4km", head_b, 40426079712ULL, dir);
+    // The real file itself (mapped read-only; only metadata and tensor infos
+    // are parsed, no tensor data is touched). Skipped when absent.
+    const std::string real = EnvOr(
+        "RICURSIVE_REAL_MODEL",
+        "/server/ai/models/AtomicChat/Ripple-65B-Preview-GGUF/Ripple-65B-Preview-AD-Q4_K_M.gguf");
+    if (!fs::exists(real)) {
+      std::cout << "SKIP real model file (not found): " << real << '\n';
+      return;
+    }
+    std::string error;
+    auto reader = gufo::core::GgufReader::OpenFile(real, &error);
+    Require(reader != nullptr, "open real model: " + error);
+    Require(reader->GetSize() == 40426079712ULL, "real model size");
+    CheckRealReader("real AD-Q4_K_M", *reader);
   });
 }
