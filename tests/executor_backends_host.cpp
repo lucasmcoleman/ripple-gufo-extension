@@ -54,7 +54,7 @@ ExecBackend TestBackend() {
   b.tap_rel_tol = 1e-4;
   b.exact_equal_tol = 0;
   b.production_equal_tol = 0;  // host ops never round activations
-  b.quant_exact_max_abs = 1e-3;
+  b.quant_exact_max_abs = 1e-4;  // measured 8.6e-6 (float rounding)
   return b;
 }
 
