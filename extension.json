@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "name": "ricursive",
+  "version": "0.0.1",
+  "api_version": ">= 0.2.26",
+  "entry": "ricursive_register",
+  "registration_target": "gufo_ricursive",
+  "depends": [],
+  "platforms": ["linux"],
+  "providers": [
+    {
+      "id": "ricursive",
+      "capability": "text_generation",
+      "keys": ["gguf:ricursive"],
+      "model_ids": ["ricursive-skeleton"],
+      "target": "gufo_ricursive",
+      "entry": "ricursive_provider_register"
+    }
+  ],
+  "options": [],
+  "targets": {
+    "gufo_ricursive": {"requires": []}
+  },
+  "licenses": ["LICENSE"]
+}
