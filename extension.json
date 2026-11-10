@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "ricursive",
   "version": "0.0.1",
-  "api_version": ">= 0.2.26",
+  "api_version": ">= 0.2.0",
   "entry": "ricursive_register",
   "registration_target": "gufo_ricursive",
   "depends": [],
