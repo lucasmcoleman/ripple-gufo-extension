@@ -10,8 +10,8 @@ Files: `hip/kernels.hpp`, `hip/kernels.hip.cpp`, `hip/kernels_math.hpp`, `tests/
 - Source: `hip/kernels.hip.cpp` (one translation unit). Headers: `hip/kernels.hpp`, `hip/kernels_math.hpp`
   (no gufo header, no other include; the include root must be the extension root because the headers include each
   other as `"hip/kernels_math.hpp"`).
-- Language/arch: HIP, `gfx1151`, C++20. Wave32 (the default for gfx11) is assumed by nothing except launch geometry
-  (the kernels use `warpSize` at run time); do not add `-mwavefrontsize64`.
+- Language/arch: HIP, `gfx1151`, C++20. Blocks are 128 or 256 threads and the reductions use `warpSize` at run time
+  (wave32 is the gfx11 default); not built or tried with `-mwavefrontsize64`.
 - Flags: `-O3 -fno-fast-math -ffp-contract=off` (plus `-Wno-unused-command-line-argument` as Gemma 4 does). This is
   the Gemma 4 extension's strict-FP unit set (`attention_wmma`, `gemv`, ...) rather than its default own-kernel set
   (`-O3 -ffast-math -fno-finite-math-only`): Gemma's comment in `extension.cmake` says fast math makes a row depend on
@@ -69,7 +69,9 @@ GatherRows(src, ids_dev, dst, n_ids, src_rows, dim, stream, error*)
   parser produced 0 or NaN. Note the disagreement this exposes: `oracle/np_ref.py` (`if c > 0:` clamp, else none) and
   recon C-gpu-inventory 3b ("0 = no clamp") treat `c <= 0` as "no clamp". The brief overrides here; if some layer
   legitimately has no clamp, the executor must call a plain SwiGLU explicitly (not provided: YAGNI until a model needs it).
-  NaN inputs give NaN outputs (comparisons, not `fminf`, so a NaN is not replaced by the clamp).
+  NaN inputs give NaN outputs (comparisons, not `fminf`, so a NaN is not replaced by the clamp). A `-inf` gate input
+  also gives NaN (`-inf * sigmoid(-inf) = -inf * 0`), as in numpy; mathematically silu(-inf) = 0. Not handled: it
+  cannot occur from finite activations.
 - **RoPE angle in double.** `pos * theta^(-2 pair / 128)` and its cos/sin are evaluated in double and narrowed after.
   A float angle at position 3000 is off by up to 1.2e-4 rad, far more than the 2e-5 attention tolerance; llama.cpp and
   np_ref use float angles, which only matters beyond a few hundred positions (their tiny-fixture sequences are 64 long,
