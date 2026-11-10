@@ -205,6 +205,27 @@ void TestRope() {
   Require(std::fabs(k::RopeAngle(3000, 5, D, theta) - exact) < 1e-9 * exact, "double angle");
 }
 
+// Broken twins of the definitions above must disagree with the functions.
+void TestTwins() {
+  for (std::uint32_t window : {2U, 8U, 16U, 1024U}) {
+    for (std::uint32_t p : {window - 1, window, window + 1, 3 * window}) {
+      const auto first = k::FirstVisibleKey(p, window);
+      // window off by one in both directions: differs wherever the window is full
+      if (p + 1 > window) Require(first != k::FirstVisibleKey(p, window - 1), "window-1 twin equals");
+      if (p + 1 > window + 1) Require(first != k::FirstVisibleKey(p, window + 1), "window+1 twin equals");
+      Require(k::KeyVisible(first, p, window), "first visible key is visible");
+      if (first > 0) Require(!k::KeyVisible(first - 1, p, window), "key before the first is hidden");
+      Require(!k::KeyVisible(p + 1, p, window), "causality");
+      ++g_checks;
+    }
+  }
+  // GPT-J style interleaved pairing (d, d+1) is not the NeoX pairing.
+  for (std::uint32_t d = 0; d < 128; ++d) Require(k::RopePartner(d, 128) != (d ^ 1U), "interleaved pairing twin");
+  // Ring slot with capacity - 1 is a different mapping.
+  Require(k::RingSlot(1500, 1024) != k::RingSlot(1500, 1023), "ring twin");
+  ++g_checks;
+}
+
 }  // namespace
 
 int main() {
@@ -212,6 +233,7 @@ int main() {
     TestVisibility();
     TestRing();
     TestGqa();
+    TestTwins();
     TestRope();
     std::cout << g_checks << " exhaustive checks\n";
   });
