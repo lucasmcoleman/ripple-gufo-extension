@@ -6,20 +6,71 @@
   "entry": "ricursive_register",
   "registration_target": "gufo_ricursive",
   "depends": [],
-  "platforms": ["linux"],
+  "platforms": [
+    "linux"
+  ],
   "providers": [
     {
       "id": "ricursive",
       "capability": "text_generation",
-      "keys": ["gguf:ricursive"],
-      "model_ids": ["ricursive-skeleton"],
+      "keys": [
+        "gguf:ricursive"
+      ],
+      "model_ids": [
+        "ricursive-skeleton"
+      ],
       "target": "gufo_ricursive",
       "entry": "ricursive_provider_register"
     }
   ],
   "options": [],
   "targets": {
-    "gufo_ricursive": {"requires": []}
+    "gufo_ricursive": {
+      "requires": []
+    },
+    "gufo_ricursive_reference": {
+      "requires": [
+        "testing"
+      ]
+    },
+    "ricursive_config_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_weights_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_oracle_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_incremental_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_ref_logits": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_quant_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    }
   },
-  "licenses": ["LICENSE"]
+  "licenses": [
+    "LICENSE"
+  ]
 }
