@@ -106,3 +106,48 @@ profile on and off. Gates 56/56, CPU 20/20.
 
 `perf/gpu-use.log` at the end of this work: 33 wrapped runs, 11.4 minutes, plus 3 refusals (the coordinator's own
 model load). The gate script's lock-wrapped runs are not in that log (about 2 minutes per full set, 4 sets).
+
+## Round 3: review items F, then long prompts (target 4)
+
+F1. 8 small-shape route cases `route_{q4k,q5k}_{1,7}x{256,512}` (RunRoute; gate list 56 -> 64, self-test counts raised by
+exactly 8 invocations and the dependent sums). F2. The stage-count comment is corrected (128 sub-blocks = 2048 inputs per
+stage: K = 16384 is 8 stages, 16640 is 8 plus a 16-sub-block stage, 16128 is 7 plus a 112-sub-block stage). F3. `Project`
+checks 16-byte alignment on the 2..16-row paths too (and on the `exact` path) and falls back to row-by-row plain GEMV
+(each batched row equals the GEMV bit for bit); every route case now also runs 4 rows at +4 bytes, normal and exact, and compares with the aligned
+1-row results (as with B, the misaligned case also passes without the check on this hardware, so it proves the fallback
+is bit-equal, not that the check is needed). Rows > 16 (Q8_1 activation quantisation) were not touched. Gates 64/64, CPU 20/20.
+
+### qknorm_rope_kv (kept)
+
+Cause: `QkNormRopeAppendKernel` launched one block per (row, head) and every one of the 80 + 8 head blocks of a row
+recomputed the RoPE angle in double precision (`pow`, `cos`, `sin`, 2 threads per pair), about 23 million double
+transcendental evaluations per 2048-row call. The cos/sin depend on (position, pair) only. For more than 4 rows a block
+now serves all 88 "heads" of one row (loop over heads; the angle is evaluated once per thread per row); for <= 4 rows
+the old one-head-per-block layout stays (decode is unchanged). The value each element receives is identical.
+Micro-benchmark (q restore subtracted, hashes over q, K cache and V cache identical): 2048 rows 24,985 -> 1,300 us (19x),
+510 rows 6,109 -> 216 us (28x). Real model, `prompt` bucket, ms per pass: sw.qknorm_rope_kv 1906 -> 89.6 (2048 rows) and
+436.7 -> 24.4 (510 rows); gl 104 -> 17. 
+
+Prompt speed with the profile off: 510 tokens 152.7 -> 171.2 tokens/s; 4096 tokens 113.4 (116.8 in the first baseline
+file) -> 128.8 tokens/s (llama.cpp reference 139 / 118). Generation with the profile off unchanged: 5.263 tokens/s
+(190.0 ms) at ~540 and 5.081 (196.8 ms) at ~4,100. Ids and logits files identical to `off-510.*` / `off-4096.*` (and
+profile-on files), gates 64/64 PASS, CPU 20/20.
+
+### Multi-row attention (nothing kept)
+
+Bench (`ricursive_kernel_bench rows-suite`, us): sliding 510 rows 2,019; 2048 rows 25,133 (start 0) and 28,774 (start 2048);
+global 510 rows 2,023; 2048 rows 48,630 (start 0) and 204,324 (start 2048, up to 4,096 keys). Findings, all with identical hashes:
+- Heads per block (10 / 5 / 2): time scales inversely with heads per block (5 heads = 2x, 2 heads = 5x slower), so the
+  kernel's cost is per block and tile (loads, syncs, reductions), not per product; 10 stays best. Occupancy is already 10
+  waves/SIMD, no spills (kernel-resource-usage remark).
+- 16-byte LDS reads of q and of the probabilities (4 products per LDS read): global 2048 rows 42.7 / 181 ms (-12 %), sliding
+  -7 % to +6 %: below the 15 % bar, dropped.
+- K tile staged into LDS with coalesced loads (row stride 17 chunks, 44 KB LDS per block): 2x SLOWER (sliding 2048 rows
+  54.6 ms, global 232 ms at start 2048); dropped.
+Not tried (would change bits or needs a rewrite): matrix-unit (WMMA) scoring, sharing a K/V tile between several rows
+(global layers only: sliding-window tile starts differ per row), splitting the key range across blocks. The attention
+stage at 2048 rows is about 5 % of the FP32 peak; a rewrite is the next step if more prompt speed is wanted. The
+sw.attention stage in the real-model runs moved 1739 -> 1918 ms per pass with unchanged code (run-to-run variation).
+
+GPU time at the end of round 3: see `perf/gpu-use.log` (about 21 minutes of wrapped runs, plus the gate script's own lock time); no
+refusals in round 3.
