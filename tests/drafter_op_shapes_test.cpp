@@ -1081,7 +1081,7 @@ void RunProjectQ8(Side& a, Side& b, Rng& rng, Report& report, bool gpu) {
     c.weights = RandomMatrix(rng, sh.type, sh.m, sh.k);
     double worst = 0.0;
     const bool head = sh.m == kVocab;
-    for (const int rows : head ? std::vector<int>{15} : std::vector<int>{1, 3, 15, 16}) {
+    for (const int rows : head ? std::vector<int>{1, 3, 8, 15} : std::vector<int>{1, 3, 15, 16}) {
       c.rows = rows;
       c.what = std::string(sh.name) + ", " + std::to_string(rows) + " rows";
       c.x = Normals(rng, static_cast<std::size_t>(rows) * sh.k, 1.0);
@@ -1102,7 +1102,7 @@ void RunProjectQ8(Side& a, Side& b, Rng& rng, Report& report, bool gpu) {
         if (!(rel <= worst)) worst = rel;
       }
     }
-    report.Add(Judge(std::string("8-bit projection route, ") + sh.name + ", rows 1.." + (head ? "15" : "16"), worst, tol,
+    report.Add(Judge(std::string("8-bit projection route, ") + sh.name + ", rows 1.." + (head ? "15 (1, 3, 8 and 15: the BN = 32 and BN = 64 kernel instances)" : "16"), worst, tol,
                      "relative RMSE per row"));
   }
 }
