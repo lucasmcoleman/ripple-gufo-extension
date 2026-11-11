@@ -450,4 +450,15 @@ gufo_extension_target(
 if(TARGET ricursive_decode_bench)
   set_target_properties(ricursive_decode_bench PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
+# Tool, built on request: synthetic-tensor timing of the attention and projection kernels
+# (docs/PERF-KERNELS.md). Run only through the GPU wrapper.
+gufo_extension_target(
+  NAME ricursive_kernel_bench
+  SOURCES tools/kernel_bench.cpp
+  LINK_LIBRARIES gufo_ricursive_gpuexec gufo_ricursive_hip gufo_ricursive
+    gufo_ext_runtime gufo_ext_core gufo_ext_hip
+)
+if(TARGET ricursive_kernel_bench)
+  set_target_properties(ricursive_kernel_bench PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
 # --- integration end ---

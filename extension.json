@@ -229,6 +229,13 @@
         "testing"
       ],
       "role": "test"
+    },
+    "ricursive_kernel_bench": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
     }
   },
   "licenses": [
