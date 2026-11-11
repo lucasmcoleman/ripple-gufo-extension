@@ -74,6 +74,16 @@ class DrafterEngine {
   [[nodiscard]] virtual std::uint64_t DeviceBytes() const noexcept { return 0; }
 };
 
+/// The text of the exception being handled, in a fixed buffer (truncated to kSize - 1 bytes): handlers that are `noexcept` must not allocate, and a
+/// `std::string` built from a long message while handling an exception could throw `bad_alloc` and terminate the process (stage 4c review, finding 5).
+struct ErrorText {
+  static constexpr std::size_t kSize = 256;
+  char text[kSize]{};
+  [[nodiscard]] std::string_view view() const noexcept { return text; }
+};
+/// Call inside a `catch` block only. Never allocates and never throws.
+[[nodiscard]] ErrorText DescribeCurrentException() noexcept;
+
 /// What went wrong inside one session's drafter, shared by its ingest and its backend (docs/DRAFTER-S4.md,
 /// "Follow-ups", item C). A drafter that throws costs speed, never the request: the failed draft becomes an empty
 /// proposal, the context is reset to the current position and the failure is counted here. After kLimit

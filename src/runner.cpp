@@ -563,15 +563,6 @@ void WarnOff(std::string_view what, std::string_view why) noexcept {
   }
 }
 
-std::string DescribeCurrent() noexcept {
-  try {
-    throw;
-  } catch (const std::exception& e) {
-    return e.what();
-  } catch (...) {
-    return "unknown exception";
-  }
-}
 }  // namespace
 
 const DrafterHealth* DraftingHealthOf(Session& session) {
@@ -601,10 +592,10 @@ std::shared_ptr<DraftedSession> DraftedSession::For(Session& session, const Spec
       try {
         if (held->drafted->engine_->End() != session.Position()) held->drafted->engine_->ResetTo(session.Position());
       } catch (...) {
-        const std::string why = DescribeCurrent();
+        const ErrorText why = DescribeCurrentException();
         held->health->ResetFailed();
-        held->health->Failed("reset at the bind", why, false);
-        WarnOff("the drafter's context could not be brought to the session's position", why);
+        held->health->Failed("reset at the bind", why.view(), false);
+        WarnOff("the drafter's context could not be brought to the session's position", why.view());
         return nullptr;
       }
       held->drafted->decoder_->Restart();
@@ -614,9 +605,9 @@ std::shared_ptr<DraftedSession> DraftedSession::For(Session& session, const Spec
     try {
       held->drafted = std::make_shared<DraftedSession>(session, setup, held->health);
     } catch (...) {
-      const std::string why = DescribeCurrent();
-      held->health->BuildFailed(why);
-      WarnOff("the drafter could not be built", why);
+      const ErrorText why = DescribeCurrentException();
+      held->health->BuildFailed(why.view());
+      WarnOff("the drafter could not be built", why.view());
       return nullptr;
     }
     held->health->BuildSucceeded();

@@ -8,17 +8,28 @@ namespace gufo::models::ricursive {
 
 namespace {
 
-std::string Describe() noexcept {
-  try {
-    throw;
-  } catch (const std::exception& e) {
-    return e.what();
-  } catch (...) {
-    return "unknown exception";
+void Copy(ErrorText& out, const char* text) noexcept {
+  std::size_t n = 0;
+  while (text != nullptr && text[n] != '\0' && n + 1 < ErrorText::kSize) {
+    out.text[n] = text[n];
+    ++n;
   }
+  out.text[n] = '\0';
 }
 
 }  // namespace
+
+ErrorText DescribeCurrentException() noexcept {
+  ErrorText out;
+  try {
+    throw;
+  } catch (const std::exception& e) {
+    Copy(out, e.what());
+  } catch (...) {
+    Copy(out, "unknown exception");
+  }
+  return out;
+}
 
 void DrafterHealth::Failed(std::string_view where, std::string_view what, bool in_ingest) noexcept {
   try {
@@ -94,7 +105,7 @@ void DrafterIngest::Rows(std::uint32_t first_position, std::uint32_t rows,
     ++failures_;
     if (health_ != nullptr) {
       if (resetting) health_->ResetFailed();
-      health_->Failed("ingest", Describe(), true);
+      health_->Failed("ingest", DescribeCurrentException().view(), true);
     }
     try {
       engine_->ResetTo(first_position + rows);
@@ -110,7 +121,7 @@ void DrafterIngest::Rewound(std::uint32_t position) noexcept {
     engine_->TruncateTo(position);
   } catch (...) {
     ++failures_;
-    if (health_ != nullptr) health_->Failed("ingest", Describe(), true);
+    if (health_ != nullptr) health_->Failed("ingest", DescribeCurrentException().view(), true);
   }
 }
 
@@ -126,7 +137,7 @@ void DrafterIngest::Replaced(std::uint32_t position) noexcept {
     ++failures_;
     if (health_ != nullptr) {
       health_->ResetFailed();
-      health_->Failed("ingest", Describe(), true);
+      health_->Failed("ingest", DescribeCurrentException().view(), true);
     }
   }
 }
@@ -152,7 +163,7 @@ speculative::DraftProposal DFlash2DraftBackend::Propose(std::span<const sampling
     } catch (...) {
       if (health_ != nullptr) {
         health_->ResetFailed();
-        if (is_the_failure) health_->Failed(where, Describe(), false);
+        if (is_the_failure) health_->Failed(where, DescribeCurrentException().view(), false);
       }
     }
   };
@@ -172,7 +183,7 @@ speculative::DraftProposal DFlash2DraftBackend::Propose(std::span<const sampling
     last_block_ = engine_->Draft(static_cast<std::int32_t>(prompt_tokens[anchor_index]), anchor_position, max_tokens);
   } catch (...) {
     last_block_ = {};
-    if (health_ != nullptr) health_->Failed("draft", Describe(), false);
+    if (health_ != nullptr) health_->Failed("draft", DescribeCurrentException().view(), false);
     reset("reset after a failed draft", false);
     return proposal;
   }

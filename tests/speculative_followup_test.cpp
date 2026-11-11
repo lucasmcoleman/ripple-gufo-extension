@@ -803,6 +803,33 @@ void BuildFailTests(const TinyFixture& f, const DraftBackend& be, const std::str
     Require(health != nullptr && health->build_given_up() && health->build_failures() == DrafterHealth::kLimit, what + ": the build must be given up after the third failure");
     ++checked;
   }
+  // Stage 4c-fix item 5: the message of the exception is copied into a fixed buffer, not built as a string inside the handler (a bad_alloc there ends the
+  // process). A 20,000-character message is truncated to the buffer; the request completes as plain.
+  {
+    auto setup = std::make_shared<SpeculativeSetup>(*base);
+    setup->engine_factory = [](const SpeculativeSetup&, const EngineModel&) -> std::unique_ptr<DrafterEngine> { throw std::runtime_error(std::string(20000, 'x')); };
+    const auto spec_model = ArmedModel(f, be, *setup);
+    const auto plain_model = PlainModel(f, be);
+    Serve spec(CreateRunnerForModel(spec_model, "", setup), spec_model), plain(CreateRunnerForModel(plain_model, "", nullptr), plain_model);
+    const std::string what = be.name + "/" + f.name + " C build (a 20,000-character exception message)";
+    std::ostringstream captured;
+    std::streambuf* const old_buf = std::cerr.rdbuf(captured.rdbuf());
+    Result rs;
+    std::string failure;
+    try {
+      rs = spec.Run(prompt, limit);
+    } catch (const std::exception& e) {
+      failure = e.what();
+    }
+    std::cerr.rdbuf(old_buf);
+    Require(failure.empty(), what + ": the request failed: " + failure);
+    const Result rp = plain.Run(prompt, limit);
+    Require(rs.published == rp.published, what + ": the tokens differ from plain's");
+    const DrafterHealth* health = DraftingHealthOf(*spec.state);
+    Require(health != nullptr && health->failures() == 1 && health->last_error().size() < 300 && captured.str().size() < 600,
+            what + ": the recorded message must be bounded (" + std::to_string(health != nullptr ? health->last_error().size() : 0) + " bytes in the record, " + std::to_string(captured.str().size()) + " on stderr)");
+    ++checked;
+  }
   // The drafter exists but its context cannot be brought to the session's position at the bind (ResetTo throws there): that request
   // runs as plain generation, is counted, and the next bind builds on what the sink kept.
   {
