@@ -56,7 +56,12 @@ struct DrafterOptions {
   /// blocks). The host operations ignore it.
   bool exact{false};
   DrafterRoutes q8;  ///< groups of projections on the 8-bit activation route (default: none)
+  /// The attention kernel, by name (kDraftAttentionKernels). Only "default" exists; stage 2c adds a second one and the dispatch
+  /// behind this name (Ops::DraftAttention has no kernel argument yet). An unknown name is refused when the executor is built.
+  std::string attention_kernel{"default"};
 };
+/// The attention kernels the drafter knows, by name.
+inline constexpr std::string_view kDraftAttentionKernels[] = {"default"};
 
 /// Test-only deliberate defects (each a one-line change that must make the checks fail).
 struct DrafterExecFaults {

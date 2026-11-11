@@ -757,6 +757,18 @@ void TinyCase(const ricursive_test::Model& target, const std::string& dir) {
   CheckBookkeeping(t, q8);
   CheckSlackEdge(t, q8);
   CheckAccounting(t, q8);
+  {  // item 5: the attention kernel is chosen by name; an unknown name is refused when the executor is built
+    DrafterOptions o;
+    o.attention_kernel = "no-such-kernel";
+    std::string what;
+    try {
+      (void)MakeEngine(q8, t.target, o);
+    } catch (const std::exception& e) {
+      what = e.what();
+    }
+    RequireContains(what, "attention kernel", "an unknown attention kernel name");
+    std::printf("  attention kernel by name: 'default' is built, an unknown name is refused (%s)\n", what.c_str());
+  }
   // 4. twins of 1.
   {
     Walk w = base("");
@@ -835,18 +847,46 @@ int Real(int argc, char** argv) {
       std::printf("  projection routes on the 8-bit path: %s\n", ToString(o.q8).c_str());
     }
     auto engine = MakeEngine(d, target, o);
+    DrafterExecutor& exec = engine->executor();
     const std::size_t F = d.w.config.FeatureWidth();
+    // The named stages are compared with the oracle's stage file as well as the tokens (docs/DRAFTER-S2.md, "Stage 2b": a pooled token
+    // percentage can hide a subtle error that a stage shows): relative RMSE per stage, the worst over the context chunks and the anchors.
+    // F16 context storage and, on the GPU, the 8-bit activation route of the context passes (chunks of 128 rows) round: the tolerance is
+    // 2e-3 on the host and 5e-2 on the GPU (RICURSIVE_TEST_STAGE_TOL overrides); the table of the largest stage errors is printed either way.
+    const double stage_tol = std::getenv("RICURSIVE_TEST_STAGE_TOL") != nullptr ? std::stod(std::getenv("RICURSIVE_TEST_STAGE_TOL"))
+                                                                                : (TheBackend().gpu ? 5e-2 : 2e-3);
+    std::map<std::string, double> worst_stage;
+    const auto note = [&](const std::string& name, double rel) {
+      auto [it, fresh] = worst_stage.try_emplace(name, rel);
+      if (!fresh && !(rel <= it->second)) it->second = rel;  // keeps NaN / inf
+    };
     const auto t0 = std::chrono::steady_clock::now();
-    engine->Append(0, std::span(dump.taps).subspan(0, max_anchor * F));
-    std::printf("  context of %zu rows appended in %.1f s\n", max_anchor,
+    {
+      std::map<std::string, std::vector<float>> ctx;
+      for (std::size_t at = 0; at < max_anchor; at += 128) {
+        const std::size_t n = std::min<std::size_t>(128, max_anchor - at);
+        exec.AppendContext(std::span(dump.taps).subspan(at * F, n * F), n,
+                           [&](std::string_view name, int layer, const float* data, std::size_t rows, std::size_t width) {
+                             auto& v = ctx[Key(name, layer)];
+                             v.insert(v.end(), data, data + rows * width);
+                           });
+      }
+      for (const auto& [name, got] : ctx) note(name, RelRmse(got, oracle.at(name).f));
+    }
+    std::printf("  context of %zu rows appended in %.1f s (chunks of 128 rows, stages captured)\n", max_anchor,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     std::size_t done = 0, rows = 0, equal = 0, anchors_equal = 0;
     double draft_seconds = 0;
     for (const std::size_t s : anchors) {
       if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > max_seconds) break;
       const auto a = std::chrono::steady_clock::now();
-      const auto block = engine->Draft(dump.ids[s], static_cast<std::uint32_t>(s));
+      std::map<std::string, std::vector<float>> got_stage;
+      const auto block = exec.DraftStep(dump.ids[s], static_cast<std::uint32_t>(s), d.w.config.block_size - 1,
+                                        [&](std::string_view name, int layer, const float* data, std::size_t r, std::size_t width) {
+                                          got_stage[Key(name, layer)].assign(data, data + r * width);
+                                        });
       draft_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
+      for (const auto& [name, g] : got_stage) note(name, RelRmse(g, oracle.at("a" + std::to_string(s) + "/" + name).f));
       const auto& want = oracle.at("a" + std::to_string(s) + "/tokens").i;
       std::size_t same = 0, first = 0;
       while (first < want.size() && first < block.tokens.size() && block.tokens[first] == want[first]) ++first;
@@ -865,6 +905,19 @@ int Real(int argc, char** argv) {
     std::printf("  real weights, host ops, F16 context: %zu anchors, %zu all 15 tokens equal, %zu of %zu token rows equal (%.1f%%), %.1f s per anchor\n", done,
                 anchors_equal, equal, rows, 100.0 * static_cast<double>(equal) / static_cast<double>(rows),
                 draft_seconds / static_cast<double>(done));
+    // the stage table: the largest errors first
+    {
+      std::vector<std::pair<double, std::string>> by;
+      for (const auto& [name, rel] : worst_stage) by.emplace_back(rel, name);
+      std::sort(by.rbegin(), by.rend());
+      std::printf("  %zu stages compared with the oracle (relative RMSE, worst over the context chunks and anchors, tolerance %s); the largest:\n",
+                  by.size(), Sci(stage_tol).c_str());
+      for (std::size_t i = 0; i < std::min<std::size_t>(10, by.size()); ++i) std::printf("      %-14s %s\n", by[i].second.c_str(), Sci(by[i].first).c_str());
+      std::string failing;
+      for (const auto& [rel, name] : by)
+        if (Exceeds(rel, stage_tol) && failing.size() < 200) failing += " " + name + " " + Sci(rel);
+      Require(failing.empty(), "stages above the tolerance " + Sci(stage_tol) + ":" + failing);
+    }
     Require(done >= 10 || max_seconds < 1e29, "fewer than 10 anchors ran");
     Require(equal * 100 >= rows * 95, "fewer than 95% of the token rows equal the stage 1 reference's");
   });

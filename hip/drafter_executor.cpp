@@ -274,6 +274,10 @@ DrafterExecutor::DrafterExecutor(std::unique_ptr<Ops> ops, std::shared_ptr<const
     prof_ = std::make_unique<Profile>();
   }
   const DrafterConfig& c = drafter_->config;
+  if (std::find(std::begin(kDraftAttentionKernels), std::end(kDraftAttentionKernels), std::string_view(options_.attention_kernel)) ==
+      std::end(kDraftAttentionKernels)) {
+    throw std::invalid_argument("ricursive drafter: unknown attention kernel '" + options_.attention_kernel + "' (known: default)");
+  }
   if (c.head_dim == 0 || c.head_dim % 2 != 0 || c.head_dim > km::kDraftMaxHeadDim) {
     throw std::invalid_argument("ricursive drafter: head_dim " + std::to_string(c.head_dim) +
                                 " (the operations take even values up to 256)");
