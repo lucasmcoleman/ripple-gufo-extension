@@ -228,6 +228,18 @@ class HostOps final : public Ops {
       counters_->q8_rows += static_cast<std::uint64_t>(std::max(rows, 0));
       counters_->q8_weights.push_back(w.data);
     }
+    // The GPU refuses a pass whose scratch is short (rocm::ProjectW8A8): model it, so that a missing reservation fails here too.
+    // Q8_0 needs what the kernel reads, the K-quants `rows`, dense weights no scratch.
+    if (w.type != core::GgmlType::kF32 && w.type != core::GgmlType::kBF16 && rows >= 1) {
+      const std::uint64_t n = static_cast<std::uint64_t>(rows);
+      const std::uint64_t read_rows = w.type == core::GgmlType::kQ8_0 ? km::Q8KernelReadRows(n, w.rows, w.cols) : n;
+      const std::uint64_t need = km::Q8ActivationBytes(read_rows, w.cols);
+      if (scratch_bytes_ < need) {
+        Fail("ProjectQ8", "the Q8_1 scratch holds " + std::to_string(scratch_bytes_) + " bytes, " + std::to_string(rows) + " rows of " +
+                              std::to_string(w.cols) + " need " + std::to_string(need) + " (" + std::to_string(read_rows) +
+                              " rows are read; reserve it before the pass)");
+      }
+    }
     ProjectRows(w, x, rows, y);
   }
   void ProjectRows(const WeightView& w, const float* x, int rows, float* y) {

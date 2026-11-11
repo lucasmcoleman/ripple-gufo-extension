@@ -190,6 +190,9 @@ struct ProjectCase {
   int rows{0};
   std::vector<std::uint8_t> weights;
   std::vector<float> x;
+  /// What the OpsSide reserves before the pass: 2 = what the kernel reads (rocm::Q8ReserveRows), 1 = `rows` only (the reservation before
+  /// the review of stage 2b), 0 = nothing. Only the check that the host operations model the scratch uses the others.
+  int reservation{2};
 };
 struct SelectOut {
   std::vector<std::int32_t> tokens, ids;
@@ -268,7 +271,8 @@ class OpsSide final : public Side {
     w.bytes = c.weights.size();
     const float* x = Up(c.x);
     float* y = Alloc<float>(std::size_t{static_cast<std::size_t>(c.rows)} * c.m);
-    ops_->ReserveProjection(static_cast<std::size_t>(rocm::Q8ReserveRows(static_cast<std::uint64_t>(c.rows))), c.k);  // what the kernel reads
+    if (c.reservation == 2) ops_->ReserveProjection(static_cast<std::size_t>(rocm::Q8ReserveRows(static_cast<std::uint64_t>(c.rows))), c.k);  // what the kernel reads
+    if (c.reservation == 1) ops_->ReserveProjection(static_cast<std::size_t>(c.rows), c.k);
     ops_->ProjectQ8(w, x, c.rows, y);
     auto result = Down<float>(y, std::size_t{static_cast<std::size_t>(c.rows)} * c.m);
     Release();
@@ -1150,6 +1154,44 @@ void CheckQ8ReservationCoversKernel(Report& report) {
   if (!all) ++report.failures;
 }
 
+/// Review of stage 2b, finding 5: the host operations model the scratch, so a missing or short reservation fails on the host as it throws on the
+/// GPU (ProjectW8A8). Q8_0 needs what the kernel reads (15 rows: four tiles), the K-quants the rows only, dense weights nothing.
+void CheckHostModelsScratch(Report& report) {
+  Rng rng(7);
+  struct Want {
+    core::GgmlType type;
+    int reservation;
+    bool throws;
+  };
+  std::size_t checks = 0;
+  for (const Want& w : {Want{core::GgmlType::kQ8_0, 0, true}, Want{core::GgmlType::kQ8_0, 1, true}, Want{core::GgmlType::kQ8_0, 2, false},
+                        Want{core::GgmlType::kQ4_K, 0, true}, Want{core::GgmlType::kQ4_K, 1, false}, Want{core::GgmlType::kQ4_K, 2, false}}) {
+    ProjectCase c;
+    c.type = w.type;
+    c.m = 64;
+    c.k = 1024;
+    c.rows = 15;
+    c.reservation = w.reservation;
+    c.weights = RandomMatrix(rng, c.type, c.m, c.k);
+    c.x = Normals(rng, static_cast<std::size_t>(c.rows) * c.k, 1.0);
+    OpsSide side(CreateHostOps());
+    bool threw = false;
+    try {
+      (void)side.ProjectQ8(c);
+    } catch (const std::exception& e) {
+      threw = std::string(e.what()).find("scratch") != std::string::npos;
+    }
+    ++checks;
+    ++report.checks;
+    if (threw != w.throws) {
+      ++report.failures;
+      std::printf("  host scratch model: %s, reservation %d: %s\n", std::string(core::ToString(w.type)).c_str(), w.reservation,
+                  threw ? "refused although the scratch suffices" : "ran without enough scratch");
+    }
+  }
+  std::printf("  host scratch model: a missing or short reservation is refused, the right one runs (%zu cases: Q8_0 and Q4_K at 15 rows)\n", checks);
+}
+
 // ---- the whole run --------------------------------------------------------------------------------------------------------------
 void RunAll() {
   const Backend& be = TheBackend();
@@ -1198,6 +1240,7 @@ void RunAll() {
   std::printf("  (8-bit projection route: %.1f s)\n", Seconds(t0));
   CheckQ8ReservationCoversKernel(report);
 
+  if (!be.gpu) CheckHostModelsScratch(report);
   if (!be.gpu) {
     // Twins: one wrong index in the naive side's ring arithmetic must fail the comparison.
     const KvType type = KvType::kF16;
