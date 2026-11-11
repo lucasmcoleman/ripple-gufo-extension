@@ -1203,7 +1203,8 @@ void CheckHostModelsScratch(Report& report) {
 // ---- stage 2c: the tiled attention kernel -------------------------------------------------------------------------------------
 /// Stage 2c: RICURSIVE_TEST_ATTENTION=tiled. Only DraftAttention's cases run (the other operations do not depend on the kernel
 /// and are checked by the default run): A = the tiled kernel (GPU modes) or its structural twin (cpu mode, the host operations),
-/// B = the existing host operation (Ops::DraftAttention on the host), at every context length and wrap position of AttentionSpecs, with
+/// B = the existing host operation (Ops::DraftAttention on the host), at every context length and wrap position of AttentionSpecs plus one tiled-only
+/// case (sliding, 4,096 rows, 16 block rows: several tiles per split at the real workgroup size), with
 /// the GPU's attention tolerance (both A sides compute in fp32 as the GPU does). cpu mode also runs the three faulty twins, which must fail.
 void RunTiled(const Backend& be, Rng& rng, const Rings& rings, Report& report) {
   OpsSide a(be.gpu ? CreateGpuOps() : CreateHostOps(), /*tiled=*/true);
@@ -1213,6 +1214,19 @@ void RunTiled(const Backend& be, Rng& rng, const Rings& rings, Report& report) {
     if (be.gpu && (type == KvType::kF16) != be.f16) continue;
     const auto t0 = Clock::now();
     RunAttention(a, b, rng, rings, type, report, tol);
+    {  // Tiled only (review of stage 2c, finding 3): the real 16 block rows at a context with more than one tile per split (4,095 keys: 16 splits of
+       // 8 tiles, 320 threads); every other case of 4,096 rows or more runs 4 rows, and the 16-row cases have at most one tile per split.
+      const AttnSpec spec{"sliding, 4096 context rows, 16 block rows (8 tiles per split)", kSlideCap, kSlideWindow, 4096, 0, 16};
+      const AttnCase c = MakeAttn(rng, rings, type, spec);
+      const auto t1 = Clock::now();
+      const auto oa = a.Attention(c);
+      const double ta = Seconds(t1);
+      const auto t2 = Clock::now();
+      const auto ob = b.Attention(c);
+      char timing[96];
+      std::snprintf(timing, sizeof timing, "A %.1f s, B %.1f s", ta, Seconds(t2));
+      report.Add(Judge("attention " + c.what, WorstRowRel(oa, ob, kD), tol.attn_rel, timing));
+    }
     std::printf("  (attention, tiled against the host operation, %s ring: %.1f s)\n", type == KvType::kF16 ? "F16" : "F32", Seconds(t0));
   }
   if (be.gpu) return;
