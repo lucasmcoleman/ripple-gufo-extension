@@ -273,7 +273,9 @@ __global__ void AttentionKernel(const float* __restrict__ q,
                                 std::uint32_t start_pos, std::uint32_t capacity,
                                 float scale) {
   const std::uint32_t t = blockIdx.x;
-  const std::uint32_t kvh = blockIdx.y;
+  const std::uint32_t group = heads / kv_heads;
+  const std::uint32_t qh0 = blockIdx.y * kGroup;  // first query head of this block
+  const std::uint32_t kvh = qh0 / group;
   const std::uint32_t d = threadIdx.x;
   const std::uint32_t p = start_pos + t;
   const std::uint32_t first = FirstVisibleKey(p, window);
@@ -286,7 +288,7 @@ __global__ void AttentionKernel(const float* __restrict__ q,
   const int waves = kHeadDim / warpSize;
 #pragma unroll
   for (int g = 0; g < kGroup; ++g) {
-    qs[g][d] = q[(std::size_t{t} * heads + kvh * kGroup + g) * kHeadDim + d];
+    qs[g][d] = q[(std::size_t{t} * heads + qh0 + g) * kHeadDim + d];
   }
   __syncthreads();
   float m[kGroup];
@@ -312,6 +314,7 @@ __global__ void AttentionKernel(const float* __restrict__ q,
       const CacheT* krow =
           k_cache + std::size_t{RingSlot(j, capacity)} * kv_width +
           kvh * kHeadDim;
+#pragma unroll
       for (int c = 0; c < static_cast<int>(kHeadDim) / 8; ++c) {
         float kf[8];
         LoadKeys8(krow, c, kf);
@@ -368,6 +371,7 @@ __global__ void AttentionKernel(const float* __restrict__ q,
       acc[g] *= alpha[g];
     }
     const std::uint32_t count = TileKeys(ts, p);
+#pragma unroll 8
     for (std::uint32_t jj = 0; jj < count; ++jj) {
       const float vv = LoadCache(&v_cache[std::size_t{RingSlot(ts + jj, capacity)} *
                                               kv_width +
@@ -381,9 +385,19 @@ __global__ void AttentionKernel(const float* __restrict__ q,
   }
 #pragma unroll
   for (int g = 0; g < kGroup; ++g) {
-    out[(std::size_t{t} * heads + kvh * kGroup + g) * kHeadDim + d] =
+    out[(std::size_t{t} * heads + qh0 + g) * kHeadDim + d] =
         acc[g] / l[g];
   }
+}
+
+/// Query heads per block for a launch: a block that serves a whole KV group
+/// reuses each K/V row for all its heads, which wins when many rows fill the
+/// GPU; with few rows only kv_heads blocks exist, so each head gets its own
+/// block pair (every head's arithmetic is independent of the others, so the bits
+/// do not change).
+std::uint32_t HeadsPerBlock(std::uint32_t group, std::uint32_t tokens) {
+  if (tokens > 4) return group;
+  return group % 2 == 0 ? 2U : 1U;  // measured: 2 heads per block beat 1, 5 and 10 (docs/PERF-KERNELS.md)
 }
 
 template<int kGroup, class CacheT>
@@ -392,7 +406,7 @@ void LaunchAttention(const float* q, const void* k, const void* v, float* out,
                      std::uint32_t window, std::uint32_t start_pos,
                      std::uint32_t tokens, std::uint32_t capacity, float scale,
                      hipStream_t stream) {
-  AttentionKernel<kGroup, CacheT><<<dim3(tokens, kv_heads), kHeadDim, 0, stream>>>(
+  AttentionKernel<kGroup, CacheT><<<dim3(tokens, heads / kGroup), kHeadDim, 0, stream>>>(
       q, static_cast<const CacheT*>(k), static_cast<const CacheT*>(v), out,
       heads, kv_heads, window, start_pos, capacity, scale);
 }
@@ -404,14 +418,18 @@ bool DispatchAttention(std::uint32_t group, const float* q, const void* k,
                        std::uint32_t start_pos, std::uint32_t tokens,
                        std::uint32_t capacity, float scale,
                        hipStream_t stream) {
+  if (group != 1 && group != 2 && group != 10) {
+    return false;
+  }
 #define RICURSIVE_ATTN_CASE(G)                                              \
   case G:                                                                   \
     LaunchAttention<G, CacheT>(q, k, v, out, heads, kv_heads, window,       \
                                start_pos, tokens, capacity, scale, stream); \
     return true;
-  switch (group) {
+  switch (HeadsPerBlock(group, tokens)) {
     RICURSIVE_ATTN_CASE(1)
     RICURSIVE_ATTN_CASE(2)
+    RICURSIVE_ATTN_CASE(5)
     RICURSIVE_ATTN_CASE(10)
     default:
       return false;
