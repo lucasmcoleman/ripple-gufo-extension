@@ -197,6 +197,11 @@ bool Executor::Rewind(std::uint32_t position) {
                               " beyond position " + std::to_string(end_));
   const std::uint32_t needed = info_.WindowFirst(position);
   if (needed < position && needed < RetainedBegin()) return false;
+  // Position 0 reads no row, so the test above passes; but the high water mark and the import
+  // floor stay, RetainedBegin() stays above 0, and the first pass from 0 would find "the window
+  // before the position is not retained" (and its writes would reuse the ring slots of old
+  // positions the write guard was never told about). Refuse: callers reset and recompute.
+  if (position == 0 && RetainedBegin() > 0) return false;
   end_ = position;
   return true;
 }

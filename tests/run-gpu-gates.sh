@@ -15,8 +15,8 @@
 #   executor_test     kernel_ops attention_ops projection_ops embed   (every filter)
 #   executor_contract executor_test       (contract suite on the GPU backend)
 #   engine_tests      executor_contract   (engine_test, continuation_test and draft_session_test
-#                                          (docs/DRAFTER-S3.md: Session::Verify / AcceptVerified / taps, 4
-#                                          invocations: verify and rest of tinyA and tinyB) with the GPU backend,
+#                                          (docs/DRAFTER-S3.md: Session::Verify / AcceptVerified / taps, 6
+#                                          invocations: verify, rest and rewind0 of tinyA and tinyB) with the GPU backend,
 #                                          RICURSIVE_TEST_BACKEND=gpu-exact: F32 caches, no activation
 #                                          rounding, so they stay comparable with the scalar Reference;
 #                                          their twins still run on the CPU executor. output_parser,
@@ -109,7 +109,8 @@ invocations() {
       echo "continuation|ricursive_continuation_test||RICURSIVE_TEST_BACKEND=gpu-exact"
       # docs/DRAFTER-S3.md; "verify" = check 1 (k 1..16 x every a across W, 2W+3 and the ring wrap),
       # "rest" = checks 2 to 6 (cycles, taps, twins, snapshots, refusals). Long: see perf/STAGE3-GPU.md.
-      for g in verify rest; do
+      # "rewind0" = Sync to an unrelated text after a wrapped ring / a restore (docs/DRAFTER-S4.md, Part 0).
+      for g in verify rest rewind0; do
         for f in tinyA tinyB; do
           echo "draft-$g-$f|ricursive_draft_session_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu-exact"
         done

@@ -14,6 +14,8 @@
 //   5. a checkpoint (component cache adapter) taken after drafted steps, and a
 //      prefix-reuse sync, give the same bytes and continuation as after plain decoding
 //   6. refusals and the write guard
+//   7. (rewind0) Sync to a text sharing no prefix with a session whose ring has wrapped, or
+//      that was restored from a checkpoint, in several passes: equal to a fresh session
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -544,9 +546,77 @@ void Refusals(const TinyFixture& f, const DraftBackend& be, const Plain& plain) 
   std::printf("  %s/%s: 6. refusals, write guard, settling calls, drafting off by default: ok\n", be.name.c_str(), f.name.c_str());
 }
 
+// ---- 7 rewind to position 0 -----------------------------------------------------------
+// Sync to a text sharing no prefix with the session asks the executor to rewind to 0. When
+// the ring has wrapped, or the cache was restored (rows below the floor are gone), the
+// executor must refuse so that the session resets and recomputes; accepting left the
+// high-water mark behind and the second pass of the new text failed.
+
+void FollowAndCompare(Session& got, Session& want, const std::string& what) {
+  std::string error;
+  Require(SameBits(got.Logits(), want.Logits()), what + ": logits after the new text differ from a fresh session");
+  Require(got.tokens() == want.tokens(), what + ": tokens differ");
+  for (int step = 0; step < 8; ++step) {
+    const std::int32_t token = Argmax(want.Logits());
+    Require(Argmax(got.Logits()) == token, what + ": token differs at step " + std::to_string(step));
+    Require(got.Evaluate(token, &error), what + ": evaluate: " + error);
+    Require(want.Evaluate(token, &error), error);
+    Require(SameBits(got.Logits(), want.Logits()), what + ": logits differ at step " + std::to_string(step));
+  }
+}
+
+void RewindToZero(const TinyFixture& f, const DraftBackend& be, const std::vector<std::int32_t>& S) {
+  std::string error;
+  std::vector<std::string> failures;  // both scenarios run: they fail for different reasons
+  try {  // the ring wrapped: 73 tokens, then an unrelated text in two passes of 20 rows
+    auto unrelated = SyntheticTokens(0x2E40ULL + f.window, 30);
+    if (unrelated[0] == S[0]) unrelated[0] = (unrelated[0] + 1) % 256;
+    const auto model = Armed(f, be);
+    Require(model->RingRows() < 73, "the fixture ring must wrap within 73 tokens");
+    auto s = NewSession(model);
+    Require(s->Sync(Slice(S, 0, 73), &error), error);
+    // The cache's guard must hear about the whole context before any row is overwritten: writing position q
+    // reuses the ring slot of the old position q + R, rows a checkpoint may have borrowed.
+    std::vector<WritePlan> plans;
+    s->SetWriteGuard([&](const WritePlan& pl) { plans.push_back(pl); });
+    const bool synced = s->Sync(unrelated, &error);
+    Require(synced, be.name + "/" + f.name + ": Sync to an unrelated text after the ring wrapped failed: " + error);
+    Require(!plans.empty() && plans.front().written == RowRange{0, model->MaxContext()} && plans.front().evicted.empty(),
+            be.name + "/" + f.name + ": the guard was not told about the whole context before the recompute");
+    s->SetWriteGuard({});
+    auto fresh = NewSession(model);
+    Require(fresh->Sync(unrelated, &error), error);
+    FollowAndCompare(*s, *fresh, be.name + "/" + f.name + " wrapped");
+  } catch (const std::exception& e) {
+    failures.push_back(e.what());
+  }
+  try {  // a restored checkpoint (floor above 0), then an unrelated text in three passes of 32 rows
+    auto unrelated = SyntheticTokens(0x2E41ULL + f.window, 70);
+    if (unrelated[0] == S[0]) unrelated[0] = (unrelated[0] + 1) % 256;
+    Rig source(f, be);
+    Require(source.session().Sync(Slice(S, 0, 61), &error), error);
+    const Checkpoint ck = Capture(source);
+    Rig restored(f, be);
+    Require(Restore(restored, ck), "restore refused");
+    Require(restored.session().executor().RetainedBegin() > 0, "a restore at 61 must leave a floor above 0");
+    const bool synced = restored.session().Sync(unrelated, &error);
+    Require(synced, be.name + "/" + f.name + ": Sync to an unrelated text after a restore failed: " + error);
+    Rig fresh(f, be);
+    Require(fresh.session().Sync(unrelated, &error), error);
+    FollowAndCompare(restored.session(), fresh.session(), be.name + "/" + f.name + " restored");
+  } catch (const std::exception& e) {
+    failures.push_back(e.what());
+  }
+  for (const auto& failure : failures) std::fprintf(stderr, "%s\n", failure.c_str());
+  Require(failures.empty(), std::to_string(failures.size()) + " of 2 scenarios failed: " + (failures.empty() ? std::string() : failures.front()));
+  std::printf("  %s/%s: 7. Sync to an unrelated text (several passes) after a wrapped ring and after a restored checkpoint: "
+              "logits and tokens of the new text and of 8 further steps equal a fresh session's, bit for bit\n",
+              be.name.c_str(), f.name.c_str());
+}
+
 }  // namespace
 
-// Argument: "<group>:<fixture>" with group verify (check 1) or rest (checks 2 to 6) and
+// Argument: "<group>:<fixture>" with group verify (check 1), rest (checks 2 to 6) or rewind0 (check 7) and
 // fixture tinyA or tinyB; none = everything. The GPU gates run one group of one fixture
 // per GPU-lock acquisition. "verify:<fixture>:<n>" (n = 0..3) runs one of the four anchor
 // boundaries (W, 2W+3, ring, 2 x ring) only: the way to split a verify run that is too long.
@@ -566,8 +636,13 @@ int main(int argc, char** argv) {
     std::size_t scenario_total = 0, groups = 0;
     for (const auto& be : DraftBackends()) {
       for (const auto& f : TinyFixtures()) {
-        if (!wants("verify", f) && !wants("rest", f)) continue;
+        if (!wants("verify", f) && !wants("rest", f) && !wants("rewind0", f)) continue;
         const auto S = SyntheticTokens(f.window * 100 + 3 + (f.window == 8 ? 0 : 5), kSeq);
+        if (wants("rewind0", f)) {
+          RewindToZero(f, be, S);
+          ++groups;
+        }
+        if (!wants("verify", f) && !wants("rest", f)) continue;
         const auto model = Armed(f, be);
         const Plain plain = RunPlain(model, S);
         // Armed but unused changes nothing: the unarmed model gives the same bits.

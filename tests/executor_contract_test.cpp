@@ -15,6 +15,8 @@
 //   7 write plans / retained rows ring one slot short
 //   8 taps and K/V rows vs the    compared one layer off
 //     Reference
+//   9 rewind to position 0        (none: the unfixed executor fails it, docs/DRAFTER-S4.md)
+//     after a wrap and an import
 #include <cstdio>
 #include <cstring>
 #include <gufo/ext/cache.hpp>
@@ -336,6 +338,97 @@ Outcome Rewinds(const Ctx& c) {
   return o;
 }
 
+// ---- 9 rewind to position 0 ------------------------------------------------------
+// Position 0 reads no earlier row, but the high water mark and the import floor
+// stay where they were: a rewind to 0 after the ring wrapped (or after an import)
+// would leave RetainedBegin() above 0, and the next pass could not start. It must
+// be refused, changing nothing, like every other rewind that needs recomputation;
+// a rewind to 0 where nothing is lost (high water within the ring) still succeeds.
+Outcome RewindToZero(const Ctx& c) {
+  Outcome o;
+  const std::uint32_t M = c.f.Rows(), V = c.f.model.weights.config.vocab_size;
+  constexpr std::uint32_t kHigh = 40;
+  const auto want = [&] {
+    auto e = c.make(Config(c, M));
+    return Feed(*e, c.f.u, 0, kSeq, {5});
+  }();
+  std::size_t widest = 0;
+  const auto from_scratch = [&](Executor& e, const char* what) {
+    // What every caller does when Rewind says false: Reset and recompute.
+    const auto got = Feed(e, c.f.u, 0, kSeq, {5}, &widest);
+    o.measure = MaxKeepNaN(o.measure, MaxDiff(got, want));
+    if (Exceeds(o.measure, Tol(c, e, widest)))
+      o.Fail(std::string(what) + ": a new text from position 0 differs from a fresh executor by " +
+             std::to_string(o.measure));
+  };
+  (void)V;
+  // (a) the ring wrapped
+  {
+    auto a = c.make(Config(c, M));
+    Feed(*a, c.f.t, 0, kHigh, {M});
+    Require(kHigh > a->Info().ring_rows, "fixture ring too large for the rewind test");
+    const std::uint32_t retained = a->RetainedBegin();
+    if (retained == 0) o.Fail("RetainedBegin is 0 after the ring wrapped");
+    const Bytes before = ExportAll(*a, retained);
+    if (a->Rewind(0)) {
+      o.Fail("rewind to 0 accepted after the ring wrapped (RetainedBegin " + std::to_string(retained) + ")");
+    } else if (a->Position() != kHigh || a->RetainedBegin() != retained ||
+               ExportAll(*a, retained) != before) {
+      o.Fail("refused rewind to 0 changed the executor");
+    }
+    if (a->State() == ExecState::kReady) {
+      a->Reset();
+      from_scratch(*a, "after the refused rewind");
+    }
+  }
+  // (b) after an import: the floor is above 0
+  {
+    auto src = c.make(Config(c, M));
+    Feed(*src, c.f.t, 0, kHigh, {M});
+    auto b = c.make(Config(c, M));
+    const ExecutorInfo& info = src->Info();
+    gufo::cache::ComponentDescriptor window;
+    window.kind = gufo::cache::ComponentKind::kWindowRows;
+    window.rows_per_chunk = kChunkRows;
+    window.window_rows = c.f.W - 1;
+    b->BeginImport(kHigh);
+    for (std::uint32_t l = 0; l < info.layers; ++l) {
+      for (const KvPart part : {KvPart::kKey, KvPart::kValue}) {
+        const std::uint32_t first =
+            info.sliding[l] ? static_cast<std::uint32_t>(gufo::cache::FirstChunkRow(window, kHigh)) : 0;
+        b->ImportRows(l, part, {first, kHigh}, Export(*src, l, part, {first, kHigh}));
+      }
+    }
+    if (!b->CommitImport()) {
+      o.Fail("CommitImport refused the import");
+    } else {
+      const std::uint32_t retained = b->RetainedBegin();
+      if (retained == 0) o.Fail("RetainedBegin is 0 after an import at " + std::to_string(kHigh));
+      if (b->Rewind(0)) {
+        o.Fail("rewind to 0 accepted after an import (RetainedBegin " + std::to_string(retained) + ")");
+      } else if (b->Position() != kHigh || b->RetainedBegin() != retained) {
+        o.Fail("refused rewind to 0 changed the executor after an import");
+      }
+      if (b->State() == ExecState::kReady) {
+        b->Reset();
+        from_scratch(*b, "after the refused rewind (import)");
+      }
+    }
+  }
+  // (c) nothing lost: a rewind to 0 succeeds and the text from 0 is the fresh one
+  {
+    auto d = c.make(Config(c, M));
+    Feed(*d, c.f.t, 0, d->Info().ring_rows, {M});
+    if (d->RetainedBegin() != 0) o.Fail("RetainedBegin above 0 within the first ring");
+    if (!d->Rewind(0) || d->Position() != 0) {
+      o.Fail("rewind to 0 refused where no row was lost");
+    } else {
+      from_scratch(*d, "after the accepted rewind");
+    }
+  }
+  return o;
+}
+
 // ---- 6 failure in the middle of a forward --------------------------------------
 template<class Fn>
 bool RefusedAsLogicError(Fn&& fn) {
@@ -596,6 +689,8 @@ void RunBackend(const ContractBackend& b, const Fixture& f) {
   if (twins)
     Report(p + "8 twin: compared one layer off",
            OnTwin([&] { return TapsAndRows(ok, 1); }), true, true);
+
+  Report(p + "9 rewind to position 0 (wrapped, imported, nothing lost)", RewindToZero(ok), false, true);
 }
 
 }  // namespace
