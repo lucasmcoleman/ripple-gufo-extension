@@ -1,14 +1,14 @@
 // ricursive_drafter_bench DRAFTER.gguf TARGET.gguf --dump DIR [--contexts 500,4096,16384] [--draft 1,2,3,4,6,15]
 //     [--steps 20] [--warmup 3] [--appends 5] [--kv f16|f32] [--backend gpu|host] [--append-rows 512]
-//     [--engine head|factory] [--q8 none/block/head/context/block,head,context/all ...] [--attention default]
+//     [--engine head|factory] [--q8 none/block/head/context/block,head,context/all ...] [--attention default|tiled]
 //     [--drafts-out FILE.i32 --from A --to B]
 //
 // Stage 2b switches (docs/DRAFTER-S2.md): --engine head (default) uploads the target's output head alone (0.42 GB);
 // --engine factory is the production path, MakeGpuDrafterEngine over the target's device copy (the whole 40 GB target is
 // uploaded first: its time is printed). --q8 takes route sets separated by '/' (groups block, head, context of
 // DrafterOptions::q8; "none" = today's behaviour) and runs the whole table once per set, in one process (the drafter's weights
-// stay resident between sets). --attention NAME picks the attention kernel by name (only "default" exists; stage 2c adds a
-// second). The cost of creating an engine is printed for the first set: the first engine (which uploads the drafter's weights
+// stay resident between sets). --attention NAME picks the attention kernel by name ("default" or "tiled": the second kernel,
+// added in stage 2c; the name is validated when the engine is built). The cost of creating an engine is printed for the first set: the first engine (which uploads the drafter's weights
 // unless pinned) and a second one made from the resident weights.
 //
 // With --drafts-out the tool does not time anything: for every anchor s in [A, B) of the dump it drafts the
