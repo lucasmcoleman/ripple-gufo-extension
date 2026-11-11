@@ -418,6 +418,8 @@ void Session::SyncImpl(std::span<const std::int32_t> target) {
   std::size_t common = 0;
   const std::size_t most = std::min(tokens_.size(), target.size() - 1);
   while (common < most && tokens_[common] == target[common]) ++common;
+  bool rewound_here = false;
+  std::int32_t held_token = 0;
   if (common < tokens_.size()) {
     // The cache keeps a sliding window; Rewind says whether the rows the
     // continuation reads are still there. If not, only a full recompute is
@@ -427,10 +429,12 @@ void Session::SyncImpl(std::span<const std::int32_t> target) {
       const std::lock_guard lock(mutex_);
       rewound = executor_->Rewind(static_cast<std::uint32_t>(common));
       if (rewound) {
+        held_token = tokens_[common];
         tokens_.resize(common);
         logits_valid_ = false;
         TrimTaps(static_cast<std::uint32_t>(common));
         if (sink_ != nullptr) sink_->Rewound(static_cast<std::uint32_t>(common));
+        rewound_here = true;
       }
     }
     if (!rewound) {
@@ -442,6 +446,13 @@ void Session::SyncImpl(std::span<const std::int32_t> target) {
       Fail();
       common = 0;
     }
+  }
+  // Test fault only (Session::Faults): after a rewind the first row is evaluated from the token the session held there before.
+  if (faults_.sync_stale_row_after_rewind && rewound_here) {
+    std::vector<std::int32_t> stale(target.begin() + static_cast<std::ptrdiff_t>(common), target.end());
+    stale.front() = held_token;
+    ForwardChunks(stale);
+    return;
   }
   ForwardChunks(target.subspan(common));
 }

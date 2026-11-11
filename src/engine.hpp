@@ -270,6 +270,7 @@ class Session {
     bool rewind_from_end{false};     ///< AcceptVerified rewinds to the logical end - accepted, not p + accepted
     bool stale_frontier{false};      ///< AcceptVerified keeps the last row's logits as the frontier
     bool keep_rejected_taps{false};  ///< AcceptVerified leaves the rejected rows' taps pending
+    bool sync_stale_row_after_rewind{false};  ///< a Sync that rewound evaluates its first row from the token the session held there before (a stale row after a prefix-reuse rewind)
   };
   void SetFaults(Faults faults) noexcept { faults_ = faults; }
 

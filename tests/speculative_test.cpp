@@ -188,13 +188,14 @@ Truth RunTruth(const std::shared_ptr<EngineModel>& model, const std::vector<std:
 /// one row at a time (a drafted request ends with every token evaluated), then Sync(second) and one-row steps. Taps cover every
 /// position of `second` (below the rewind they are the first run's).
 Truth RunTruthAfter(const std::shared_ptr<EngineModel>& model, const Truth& first, std::size_t first_used,
-                     const std::vector<std::int32_t>& second, std::size_t limit) {
+                     const std::vector<std::int32_t>& second, std::size_t limit, Session::Faults faults = {}) {
   Truth t;
   t.prompt = second;
   t.vocab = model->VocabSize();
   t.tap_width = model->executor_config().capture_layers.size() * model->weights().config.embedding_length;
   std::string error;
   auto s = NewSession(model);
+  s->SetFaults(faults);
   const auto take = [&] {
     auto taps = s->TakeTaps();
     if (t.tap_width == 0 || taps.rows == 0) return;
@@ -610,6 +611,49 @@ std::vector<std::int32_t> Concat(std::vector<std::int32_t> a, const std::vector<
   return a;
 }
 
+/// 4a: prefix reuse after drafted steps (see ReuseAndRestore). `corrupt`: a twin in which the Sync after a rewind evaluates its first row from the old token (a stale row), on both
+/// the drafted and the plain side (`Session::Faults::sync_stale_row_after_rewind`).
+void PrefixReuse4a(const TinyFixture& f, const DraftBackend& be, const std::shared_ptr<const SpeculativeSetup>& base_setup,
+                   const std::shared_ptr<EngineModel>& model, bool corrupt) {
+  const std::size_t limit = 22;
+  std::string error;
+  Rig rig(model);
+  Session::Faults faults;
+  faults.sync_stale_row_after_rewind = corrupt;
+  rig.session().SetFaults(faults);
+  DraftedSession ds(rig.session(), *base_setup);
+  const Truth a = FindTruth(model, 30, 700, limit + 18, false);
+  Require(rig.session().Sync(a.prompt, &error), error);
+  ProposalCheck check_a(*base_setup, *model, a, 0);
+  Drafted run = RunDrafted(ds.decoder(), a, limit, [&](const DecodeResult&) {
+    std::string e = ContextLedger(ds, 0);
+    return e.empty() ? check_a.Check(ds) : e;
+  });
+  Require(run.error.empty(), be.name + "/" + f.name + " 4a first request: " + run.error);
+  // The next text shares the first 24 tokens (and diverges at once), as a conversation that was edited.
+  const auto a_sequence = a.Sequence();
+  auto b_prompt = std::vector<std::int32_t>(a_sequence.begin(), a_sequence.begin() + 24);
+  for (std::size_t i = 0; i < 9; ++i) b_prompt.push_back((a_sequence[24 + i] + 5) % 256);
+  const Truth b = RunTruthAfter(model, a, limit, b_prompt, limit, faults);
+  if (be.exact) {
+    // Exact back end: the fresh plain session is the oracle too. The same call sequence alone would pass a rewind that is wrong the same way on both
+    // sides (stage 4c, item 2); here nothing is rewound, so such a bug cannot hide.
+    const Truth fresh = RunTruth(model, b_prompt, limit);
+    Require(b.gen == fresh.gen && b.rows.size() == fresh.rows.size() && SameBits(b.rows, fresh.rows),
+            be.name + "/" + f.name + " 4a exact: plain decoding through the prefix-reuse Sync differs from a fresh plain session (a rewind bug common to both sides)");
+  }
+  Require(rig.session().Sync(b_prompt, &error), error);
+  ds.decoder().Restart();
+  Require(ContextLedger(ds, 0).empty(), be.name + "/" + f.name + " 4a: the drafter's context after the prefix-reuse Sync: " + ContextLedger(ds, 0));
+  ProposalCheck check_b(*base_setup, *model, b, 0);
+  run = RunDrafted(ds.decoder(), b, limit, [&](const DecodeResult&) {
+    std::string e = ContextLedger(ds, 0);
+    return e.empty() ? check_b.Check(ds) : e;
+  });
+  Require(run.error.empty(), be.name + "/" + f.name + " 4a second request: " + run.error);
+  Require(check_b.compared > 0, "4a: nothing was proposed after the prefix reuse");
+}
+
 void ReuseAndRestore(const TinyFixture& f, const DraftBackend& be, const std::string& dir) {
   const auto base_setup = Setup(f, dir, 6);
   const std::size_t limit = 22;
@@ -618,36 +662,24 @@ void ReuseAndRestore(const TinyFixture& f, const DraftBackend& be, const std::st
 
   // 4a. prefix reuse: drafted generation, then a text sharing the first half, drafted again. The truth is plain decoding given the SAME
   // call sequence (Sync, one-row steps, Sync of the new text, one-row steps), so this holds on the production route as well.
-  {
-    Rig rig(model);
-    DraftedSession ds(rig.session(), *base_setup);
-    const Truth a = FindTruth(model, 30, 700, limit + 18, false);
-    Require(rig.session().Sync(a.prompt, &error), error);
-    ProposalCheck check_a(*base_setup, *model, a, 0);
-    Drafted run = RunDrafted(ds.decoder(), a, limit, [&](const DecodeResult&) {
-      std::string e = ContextLedger(ds, 0);
-      return e.empty() ? check_a.Check(ds) : e;
-    });
-    Require(run.error.empty(), be.name + "/" + f.name + " 4a first request: " + run.error);
-    // The next text shares the first 24 tokens (and diverges at once), as a conversation that was edited.
-    const auto a_sequence = a.Sequence();
-    auto b_prompt = std::vector<std::int32_t>(a_sequence.begin(), a_sequence.begin() + 24);
-    for (std::size_t i = 0; i < 9; ++i) b_prompt.push_back((a_sequence[24 + i] + 5) % 256);
-    const Truth b = RunTruthAfter(model, a, limit, b_prompt, limit);
-    Require(rig.session().Sync(b_prompt, &error), error);
-    ds.decoder().Restart();
-    Require(ContextLedger(ds, 0).empty(), be.name + "/" + f.name + " 4a: the drafter's context after the prefix-reuse Sync: " + ContextLedger(ds, 0));
-    ProposalCheck check_b(*base_setup, *model, b, 0);
-    run = RunDrafted(ds.decoder(), b, limit, [&](const DecodeResult&) {
-      std::string e = ContextLedger(ds, 0);
-      return e.empty() ? check_b.Check(ds) : e;
-    });
-    Require(run.error.empty(), be.name + "/" + f.name + " 4a second request: " + run.error);
-    Require(check_b.compared > 0, "4a: nothing was proposed after the prefix reuse");
-  }
+  PrefixReuse4a(f, be, base_setup, model, false);
   {
     std::printf("  %s/%s: 4a. prefix reuse after drafted steps: output equals plain, the drafter's context is the session's, proposals equal the reference\n",
                 be.name.c_str(), f.name.c_str());
+  }
+  if (be.exact) {
+    // Twin (stage 4c, item 2): the Sync after a rewind computes its first row from the old token, on the drafted side and on the plain side alike. Same call sequence on both
+    // sides gives equal results; only the fresh plain session (no rewind) shows the bug, and 4a must fail there.
+    std::string message;
+    try {
+      PrefixReuse4a(f, be, base_setup, model, true);
+    } catch (const std::exception& e) {
+      message = e.what();
+    }
+    Require(message.find("4a exact: plain decoding through the prefix-reuse Sync differs from a fresh plain session") != std::string::npos,
+            be.name + "/" + f.name + " 4a twin (a rewind that leaves a stale row, the same on both sides): " +
+                (message.empty() ? std::string("4a passed") : "it failed elsewhere: " + message));
+    std::printf("  %s/%s: 4a. twin 'a rewind that leaves a stale row, the same on both sides': the exact-mode oracle (fresh plain session) catches it\n", be.name.c_str(), f.name.c_str());
   }
 
   // 4b. a restored checkpoint into a slot whose drafter holds an old branch.
