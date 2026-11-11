@@ -258,6 +258,154 @@ __global__ void DraftAttentionKernel(const float* __restrict__ q,
     out[(std::size_t{t} * heads + qh0 + g) * head_dim + d] = acc[g] / l[g];
 }
 
+// ---- attention, second kernel: "tiled" (docs/DRAFTER-S2.md, "Stage 2c") ------------------------
+// The host twin is TiledAttentionWorkgroup / TiledAttentionCombine in hip/ops_host.cpp: the same steps in the same order,
+// line for line. Keep the two parallel; docs/DRAFTER-S2.md "Stage 2c" lists every way they differ.
+
+/// grid (plan.splits + 1, kv_heads), block DraftTiledThreads(tokens, group). Workgroup (split, kvh) serves every query
+/// qi = t * group + g of K/V head kvh: thread 2 qi + half holds the head dimensions d = 4 (2 j + half) + e (j < kD / 8,
+/// e < 4) of q and of the output accumulator. Per tile of kDraftTiledKeys keys: the workgroup stages the tile's K and V
+/// rows as fp32 in LDS (every element loaded once), then each thread scores the tile's keys (its half of the dot product,
+/// plus its partner's through one shuffle), keeps a running max m and sum l (online softmax, rescaled once per tile) and
+/// adds p x V for its dimensions. The record (acc, m, l) of every query goes to `part` for TiledCombineKernel.
+template<int kD, class CacheT>
+__global__ void DraftTiledAttentionKernel(const float* __restrict__ q, const CacheT* __restrict__ k_ctx,
+                                          const CacheT* __restrict__ v_ctx, std::uint32_t ctx_capacity,
+                                          std::uint32_t ctx_first, std::uint32_t anchor,
+                                          const float* __restrict__ k_blk, const float* __restrict__ v_blk,
+                                          float* __restrict__ part, std::uint32_t tokens, std::uint32_t heads,
+                                          std::uint32_t kv_heads, std::uint32_t window, float scale,
+                                          DraftTiledPlan plan) {
+  constexpr std::uint32_t kT = kDraftTiledKeys, kHalf = kD / 2, kJ = kD / 8, kChunks = kD / 8;
+  const std::uint32_t split = blockIdx.x, kvh = blockIdx.y, tid = threadIdx.x;
+  const std::uint32_t group = heads / kv_heads, nq = tokens * group, kv_width = kv_heads * kD;
+  const bool block_split = split == plan.splits;
+  std::uint32_t n0 = 0, n1 = tokens;
+  if (!block_split) DraftTiledSplitKeys(plan, split, &n0, &n1);
+  const std::uint32_t slot0 = block_split ? 0U : (plan.ctx_begin + n0) % ctx_capacity;  // one modulo per workgroup
+  // This thread's query and the keys it sees, in this split's key numbering.
+  const std::uint32_t qi = tid >> 1, half = tid & 1U;
+  const bool active = qi < nq;
+  const std::uint32_t t = active ? qi / group : 0U, h = kvh * group + (active ? qi % group : 0U);
+  const DraftKeys keys = DraftVisibleKeys(t, anchor, ctx_first, tokens, window);
+  std::uint32_t vis_lo = block_split ? keys.blk_begin : keys.ctx_begin - plan.ctx_begin;
+  std::uint32_t vis_hi = block_split ? keys.blk_end : keys.ctx_end - plan.ctx_begin;
+  if (!active) vis_lo = vis_hi = 0;  // sees nothing: m stays -inf, nothing is written
+  float qv[kHalf];
+  const float* qrow = q + (std::size_t{t} * heads + h) * kD;
+#pragma unroll
+  for (std::uint32_t j = 0; j < kJ; ++j) {
+#pragma unroll
+    for (std::uint32_t e = 0; e < 4; ++e) qv[4 * j + e] = active ? qrow[4 * (2 * j + half) + e] : 0.0F;  // scalar loads: no alignment assumed
+  }
+  __shared__ float4 ks[kT * kD / 4];
+  __shared__ float4 vs[kT * kD / 4];
+  float m = -INFINITY, l = 0.0F, acc[kHalf];
+#pragma unroll
+  for (std::uint32_t k = 0; k < kHalf; ++k) acc[k] = 0.0F;
+  for (std::uint32_t ts = n0; ts < n1; ts += kT) {
+    // Stage the tile: chunk c = 8 elements (i = key of the tile, c8 = which 8 of the row); keys past the split are zero.
+    for (std::uint32_t c = tid; c < kT * kChunks; c += blockDim.x) {
+      const std::uint32_t i = c / kChunks, c8 = c % kChunks, n = ts + i;
+      float kf[8], vf[8];
+      if (n < n1 && block_split) {
+        LoadKeys8(k_blk + std::size_t{n} * kv_width + kvh * kD, static_cast<int>(c8), kf);
+        LoadKeys8(v_blk + std::size_t{n} * kv_width + kvh * kD, static_cast<int>(c8), vf);
+      } else if (n < n1) {
+        const std::uint32_t slot = DraftTiledSlot(slot0, n - n0, ctx_capacity);
+        LoadKeys8(k_ctx + std::size_t{slot} * kv_width + kvh * kD, static_cast<int>(c8), kf);
+        LoadKeys8(v_ctx + std::size_t{slot} * kv_width + kvh * kD, static_cast<int>(c8), vf);
+      } else {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) kf[e] = vf[e] = 0.0F;
+      }
+      ks[i * (kD / 4) + 2 * c8] = make_float4(kf[0], kf[1], kf[2], kf[3]);
+      ks[i * (kD / 4) + 2 * c8 + 1] = make_float4(kf[4], kf[5], kf[6], kf[7]);
+      vs[i * (kD / 4) + 2 * c8] = make_float4(vf[0], vf[1], vf[2], vf[3]);
+      vs[i * (kD / 4) + 2 * c8 + 1] = make_float4(vf[4], vf[5], vf[6], vf[7]);
+    }
+    __syncthreads();
+    // Scores of the tile's keys (every thread, active or not, so that the shuffle has its partner).
+    float s[kT];
+    float tile_max = -INFINITY;
+#pragma unroll
+    for (std::uint32_t i = 0; i < kT; ++i) {
+      float p = 0.0F;
+#pragma unroll
+      for (std::uint32_t j = 0; j < kJ; ++j) {
+        const float4 kk = ks[i * (kD / 4) + 2 * j + half];
+        p = fmaf(qv[4 * j], kk.x, p);
+        p = fmaf(qv[4 * j + 1], kk.y, p);
+        p = fmaf(qv[4 * j + 2], kk.z, p);
+        p = fmaf(qv[4 * j + 3], kk.w, p);
+      }
+      const float dot = p + __shfl_xor(p, 1);  // half 0: p0 + p1, half 1: p1 + p0 (the same float)
+      const std::uint32_t n = ts + i;
+      const bool visible = n < n1 && n >= vis_lo && n < vis_hi;
+      s[i] = visible ? dot * scale : -INFINITY;
+      tile_max = fmaxf(tile_max, s[i]);
+    }
+    const float m_new = fmaxf(m, tile_max);
+    if (m_new != -INFINITY) {  // else no key of this tile or before is visible to this query: nothing changes
+      const float alpha = expf(m - m_new);
+      float tile_sum = 0.0F;
+#pragma unroll
+      for (std::uint32_t i = 0; i < kT; ++i) {
+        s[i] = expf(s[i] - m_new);  // 0 for an invisible key (-inf)
+        tile_sum += s[i];
+      }
+      l = l * alpha + tile_sum;
+#pragma unroll
+      for (std::uint32_t k = 0; k < kHalf; ++k) acc[k] *= alpha;
+#pragma unroll
+      for (std::uint32_t i = 0; i < kT; ++i) {
+#pragma unroll
+        for (std::uint32_t j = 0; j < kJ; ++j) {
+          const float4 vv = vs[i * (kD / 4) + 2 * j + half];
+          acc[4 * j] = fmaf(s[i], vv.x, acc[4 * j]);
+          acc[4 * j + 1] = fmaf(s[i], vv.y, acc[4 * j + 1]);
+          acc[4 * j + 2] = fmaf(s[i], vv.z, acc[4 * j + 2]);
+          acc[4 * j + 3] = fmaf(s[i], vv.w, acc[4 * j + 3]);
+        }
+      }
+      m = m_new;
+    }
+    __syncthreads();  // ks and vs are rewritten by the next tile
+  }
+  if (active) {
+    float* rec = part + DraftTiledRecord(kvh, split, plan.splits, nq, qi, kD);
+#pragma unroll
+    for (std::uint32_t j = 0; j < kJ; ++j) {
+#pragma unroll
+      for (std::uint32_t e = 0; e < 4; ++e) rec[4 * (2 * j + half) + e] = acc[4 * j + e];  // scalar stores: a record is head_dim + 2 floats, not 16-byte aligned
+    }
+    if (half == 0) {
+      rec[kD] = m;
+      rec[kD + 1] = l;
+    }
+  }
+}
+
+/// grid (tokens, heads), block head_dim: out[t][h][d] = sum_s acc_s[d] w_s / sum_s l_s w_s, w_s = exp(m_s - max_s m_s)
+/// (0 for a split that saw no key of the query), splits in order 0 .. splits (the block's rows last).
+__global__ void DraftTiledCombineKernel(const float* __restrict__ part, float* __restrict__ out, std::uint32_t tokens,
+                                        std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+                                        std::uint32_t splits) {
+  const std::uint32_t t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+  const std::uint32_t group = heads / kv_heads, nq = tokens * group;
+  const std::uint32_t kvh = KvHeadOf(h, group), qi = t * group + (h - kvh * group);
+  float mx = -INFINITY;
+  for (std::uint32_t s = 0; s <= splits; ++s) mx = fmaxf(mx, part[DraftTiledRecord(kvh, s, splits, nq, qi, head_dim) + head_dim]);
+  float l = 0.0F, a = 0.0F;
+  for (std::uint32_t s = 0; s <= splits; ++s) {
+    const float* rec = part + DraftTiledRecord(kvh, s, splits, nq, qi, head_dim);
+    const float w = rec[head_dim] == -INFINITY ? 0.0F : expf(rec[head_dim] - mx);
+    l = fmaf(rec[head_dim + 1], w, l);
+    a = fmaf(rec[d], w, a);
+  }
+  out[(std::size_t{t} * heads + h) * head_dim + d] = a / l;
+}
+
 // ---- dynamic convolution and SiLU * up (vendored) -----------------------------------------------
 
 __global__ void DraftDynamicConvKernel(const float* __restrict__ input,
@@ -549,6 +697,63 @@ bool DraftAttention(const float* q, const void* k_ctx, const void* v_ctx, KvType
     else LaunchAttention<1, float>(q, k_ctx, v_ctx, ctx_capacity, ctx_first, anchor, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, window, scale, stream);
   }
   return Launched(error, "DraftAttention");
+}
+
+namespace {
+template<int kD, class CacheT>
+void LaunchTiled(const float* q, const void* k_ctx, const void* v_ctx, std::uint32_t ctx_capacity, std::uint32_t ctx_first,
+                 std::uint32_t anchor, const float* k_blk, const float* v_blk, float* scratch, std::uint32_t tokens,
+                 std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t window, float scale, const DraftTiledPlan& plan,
+                 hipStream_t stream) {
+  DraftTiledAttentionKernel<kD, CacheT><<<dim3(plan.splits + 1, kv_heads), DraftTiledThreads(tokens, heads / kv_heads), 0, stream>>>(
+      q, static_cast<const CacheT*>(k_ctx), static_cast<const CacheT*>(v_ctx), ctx_capacity, ctx_first, anchor, k_blk, v_blk,
+      scratch, tokens, heads, kv_heads, window, scale, plan);
+}
+template<int kD>
+void LaunchTiledType(KvType type, const float* q, const void* k_ctx, const void* v_ctx, std::uint32_t ctx_capacity,
+                     std::uint32_t ctx_first, std::uint32_t anchor, const float* k_blk, const float* v_blk, float* scratch,
+                     std::uint32_t tokens, std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t window, float scale,
+                     const DraftTiledPlan& plan, hipStream_t stream) {
+  if (type == KvType::kF16) {
+    LaunchTiled<kD, __half>(q, k_ctx, v_ctx, ctx_capacity, ctx_first, anchor, k_blk, v_blk, scratch, tokens, heads, kv_heads, window, scale, plan, stream);
+  } else {
+    LaunchTiled<kD, float>(q, k_ctx, v_ctx, ctx_capacity, ctx_first, anchor, k_blk, v_blk, scratch, tokens, heads, kv_heads, window, scale, plan, stream);
+  }
+}
+}  // namespace
+
+bool DraftAttentionTiled(const float* q, const void* k_ctx, const void* v_ctx, KvType type,
+                         std::uint32_t ctx_capacity, std::uint32_t ctx_first, std::uint32_t anchor,
+                         const float* k_blk, const float* v_blk, float* out, std::uint32_t tokens,
+                         std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+                         std::uint32_t window, float scale, float* scratch, hipStream_t stream,
+                         std::string* error) {
+  if (head_dim != 32 && head_dim != 64 && head_dim != 128)
+    return Fail(error, "DraftAttentionTiled: head_dim must be 32, 64 or 128");
+  if (heads == 0 || kv_heads == 0 || heads % kv_heads != 0)
+    return Fail(error, "DraftAttentionTiled: heads must be a positive multiple of kv_heads");
+  if (DraftTiledThreads(tokens, heads / kv_heads) > 1024)
+    return Fail(error, "DraftAttentionTiled: 2 x tokens x (heads / kv_heads) must be at most 1024 (threads of a workgroup)");
+  if (!std::isfinite(scale)) return Fail(error, "DraftAttentionTiled: scale must be finite");
+  if (ctx_capacity == 0) return Fail(error, "DraftAttentionTiled: ctx_capacity is 0");
+  if (ctx_first > anchor) return Fail(error, "DraftAttentionTiled: ctx_first is above the anchor");
+  if (std::uint64_t{anchor} + tokens > (1ULL << 31))
+    return Fail(error, "DraftAttentionTiled: position out of range");
+  const DraftTiledPlan plan = DraftTiledSplits(anchor, ctx_first, tokens, window);
+  if (plan.ctx_keys > ctx_capacity)  // every row's range lies inside the first row's (DraftTiledSplits)
+    return Fail(error, "DraftAttentionTiled: the visible context rows do not fit the ring");
+  if (tokens == 0) return true;
+  if (q == nullptr || k_ctx == nullptr || v_ctx == nullptr || k_blk == nullptr || v_blk == nullptr ||
+      out == nullptr || scratch == nullptr)
+    return Fail(error, "DraftAttentionTiled: null pointer");
+  switch (head_dim) {
+    case 32: LaunchTiledType<32>(type, q, k_ctx, v_ctx, ctx_capacity, ctx_first, anchor, k_blk, v_blk, scratch, tokens, heads, kv_heads, window, scale, plan, stream); break;
+    case 64: LaunchTiledType<64>(type, q, k_ctx, v_ctx, ctx_capacity, ctx_first, anchor, k_blk, v_blk, scratch, tokens, heads, kv_heads, window, scale, plan, stream); break;
+    default: LaunchTiledType<128>(type, q, k_ctx, v_ctx, ctx_capacity, ctx_first, anchor, k_blk, v_blk, scratch, tokens, heads, kv_heads, window, scale, plan, stream); break;
+  }
+  if (!Launched(error, "DraftAttentionTiled")) return false;
+  DraftTiledCombineKernel<<<dim3(tokens, heads), head_dim, 0, stream>>>(scratch, out, tokens, heads, kv_heads, head_dim, plan.splits);
+  return Launched(error, "DraftAttentionTiled (combine)");
 }
 
 bool DraftDynamicConv(const float* input, const float* dynamic_coefficients,

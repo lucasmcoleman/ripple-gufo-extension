@@ -30,6 +30,16 @@ bool DraftAttention(const float* q, const void* k_ctx, const void* v_ctx, KvType
                     std::uint32_t window, float scale, hipStream_t stream,
                     std::string* error = nullptr);
 
+/// The second attention kernel ("tiled", docs/DRAFTER-S2.md "Stage 2c"): the same operation as DraftAttention, each K/V
+/// tile read once for all the queries of its K/V head. head_dim 32, 64 or 128; 2 x tokens x (heads / kv_heads) <= 1024.
+/// `scratch`: device floats, rocm::DraftTiledScratchFloats(tokens, heads, head_dim) of them (hip/drafter_math.hpp).
+bool DraftAttentionTiled(const float* q, const void* k_ctx, const void* v_ctx, KvType type,
+                         std::uint32_t ctx_capacity, std::uint32_t ctx_first, std::uint32_t anchor,
+                         const float* k_blk, const float* v_blk, float* out, std::uint32_t tokens,
+                         std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+                         std::uint32_t window, float scale, float* scratch, hipStream_t stream,
+                         std::string* error = nullptr);
+
 bool DraftDynamicConv(const float* input, const float* dynamic_coefficients,
                       const float* base_kernel, float* output, std::uint32_t num_tokens,
                       std::uint32_t hidden_size, std::uint32_t kernel_size,

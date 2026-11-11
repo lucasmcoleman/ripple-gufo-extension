@@ -80,6 +80,66 @@ RICURSIVE_HD DraftKeys DraftVisibleKeys(std::uint32_t t, std::uint32_t anchor,
   return k;
 }
 
+// ---- the second attention kernel, "tiled" (docs/DRAFTER-S2.md, "Stage 2c") --------------------------------------------
+// One workgroup per (key split, K/V head) serves every query of that K/V head (tokens x group): each K/V tile is read from
+// memory once and used by all of them. The context keys of all rows are numbered n = 0 .. ctx_keys - 1 from the first
+// row's first visible context row (the union of the rows' ranges, see DraftTiledSplits); they are cut into at most
+// kDraftTiledMaxSplits splits of whole tiles; the block's own rows are one more split (number `splits`). Each workgroup
+// writes, per query, an unnormalised partial (acc[head_dim], running max m, sum l) to the scratch; a second kernel
+// combines the splits. The host twin (hip/ops_host.cpp, DraftAttentionTiled) calls these same functions.
+
+/// Keys per tile (staged in LDS as fp32: 2 x kDraftTiledKeys x head_dim x 4 bytes).
+inline constexpr std::uint32_t kDraftTiledKeys = 32;
+/// Most context splits per K/V head (the block's rows are one split more).
+inline constexpr std::uint32_t kDraftTiledMaxSplits = 16;
+
+struct DraftTiledPlan {
+  std::uint32_t ctx_begin;        ///< position of context key n = 0 (the first row's first visible context row)
+  std::uint32_t ctx_keys;         ///< context keys of all rows together: [ctx_begin, anchor)
+  std::uint32_t tiles_per_split;  ///< whole tiles per context split (>= 1)
+  std::uint32_t splits;           ///< context splits (0 when ctx_keys == 0); split `splits` is the block's rows
+};
+/// The union of the rows' context ranges is the first row's: every row's range ends at the anchor, and its begin
+/// (max(ctx_first, p + 1 - window), clamped to the anchor) does not decrease with the row (tested by brute force,
+/// tests/drafter_ops_test.cpp CheckTiledSplits).
+RICURSIVE_HD DraftTiledPlan DraftTiledSplits(std::uint32_t anchor, std::uint32_t ctx_first, std::uint32_t tokens,
+                                             std::uint32_t window) {
+  const DraftKeys k0 = DraftVisibleKeys(0, anchor, ctx_first, tokens, window);
+  DraftTiledPlan plan;
+  plan.ctx_begin = k0.ctx_begin;
+  plan.ctx_keys = k0.ctx_end - k0.ctx_begin;
+  const std::uint32_t tiles = (plan.ctx_keys + kDraftTiledKeys - 1) / kDraftTiledKeys;
+  plan.tiles_per_split = tiles == 0 ? 1 : (tiles + kDraftTiledMaxSplits - 1) / kDraftTiledMaxSplits;
+  plan.splits = (tiles + plan.tiles_per_split - 1) / plan.tiles_per_split;
+  return plan;
+}
+/// Context keys [*n0, *n1) of split `split` (< plan.splits): never empty (the last split begins at a tile < tiles).
+RICURSIVE_HD void DraftTiledSplitKeys(const DraftTiledPlan& plan, std::uint32_t split, std::uint32_t* n0, std::uint32_t* n1) {
+  const std::uint32_t span = plan.tiles_per_split * kDraftTiledKeys;
+  *n0 = split * span;
+  *n1 = plan.ctx_keys - *n0 < span ? plan.ctx_keys : *n0 + span;
+}
+/// Ring slot of the key `rel` keys after the one in `slot0` (< capacity): no modulo, one comparison. Exact when
+/// rel < capacity, which holds because rel < ctx_keys <= capacity (the launch refuses ctx_keys > capacity).
+RICURSIVE_HD std::uint32_t DraftTiledSlot(std::uint32_t slot0, std::uint32_t rel, std::uint32_t capacity) {
+  const std::uint32_t slot = slot0 + rel;
+  return slot >= capacity ? slot - capacity : slot;
+}
+/// Threads of a workgroup: two per query (each holds half of the head dimensions), rounded up to whole waves of 32.
+RICURSIVE_HD std::uint32_t DraftTiledThreads(std::uint32_t tokens, std::uint32_t group) {
+  return (2 * tokens * group + 31) / 32 * 32;
+}
+/// Floats of the partials scratch for up to kDraftTiledMaxSplits + 1 splits: [kv_heads][splits + 1][tokens * group][head_dim + 2]
+/// (acc, then m, then l), i.e. (kDraftTiledMaxSplits + 1) x tokens x heads x (head_dim + 2) at most.
+RICURSIVE_HD std::uint64_t DraftTiledScratchFloats(std::uint32_t tokens, std::uint32_t heads, std::uint32_t head_dim) {
+  return std::uint64_t{kDraftTiledMaxSplits + 1} * tokens * heads * (head_dim + 2);
+}
+/// Index of the partial record of query `qi` (= t * group + g) of K/V head `kvh` in split `split` (splits + 1 per head).
+RICURSIVE_HD std::uint64_t DraftTiledRecord(std::uint32_t kvh, std::uint32_t split, std::uint32_t splits, std::uint32_t nq,
+                                            std::uint32_t qi, std::uint32_t head_dim) {
+  return ((std::uint64_t{kvh} * (splits + 1) + split) * nq + qi) * (head_dim + 2);
+}
+
 }  // namespace gufo::models::ricursive::rocm
 
 #endif  // RICURSIVE_HIP_DRAFTER_MATH_HPP_

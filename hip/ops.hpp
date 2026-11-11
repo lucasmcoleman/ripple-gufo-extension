@@ -251,6 +251,19 @@ class Ops {
                               std::uint32_t heads, std::uint32_t kv_heads,
                               std::uint32_t head_dim, std::uint32_t window,
                               float scale) = 0;
+  /// The same operation by the second kernel, "tiled" (docs/DRAFTER-S2.md, "Stage 2c"): each K/V tile is read once for all
+  /// the queries of its K/V head; key splits combined by a second pass. fp32 softmax on both back ends (the host runs the
+  /// kernel's structural twin). head_dim 32, 64 or 128; 2 x tokens x (heads / kv_heads) <= 1024. `scratch`: backend floats,
+  /// rocm::DraftTiledScratchFloats(tokens, heads, head_dim) of them (hip/drafter_math.hpp), overwritten.
+  virtual void DraftAttentionTiled(const float* q, const void* k_ctx,
+                                   const void* v_ctx, KvType type,
+                                   std::uint32_t ctx_capacity,
+                                   std::uint32_t ctx_first, std::uint32_t anchor,
+                                   const float* k_blk, const float* v_blk,
+                                   float* out, std::uint32_t tokens,
+                                   std::uint32_t heads, std::uint32_t kv_heads,
+                                   std::uint32_t head_dim, std::uint32_t window,
+                                   float scale, float* scratch) = 0;
   /// The grouped dynamic causal convolution over the rows of one block:
   /// out[t][c] (+)= sum over taps o < kernel_size, t >= o, of
   /// (base[side*kernel_size + o][c] + dyn[t][side*kernel_size*G + o*G + c / group_size]) *
@@ -311,6 +324,11 @@ struct HostOpsOptions {
   /// DynamicConv reads the rows of the block's end for taps that reach before its start
   /// (a cyclic buffer instead of zero padding).
   bool conv_across_block_start{false};
+  /// Test-only defects of the tiled attention's structural twin (DraftAttentionTiled; docs/DRAFTER-S2.md "Stage 2c"), each
+  /// of which the operation-level test must catch: every tile one key late (a tile boundary off by one key), the splits
+  /// combined without rescaling to the common maximum, the ring slot without its wrap check.
+  enum class TiledFault { kNone, kTileOffByOne, kNoSplitRescale, kNoWrapCheck };
+  TiledFault tiled_fault{TiledFault::kNone};
   /// Counts the projection calls here (not owned; must outlive the operations).
   HostOpsCounters* counters{nullptr};
 };

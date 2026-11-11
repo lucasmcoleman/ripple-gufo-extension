@@ -56,12 +56,14 @@ struct DrafterOptions {
   /// blocks). The host operations ignore it.
   bool exact{false};
   DrafterRoutes q8;  ///< groups of projections on the 8-bit activation route (default: none)
-  /// The attention kernel, by name (kDraftAttentionKernels). Only "default" exists; stage 2c adds a second one and the dispatch
-  /// behind this name (Ops::DraftAttention has no kernel argument yet). An unknown name is refused when the executor is built.
+  /// The attention kernel, by name (kDraftAttentionKernels): "default" (Ops::DraftAttention) or "tiled" (Ops::DraftAttentionTiled,
+  /// docs/DRAFTER-S2.md "Stage 2c": each K/V tile read once for all the queries of its K/V head; head_dim 32, 64 or 128; adds its
+  /// partials scratch to the session's buffers). An unknown name is refused when the executor is built. SUPERSEDED statement
+  /// (stage 2b): only "default" existed and Ops::DraftAttention had no kernel argument; stage 2c added a second Ops method instead.
   std::string attention_kernel{"default"};
 };
 /// The attention kernels the drafter knows, by name.
-inline constexpr std::string_view kDraftAttentionKernels[] = {"default"};
+inline constexpr std::string_view kDraftAttentionKernels[] = {"default", "tiled"};
 
 /// Test-only deliberate defects (each a one-line change that must make the checks fail).
 struct DrafterExecFaults {
@@ -163,6 +165,7 @@ class DrafterExecutor {
   std::shared_ptr<const void> keep_alive_;
   DrafterOptions options_;
   DrafterExecFaults faults_;
+  bool tiled_{false};  ///< attention_kernel == "tiled"
   std::uint32_t base_{0}, end_{0};
   std::uint32_t high_{0};  ///< highest End() since the last reset
   std::uint32_t append_rows_{0};

@@ -38,12 +38,179 @@ constexpr unsigned char kGuardByte = 0xA5;
 
 float Sigmoid(float x) { return 1.0F / (1.0F + std::exp(-x)); }
 
+// ---- the structural twin of the tiled attention ----------------------------------------------------------------------
+// DraftTiledAttentionKernel and DraftTiledCombineKernel (hip/drafter_kernels.hip.cpp) in plain C++: the same tiling, the same
+// split, the same combination order and the same index arithmetic (the shared functions of hip/drafter_math.hpp), line for
+// line; a GPU thread is an iteration of a loop over `tid`, a __syncthreads() is the end of a loop over all of them, the
+// shuffle reads the partner's partial from the array the loop filled. Keep it parallel to the kernel; every difference is
+// listed in docs/DRAFTER-S2.md, "Stage 2c". Test-only faults: HostOpsOptions::tiled_fault.
+using TiledFault = HostOpsOptions::TiledFault;
+
+/// LoadKeys8 of the kernel: elements 8 c8 .. 8 c8 + 7 of the row that starts at element `row` of a cache, as fp32.
+void TiledLoad8(const void* cache, KvType type, std::size_t row, std::uint32_t c8, float (&f)[8]) {
+  for (std::uint32_t e = 0; e < 8; ++e) {
+    const std::size_t at = row + 8 * std::size_t{c8} + e;
+    f[e] = type == KvType::kF16 ? HalfToFloat(static_cast<const std::uint16_t*>(cache)[at]) : static_cast<const float*>(cache)[at];
+  }
+}
+
+/// One workgroup (split, kvh) of DraftTiledAttentionKernel<kD>. Returns false when a key's ring slot was not below the
+/// capacity (the host checks every slot and loads zeros instead; the kernel has no such check).
+template<std::uint32_t kD>
+bool TiledAttentionWorkgroup(std::uint32_t split, std::uint32_t kvh, const float* q, const void* k_ctx, const void* v_ctx,
+                             KvType type, std::uint32_t ctx_capacity, std::uint32_t ctx_first, std::uint32_t anchor,
+                             const float* k_blk, const float* v_blk, float* part, std::uint32_t tokens, std::uint32_t heads,
+                             std::uint32_t kv_heads, std::uint32_t window, float scale, const km::DraftTiledPlan& plan,
+                             TiledFault fault) {
+  constexpr std::uint32_t kT = km::kDraftTiledKeys, kHalf = kD / 2, kJ = kD / 8, kChunks = kD / 8;
+  const std::uint32_t threads = km::DraftTiledThreads(tokens, heads / kv_heads);  // blockDim.x
+  const std::uint32_t group = heads / kv_heads, nq = tokens * group, kv_width = kv_heads * kD;
+  const bool block_split = split == plan.splits;
+  std::uint32_t n0 = 0, n1 = tokens;
+  if (!block_split) km::DraftTiledSplitKeys(plan, split, &n0, &n1);
+  const std::uint32_t slot0 = block_split ? 0U : (plan.ctx_begin + n0) % ctx_capacity;  // one modulo per workgroup
+  // Each thread's query and the keys it sees, in this split's key numbering.
+  std::vector<std::uint32_t> half(threads), vis_lo(threads), vis_hi(threads);
+  std::vector<char> active(threads);
+  std::vector<float> qv(std::size_t{threads} * kHalf), acc(std::size_t{threads} * kHalf), m(threads), l(threads);
+  for (std::uint32_t tid = 0; tid < threads; ++tid) {
+    const std::uint32_t qi = tid >> 1;
+    half[tid] = tid & 1U;
+    active[tid] = qi < nq;
+    const std::uint32_t t = active[tid] ? qi / group : 0U, h = kvh * group + (active[tid] ? qi % group : 0U);
+    const km::DraftKeys keys = km::DraftVisibleKeys(t, anchor, ctx_first, tokens, window);
+    vis_lo[tid] = block_split ? keys.blk_begin : keys.ctx_begin - plan.ctx_begin;
+    vis_hi[tid] = block_split ? keys.blk_end : keys.ctx_end - plan.ctx_begin;
+    if (!active[tid]) vis_lo[tid] = vis_hi[tid] = 0;
+    const float* qrow = q + (std::size_t{t} * heads + h) * kD;
+    for (std::uint32_t j = 0; j < kJ; ++j) {
+      for (std::uint32_t e = 0; e < 4; ++e) qv[std::size_t{tid} * kHalf + 4 * j + e] = active[tid] ? qrow[4 * (2 * j + half[tid]) + e] : 0.0F;
+    }
+    m[tid] = -INFINITY;
+    l[tid] = 0.0F;
+    for (std::uint32_t k = 0; k < kHalf; ++k) acc[std::size_t{tid} * kHalf + k] = 0.0F;
+  }
+  std::vector<float> ks(std::size_t{kT} * kD), vs(std::size_t{kT} * kD);  // the kernel's float4 arrays, as floats
+  std::vector<float> p(threads), s(std::size_t{threads} * kT), tile_max(threads);
+  bool in_ring = true;
+  for (std::uint32_t ts = n0 + (fault == TiledFault::kTileOffByOne ? 1U : 0U); ts < n1; ts += kT) {
+    // Stage the tile (the kernel's threads tid, tid + blockDim.x, ... take every chunk c exactly once).
+    for (std::uint32_t c = 0; c < kT * kChunks; ++c) {
+      const std::uint32_t i = c / kChunks, c8 = c % kChunks, n = ts + i;
+      float kf[8], vf[8];
+      if (n < n1 && block_split) {
+        TiledLoad8(k_blk, KvType::kF32, std::size_t{n} * kv_width + kvh * kD, c8, kf);
+        TiledLoad8(v_blk, KvType::kF32, std::size_t{n} * kv_width + kvh * kD, c8, vf);
+      } else if (n < n1) {
+        const std::uint32_t slot = fault == TiledFault::kNoWrapCheck ? slot0 + (n - n0) : km::DraftTiledSlot(slot0, n - n0, ctx_capacity);
+        if (slot < ctx_capacity) {
+          TiledLoad8(k_ctx, type, std::size_t{slot} * kv_width + kvh * kD, c8, kf);
+          TiledLoad8(v_ctx, type, std::size_t{slot} * kv_width + kvh * kD, c8, vf);
+        } else {  // host only: the kernel would read past the ring
+          in_ring = false;
+          for (int e = 0; e < 8; ++e) kf[e] = vf[e] = 0.0F;
+        }
+      } else {
+        for (int e = 0; e < 8; ++e) kf[e] = vf[e] = 0.0F;
+      }
+      for (int e = 0; e < 8; ++e) {
+        ks[std::size_t{i} * kD + 8 * c8 + e] = kf[e];
+        vs[std::size_t{i} * kD + 8 * c8 + e] = vf[e];
+      }
+    }
+    // __syncthreads(). Scores of the tile's keys: every thread, then the shuffle with its partner tid ^ 1.
+    for (std::uint32_t tid = 0; tid < threads; ++tid) tile_max[tid] = -INFINITY;
+    for (std::uint32_t i = 0; i < kT; ++i) {
+      for (std::uint32_t tid = 0; tid < threads; ++tid) {
+        const float* qt = &qv[std::size_t{tid} * kHalf];
+        float pp = 0.0F;
+        for (std::uint32_t j = 0; j < kJ; ++j) {
+          const float* kk = &ks[std::size_t{i} * kD + 4 * (2 * j + half[tid])];
+          pp = std::fma(qt[4 * j], kk[0], pp);
+          pp = std::fma(qt[4 * j + 1], kk[1], pp);
+          pp = std::fma(qt[4 * j + 2], kk[2], pp);
+          pp = std::fma(qt[4 * j + 3], kk[3], pp);
+        }
+        p[tid] = pp;
+      }
+      for (std::uint32_t tid = 0; tid < threads; ++tid) {
+        const float dot = p[tid] + p[tid ^ 1U];  // half 0: p0 + p1, half 1: p1 + p0 (the same float)
+        const std::uint32_t n = ts + i;
+        const bool visible = n < n1 && n >= vis_lo[tid] && n < vis_hi[tid];
+        float& si = s[std::size_t{tid} * kT + i];
+        si = visible ? dot * scale : -INFINITY;
+        tile_max[tid] = std::fmax(tile_max[tid], si);
+      }
+    }
+    for (std::uint32_t tid = 0; tid < threads; ++tid) {
+      float* st = &s[std::size_t{tid} * kT];
+      float* at = &acc[std::size_t{tid} * kHalf];
+      const float m_new = std::fmax(m[tid], tile_max[tid]);
+      if (m_new != -INFINITY) {
+        const float alpha = std::exp(m[tid] - m_new);
+        float tile_sum = 0.0F;
+        for (std::uint32_t i = 0; i < kT; ++i) {
+          st[i] = std::exp(st[i] - m_new);
+          tile_sum += st[i];
+        }
+        l[tid] = l[tid] * alpha + tile_sum;
+        for (std::uint32_t k = 0; k < kHalf; ++k) at[k] *= alpha;
+        for (std::uint32_t i = 0; i < kT; ++i) {
+          for (std::uint32_t j = 0; j < kJ; ++j) {
+            const float* vv = &vs[std::size_t{i} * kD + 4 * (2 * j + half[tid])];
+            at[4 * j] = std::fma(st[i], vv[0], at[4 * j]);
+            at[4 * j + 1] = std::fma(st[i], vv[1], at[4 * j + 1]);
+            at[4 * j + 2] = std::fma(st[i], vv[2], at[4 * j + 2]);
+            at[4 * j + 3] = std::fma(st[i], vv[3], at[4 * j + 3]);
+          }
+        }
+        m[tid] = m_new;
+      }
+    }
+    // __syncthreads()
+  }
+  for (std::uint32_t tid = 0; tid < threads; ++tid) {
+    if (!active[tid]) continue;
+    float* rec = part + km::DraftTiledRecord(kvh, split, plan.splits, nq, tid >> 1, kD);
+    for (std::uint32_t j = 0; j < kJ; ++j) {
+      for (std::uint32_t e = 0; e < 4; ++e) rec[4 * (2 * j + half[tid]) + e] = acc[std::size_t{tid} * kHalf + 4 * j + e];
+    }
+    if (half[tid] == 0) {
+      rec[kD] = m[tid];
+      rec[kD + 1] = l[tid];
+    }
+  }
+  return in_ring;
+}
+
+/// One workgroup (t, h) of DraftTiledCombineKernel.
+void TiledAttentionCombine(std::uint32_t t, std::uint32_t h, const float* part, float* out, std::uint32_t tokens,
+                           std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t head_dim, std::uint32_t splits,
+                           TiledFault fault) {
+  for (std::uint32_t d = 0; d < head_dim; ++d) {
+    const std::uint32_t group = heads / kv_heads, nq = tokens * group;
+    const std::uint32_t kvh = km::KvHeadOf(h, group), qi = t * group + (h - kvh * group);
+    float mx = -INFINITY;
+    for (std::uint32_t s = 0; s <= splits; ++s) mx = std::fmax(mx, part[km::DraftTiledRecord(kvh, s, splits, nq, qi, head_dim) + head_dim]);
+    float l = 0.0F, a = 0.0F;
+    for (std::uint32_t s = 0; s <= splits; ++s) {
+      const float* rec = part + km::DraftTiledRecord(kvh, s, splits, nq, qi, head_dim);
+      float w = rec[head_dim] == -INFINITY ? 0.0F : std::exp(rec[head_dim] - mx);
+      if (fault == TiledFault::kNoSplitRescale && rec[head_dim] != -INFINITY) w = 1.0F;
+      l = std::fma(rec[head_dim + 1], w, l);
+      a = std::fma(rec[d], w, a);
+    }
+    out[(std::size_t{t} * heads + h) * head_dim + d] = a / l;
+  }
+}
+
 class HostOps final : public Ops {
  public:
   explicit HostOps(const HostOpsOptions& options)
       : lenient_(options.lenient_capacity),
         poison_(options.poison_memory),
         conv_across_block_start_(options.conv_across_block_start),
+        tiled_fault_(options.tiled_fault),
         counters_(options.counters) {}
   ~HostOps() override {
     for (auto& [ptr, block] : blocks_) std::free(block.raw);
@@ -622,6 +789,60 @@ class HostOps final : public Ops {
     }
   }
 
+  // The second kernel's structural twin (TiledAttentionWorkgroup / TiledAttentionCombine above): the launcher's checks, the
+  // host's range checks, then the workgroups and the combine, as rocm::DraftAttentionTiled launches them.
+  void DraftAttentionTiled(const float* q, const void* k_ctx, const void* v_ctx, KvType type,
+                           std::uint32_t ctx_capacity, std::uint32_t ctx_first, std::uint32_t anchor,
+                           const float* k_blk, const float* v_blk, float* out, std::uint32_t tokens,
+                           std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+                           std::uint32_t window, float scale, float* scratch) override {
+    const char* op = "DraftAttentionTiled";
+    if (head_dim != 32 && head_dim != 64 && head_dim != 128) Fail(op, "head_dim must be 32, 64 or 128");
+    if (heads == 0 || kv_heads == 0 || heads % kv_heads != 0)
+      Fail(op, "heads must be a positive multiple of kv_heads");
+    if (km::DraftTiledThreads(tokens, heads / kv_heads) > 1024)
+      Fail(op, "2 x tokens x (heads / kv_heads) must be at most 1024 (threads of a workgroup)");
+    if (!std::isfinite(scale)) Fail(op, "scale must be finite");
+    if (ctx_capacity == 0) Fail(op, "ctx_capacity is 0");
+    if (ctx_first > anchor) Fail(op, "ctx_first is above the anchor");
+    if (std::uint64_t{anchor} + tokens > (1ULL << 31)) Fail(op, "position out of range");
+    const km::DraftTiledPlan plan = km::DraftTiledSplits(anchor, ctx_first, tokens, window);
+    if (plan.ctx_keys > ctx_capacity) Fail(op, "the visible context rows do not fit the ring");
+    const std::uint32_t group = heads / kv_heads, nq = tokens * group;
+    const std::size_t D = head_dim, kvw = std::size_t{kv_heads} * D;
+    const std::size_t esize = type == KvType::kF16 ? 2 : 4;
+    const std::size_t qn = std::size_t{tokens} * heads * D;
+    const std::size_t part_floats = std::size_t{kv_heads} * (plan.splits + 1) * nq * (D + 2);  // what the workgroups write
+    Range(op, "q", q, qn * 4);
+    Range(op, "out", out, qn * 4);
+    Range(op, "k_ctx", k_ctx, std::size_t{ctx_capacity} * kvw * esize);
+    Range(op, "v_ctx", v_ctx, std::size_t{ctx_capacity} * kvw * esize);
+    Range(op, "k_blk", k_blk, std::size_t{tokens} * kvw * 4);
+    Range(op, "v_blk", v_blk, std::size_t{tokens} * kvw * 4);
+    Range(op, "scratch", scratch, std::max<std::size_t>(part_floats, 1) * 4);
+    NoOverlap(op, out, qn * 4, q, qn * 4);
+    NoOverlap(op, scratch, part_floats * 4, out, qn * 4);
+    if (tokens == 0) return;
+    const std::uint32_t workgroups = (plan.splits + 1) * kv_heads;
+    std::vector<char> in_ring(workgroups, 1);
+#pragma omp parallel for schedule(dynamic)
+    for (int w = 0; w < static_cast<int>(workgroups); ++w) {  // grid (splits + 1, kv_heads); workgroups are independent
+      const std::uint32_t split = static_cast<std::uint32_t>(w) % (plan.splits + 1), kvh = static_cast<std::uint32_t>(w) / (plan.splits + 1);
+      bool ok = true;
+      if (head_dim == 32) ok = TiledAttentionWorkgroup<32>(split, kvh, q, k_ctx, v_ctx, type, ctx_capacity, ctx_first, anchor, k_blk, v_blk, scratch, tokens, heads, kv_heads, window, scale, plan, tiled_fault_);
+      else if (head_dim == 64) ok = TiledAttentionWorkgroup<64>(split, kvh, q, k_ctx, v_ctx, type, ctx_capacity, ctx_first, anchor, k_blk, v_blk, scratch, tokens, heads, kv_heads, window, scale, plan, tiled_fault_);
+      else ok = TiledAttentionWorkgroup<128>(split, kvh, q, k_ctx, v_ctx, type, ctx_capacity, ctx_first, anchor, k_blk, v_blk, scratch, tokens, heads, kv_heads, window, scale, plan, tiled_fault_);
+      in_ring[static_cast<std::size_t>(w)] = ok ? 1 : 0;
+    }
+    if (std::find(in_ring.begin(), in_ring.end(), 0) != in_ring.end()) Fail(op, "a context key's ring slot is not below the capacity (the wrap)");
+    // The second launch: grid (tokens, heads).
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int t = 0; t < static_cast<int>(tokens); ++t) {
+      for (int h = 0; h < static_cast<int>(heads); ++h)
+        TiledAttentionCombine(static_cast<std::uint32_t>(t), static_cast<std::uint32_t>(h), scratch, out, tokens, heads, kv_heads, head_dim, plan.splits, tiled_fault_);
+    }
+  }
+
   void DynamicConv(const float* input, const float* dynamic_coefficients, const float* base_kernel,
                    float* output, std::uint32_t num_tokens, std::uint32_t hidden_size,
                    std::uint32_t kernel_size, std::uint32_t group_size, std::uint32_t side,
@@ -825,6 +1046,7 @@ class HostOps final : public Ops {
   bool lenient_;
   bool poison_;
   bool conv_across_block_start_;
+  TiledFault tiled_fault_;
   HostOpsCounters* counters_;
   std::uint64_t scratch_bytes_{0};
   std::map<unsigned char*, Block> blocks_;

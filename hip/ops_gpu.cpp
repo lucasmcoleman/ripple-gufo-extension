@@ -175,6 +175,17 @@ class GpuOps final : public Ops {
                                   stream_, &e),
              e, "DraftAttention");
   }
+  void DraftAttentionTiled(const float* q, const void* k_ctx, const void* v_ctx, KvType type,
+                           std::uint32_t ctx_capacity, std::uint32_t ctx_first, std::uint32_t anchor,
+                           const float* k_blk, const float* v_blk, float* out, std::uint32_t tokens,
+                           std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+                           std::uint32_t window, float scale, float* scratch) override {
+    std::string e;
+    Launched(rocm::DraftAttentionTiled(q, k_ctx, v_ctx, Kv(type), ctx_capacity, ctx_first, anchor, k_blk,
+                                       v_blk, out, tokens, heads, kv_heads, head_dim, window, scale, scratch,
+                                       stream_, &e),
+             e, "DraftAttentionTiled");
+  }
   void DynamicConv(const float* input, const float* dynamic_coefficients, const float* base_kernel,
                    float* output, std::uint32_t num_tokens, std::uint32_t hidden_size,
                    std::uint32_t kernel_size, std::uint32_t group_size, std::uint32_t side,

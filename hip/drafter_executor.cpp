@@ -65,6 +65,8 @@ Sizes Plan(const DrafterConfig& c, std::uint32_t vocab, const DrafterOptions& o)
   // h a x0 attn fin (E), q o (Q), kb vb bk bv (KV), dyn, g u (FF), logits, hproj, the 15 MASK rows (E)
   s.block = 5 * B * E + 2 * B * Q + 4 * B * KV + B * DYN + 2 * B * FF + R * vocab + R * c.selector_rank + R * E /*MASK rows*/;
   s.select = B /*tokens*/ + 2 * R * K /*candidates*/ + 2 * R * P * K /*partials*/;
+  // The tiled attention's partials (docs/DRAFTER-S2.md "Stage 2c"), one buffer for every layer (the layers run in sequence).
+  if (o.attention_kernel == "tiled") s.block += km::DraftTiledScratchFloats(c.block_size, c.head_count, c.head_dim);
   // The projection scratch holds the Q8_1 activations of the 8-bit routes only: the context pass at more than 16 rows
   // (Project's own W8A8 route) or on the chosen route, the block pass and the head when chosen. `exact` uses none.
   // The widest input of the context pass is fc's (F); of the block pass the FFN down projection's (FF); of the head E.
@@ -189,6 +191,7 @@ struct DrafterExecutor::Buffers {
   float *h{}, *a{}, *x0{}, *attn{}, *fin{}, *q{}, *o{}, *kb{}, *vb{}, *bk{}, *bv{}, *dyn{}, *g{}, *u{},
       *logits{}, *hproj{};
   float* mask{};  ///< the 15 MASK rows of the block input, embedded once per executor
+  float* attn_part{};  ///< the tiled attention's partials (attention_kernel "tiled" only)
   /// One buffer for what a draft step reads back, so that it is one copy-out: tokens [B] (tokens[0] the anchor, written
   /// before the step), candidate ids [R][K], candidate scores [R][K] (each region begins right after the previous one).
   std::int32_t* tokens{};
@@ -276,7 +279,12 @@ DrafterExecutor::DrafterExecutor(std::unique_ptr<Ops> ops, std::shared_ptr<const
   const DrafterConfig& c = drafter_->config;
   if (std::find(std::begin(kDraftAttentionKernels), std::end(kDraftAttentionKernels), std::string_view(options_.attention_kernel)) ==
       std::end(kDraftAttentionKernels)) {
-    throw std::invalid_argument("ricursive drafter: unknown attention kernel '" + options_.attention_kernel + "' (known: default)");
+    throw std::invalid_argument("ricursive drafter: unknown attention kernel '" + options_.attention_kernel + "' (known: default, tiled)");
+  }
+  tiled_ = options_.attention_kernel == "tiled";
+  if (tiled_ && ((c.head_dim != 32 && c.head_dim != 64 && c.head_dim != 128) || c.head_count_kv == 0 ||
+                 c.head_count % c.head_count_kv != 0 || km::DraftTiledThreads(c.block_size, c.head_count / c.head_count_kv) > 1024)) {
+    throw std::invalid_argument("ricursive drafter: the tiled attention kernel needs head_dim 32, 64 or 128 and 2 x block_size x group <= 1024");
   }
   if (c.head_dim == 0 || c.head_dim % 2 != 0 || c.head_dim > km::kDraftMaxHeadDim) {
     throw std::invalid_argument("ricursive drafter: head_dim " + std::to_string(c.head_dim) +
@@ -333,6 +341,7 @@ DrafterExecutor::DrafterExecutor(std::unique_ptr<Ops> ops, std::shared_ptr<const
   b.cand_scores = reinterpret_cast<float*>(b.tokens + B + R * K);
   b.part_scores = b.Take(R * P * K);
   b.part_ids = b.Take<std::int32_t>(R * P * K);
+  if (tiled_) b.attn_part = b.Take(km::DraftTiledScratchFloats(c.block_size, c.head_count, c.head_dim));
   const std::size_t esize = options_.kv_type == KvType::kF16 ? 2 : 4;
   for (std::uint32_t l = 0; l < c.block_count; ++l) {
     b.kr.push_back(b.Take<std::byte>(std::size_t{capacity_[l]} * KV * esize));
@@ -522,8 +531,13 @@ DrafterExecutor::Draft DrafterExecutor::DraftStep(std::int32_t anchor_token, std
     Lap("qk_norm_rope");
     const bool sliding = c.sliding[l];
     const std::uint32_t window = sliding ? c.sliding_window + (faults_.window_off_by_one ? 1U : 0U) : 0U;
-    ops.DraftAttention(b.q, b.kr[l], b.vr[l], options_.kv_type, capacity_[l], first_row(l), s, b.bk, b.bv, b.o, B,
-                       NH, NKV, D, window, scale);
+    if (tiled_) {
+      ops.DraftAttentionTiled(b.q, b.kr[l], b.vr[l], options_.kv_type, capacity_[l], first_row(l), s, b.bk, b.bv, b.o, B,
+                              NH, NKV, D, window, scale, b.attn_part);
+    } else {
+      ops.DraftAttention(b.q, b.kr[l], b.vr[l], options_.kv_type, capacity_[l], first_row(l), s, b.bk, b.bv, b.o, B,
+                         NH, NKV, D, window, scale);
+    }
     Lap("attention");
     Proj(options_.q8.block, L.attn_output, b.o, static_cast<int>(B), b.attn);
     Lap("o_proj");
