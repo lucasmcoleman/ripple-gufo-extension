@@ -90,8 +90,15 @@ class DrafterHealth {
   void ResetFailed() noexcept { ++reset_failures_; }
   /// A proposal whose draft succeeded: ends a run of failures unless rows failed to arrive since the previous one.
   void DraftSucceeded() noexcept;
-  /// A drafter that was built: ends a run of failed builds.
-  void BuildSucceeded() noexcept { consecutive_ = 0; }
+  /// A drafter that was built: ends the run of failed builds (both the step run and the build run below).
+  void BuildSucceeded() noexcept { consecutive_ = 0; build_failures_ = 0; }
+  /// A build failed: counted as a failed step (`Failed`) and in the run of consecutive failed BUILDS, which `Clear()` does NOT reset: gufo binds
+  /// before it knows a request is a cold start, so a cold start's `Clear()` would otherwise re-arm the build for every request of a drafter that can
+  /// never be built (each one re-uploading the weights and warning again). After `kLimit` failed builds in a row no build is attempted for the
+  /// session (`build_given_up()`), with one warning line; only a successful build ends the run.
+  void BuildFailed(std::string_view what) noexcept;
+  [[nodiscard]] bool build_given_up() const noexcept { return build_failures_ >= kLimit; }
+  [[nodiscard]] std::size_t build_failures() const noexcept { return build_failures_; }
   /// The session's content was replaced from position 0 (`TapSink::Replaced(0)`): forgets every failure and switches
   /// drafting on again (a new conversation tries the drafter again). A restore of a checkpoint arrives as `Replaced(0)` (the
   /// reset that begins it) followed by `Replaced(n)`, n > 0: `Restored()` then puts back what `Clear()` took, a restore to a
@@ -112,6 +119,7 @@ class DrafterHealth {
     std::string last_error;
   };
   std::size_t failures_{0}, consecutive_{0}, reset_failures_{0};
+  std::size_t build_failures_{0};  ///< consecutive failed builds; not part of `State`, so `Clear()` / `Restored()` leave it alone
   bool disabled_{false}, failed_since_proposal_{false};
   std::string last_error_;
   std::optional<State> before_clear_;  ///< what the last Clear() took

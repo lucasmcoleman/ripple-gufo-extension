@@ -605,12 +605,12 @@ std::shared_ptr<DraftedSession> DraftedSession::For(Session& session, const Spec
       held->drafted->decoder_->Restart();
       return held->drafted;
     }
-    if (held->health->disabled()) return nullptr;
+    if (held->health->disabled() || held->health->build_given_up()) return nullptr;
     try {
       held->drafted = std::make_shared<DraftedSession>(session, setup, held->health);
     } catch (...) {
       const std::string why = DescribeCurrent();
-      held->health->Failed("build", why, false);
+      held->health->BuildFailed(why);
       WarnOff("the drafter could not be built", why);
       return nullptr;
     }

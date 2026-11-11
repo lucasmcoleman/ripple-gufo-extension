@@ -699,13 +699,60 @@ void BuildFailTests(const TinyFixture& f, const DraftBackend& be, const std::str
       const Result rn = spec.Run(Extend(pc.checkpoint_tokens, 7, 5), limit), pn = plain.Run(Extend(pc.checkpoint_tokens, 7, 5), limit);
       Require(rn.published == pn.published, what + ": the request after the cold start differs from plain's");
       const std::size_t attempts_now = kind == Kind::kEngine ? counts->engines : counts->uploads;
-      Require(attempts_now == attempts + 1 && health->failures() == 1 && !health->disabled(),
-              what + ": after a cold start one more build must be attempted and counted afresh (" + std::to_string(attempts_now) + " attempts, " + std::to_string(health->failures()) + " failures)");
+      // Stage 4c-fix item 2 (supersedes "one more build is attempted afresh"): the run of failed BUILDS is not cleared by a cold start (gufo binds
+      // before it knows the request is one, so that would re-arm the build, and the weights' upload, for every request of a drafter that cannot be built).
+      Require(attempts_now == attempts && health->failures() == 0 && !health->disabled() && health->build_given_up() && DraftingOf(*spec.state) == nullptr,
+              what + ": after a cold start no further build may be attempted (" + std::to_string(attempts_now) + " attempts after " + std::to_string(attempts) + ", " +
+                  std::to_string(health->failures()) + " failures)");
     } else {
       Require(health->failures() == 1 && !health->disabled() && health->consecutive() == 0,
               what + ": the health record must show one failure, recovered (" + std::to_string(health->failures()) + " failures)");
       Require(DraftingOf(*spec.state) != nullptr && drafted_after_first > 0, what + ": a later bind must build the drafter and draft");
     }
+    ++checked;
+  }
+  // Stage 4c-fix item 2: five requests that each START COLD (an unrelated prompt: the bind runs first, then the session is invalidated) with a factory that
+  // always throws: exactly 3 build attempts in all (the cold start's Clear() must not re-arm the build), every request completes with plain's tokens and end
+  // state, one warning (the third failure's) says the drafter is given up.
+  for (const Kind kind : {Kind::kEngine, Kind::kUpload}) {
+    const auto counts = std::make_shared<Counts>();
+    auto setup = std::make_shared<SpeculativeSetup>(*base);
+    const auto inner = base->engine_factory;
+    setup->engine_factory = [inner, counts, kind](const SpeculativeSetup& s, const EngineModel& m) -> std::unique_ptr<DrafterEngine> {
+      if (kind == Kind::kEngine) {
+        ++counts->engines;
+        throw std::runtime_error("injected engine build failure");
+      }
+      return inner(s, m);
+    };
+    setup->shared_factory = [counts, kind](const SpeculativeSetup&, const EngineModel&) -> std::shared_ptr<void> {
+      if (kind == Kind::kUpload) {
+        ++counts->uploads;
+        throw std::runtime_error("the GPU drafter could not be uploaded: injected");
+      }
+      return std::make_shared<int>(0);
+    };
+    const auto spec_model = ArmedModel(f, be, *setup);
+    const auto plain_model = PlainModel(f, be);
+    Serve spec(CreateRunnerForModel(spec_model, "", setup), spec_model), plain(CreateRunnerForModel(plain_model, "", nullptr), plain_model);
+    const std::string what = be.name + "/" + f.name + " C build, cold starts (" + (kind == Kind::kEngine ? "the engine factory" : "the shared upload") + " always throws)";
+    for (int turn = 0; turn < 5; ++turn) {
+      const Tokens cold = ToTokens(SyntheticTokens(300 + 17 * turn + f.window, 21 + turn));
+      Result rs, rp;
+      try {
+        rs = spec.Run(cold, limit);
+      } catch (const std::exception& e) {
+        Require(false, what + ": request " + std::to_string(turn + 1) + " failed: " + e.what());
+      }
+      rp = plain.Run(cold, limit);
+      Require(rs.cached == 0, what + ": request " + std::to_string(turn + 1) + " was meant to start cold");
+      Require(rs.published == rp.published && rs.drafted == 0, what + ": request " + std::to_string(turn + 1) + "'s tokens differ from plain's");
+      RequireSameState(plain, spec, what + ", request " + std::to_string(turn + 1));
+    }
+    const std::size_t attempts = kind == Kind::kEngine ? counts->engines : counts->uploads;
+    Require(attempts == DrafterHealth::kLimit, what + ": " + std::to_string(attempts) + " builds were attempted, not " + std::to_string(DrafterHealth::kLimit));
+    const DrafterHealth* health = DraftingHealthOf(*spec.state);
+    Require(health != nullptr && health->build_given_up() && health->build_failures() == DrafterHealth::kLimit, what + ": the build must be given up after the third failure");
     ++checked;
   }
   // The drafter exists but its context cannot be brought to the session's position at the bind (ResetTo throws there): that request

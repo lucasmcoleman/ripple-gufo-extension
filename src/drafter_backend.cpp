@@ -36,6 +36,17 @@ void DrafterHealth::Failed(std::string_view where, std::string_view what, bool i
   }
 }
 
+void DrafterHealth::BuildFailed(std::string_view what) noexcept {
+  Failed("build", what, false);
+  try {
+    if (++build_failures_ == kLimit && !disabled_) {  // (`Failed` already printed its switch-off line when the run of steps hit the limit too)
+      std::cerr << "ricursive: drafting is switched off for this session after " << build_failures_
+                << " failed drafter builds (last: " << last_error_ << "); no further build is attempted\n";
+    }
+  } catch (...) {
+  }
+}
+
 void DrafterHealth::Clear() noexcept {
   try {
     before_clear_ = State{failures_, consecutive_, disabled_, failed_since_proposal_, last_error_};
