@@ -365,9 +365,22 @@ void DrafterExecutor::ResetTo(std::uint32_t base) {
 
 void DrafterExecutor::TruncateTo(std::uint32_t position) {
   if (position >= end_) return;
-  if (position <= base_ || std::uint64_t{position} + options_.ring_slack <= high_) {
+  if (position <= base_) {
     ResetTo(position);
     return;
+  }
+  if (std::uint64_t{position} + options_.ring_slack <= high_) {
+    // A full window below `position` is gone from the rings (docs/DRAFTER-S2.md, "Stage 2b", item 4). Keep what they still hold:
+    // every layer has the rows [high_ - its capacity, high_), so all layers have the rows from high_ - (the smallest capacity)
+    // on; the base rises to that row. Nothing left below the new end: the context is empty there. (Until stage 2b this
+    // emptied the context whenever the truncation was this deep.)
+    const std::uint32_t smallest = *std::min_element(capacity_.begin(), capacity_.end());
+    const std::uint32_t oldest = high_ > smallest ? high_ - smallest : 0;
+    if (oldest >= position) {
+      ResetTo(position);
+      return;
+    }
+    base_ = std::max(base_, oldest);
   }
   end_ = position;
 }

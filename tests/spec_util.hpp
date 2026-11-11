@@ -69,9 +69,7 @@ std::shared_ptr<const SpeculativeSetup> Setup(const TinyFixture& f, const std::s
     // executor on the host operations. F32 or F16 context storage as the model's cache type.
     setup->engine_factory = [](const SpeculativeSetup& s, const EngineModel& m) -> std::unique_ptr<DrafterEngine> {
       if (m.backend().uses_device) return MakeDefaultDrafterEngine(s, m);
-      DrafterOptions o = s.drafter_options;
-      o.kv_type = m.backend().kv_type;
-      return MakeHostOpsDrafterEngine(s.weights, m.weights(), o);
+      return MakeHostOpsDrafterEngine(s.weights, m.weights(), EffectiveDrafterOptions(s, m.backend()));
     };
   } else {
     // The stage 4 drafter, whatever the build would choose by default (the GPU drafter on a device model).

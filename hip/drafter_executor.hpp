@@ -99,9 +99,12 @@ class DrafterExecutor {
   [[nodiscard]] std::uint32_t End() const noexcept { return end_; }
   /// Empties the context; the next row appended is position `base`.
   void ResetTo(std::uint32_t base);
-  /// Drops the rows at positions >= `position`. A position at or below Base() empties the context
-  /// there; so does a position ring_slack or more rows below the highest row ever held since the
-  /// last reset (the rings no longer hold the rows below it): Base() is then `position`.
+  /// Drops the rows at positions >= `position`. A position at or below Base() empties the context there. A position
+  /// ring_slack or more rows below the highest row ever held since the last reset (the rings no longer hold a full window
+  /// below it) keeps the rows the rings still hold: Base() rises to the oldest row every layer has (the highest row held
+  /// minus the smallest ring), so the next drafts have a shorter context rather than none; if that leaves no row below
+  /// `position`, the context is empty there (Base() == `position`). SUPERSEDED statement (stage 2): such a truncation
+  /// always emptied the context.
   void TruncateTo(std::uint32_t position);
   /// Appends the features of `rows` positions starting at End(): [rows][taps * hidden] float32,
   /// in passes of at most max_append_rows. Stages ctx_h, ctx_k, ctx_v as the reference emits them

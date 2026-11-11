@@ -103,9 +103,7 @@ std::shared_ptr<const SpeculativeSetup> Setup(const TinyFixture& f, const std::s
     // executor on the host operations. F32 or F16 context storage as the model's cache type.
     setup->engine_factory = [](const SpeculativeSetup& s, const EngineModel& m) -> std::unique_ptr<DrafterEngine> {
       if (m.backend().uses_device) return MakeDefaultDrafterEngine(s, m);
-      DrafterOptions o = s.drafter_options;
-      o.kv_type = m.backend().kv_type;
-      return MakeHostOpsDrafterEngine(s.weights, m.weights(), o);
+      return MakeHostOpsDrafterEngine(s.weights, m.weights(), EffectiveDrafterOptions(s, m.backend()));
     };
   } else {
     // The stage 4 drafter, whatever the build would choose by default (the GPU drafter on a device model).
@@ -906,6 +904,16 @@ void RunnerTests(const TinyFixture& f, const DraftBackend& be, const std::string
     {
       const DraftedSession* ds = DraftingOf(*s.state);
       Require(ds != nullptr && ds->health().failures() == 0 && !ds->health().disabled(), "the runner's drafter must not have failed (the fallback would hide it)");
+    }
+    if (OpsDrafter()) {
+      // docs/DRAFTER-S2.md "Stage 2b", item 4: the resource claim of the runner is the memory its state measures (the drafter's rings,
+      // scratch and buffers at the model's cache type), and it is more than the plain runner's.
+      const std::uint64_t claim = s.runner->ResourceClaim().per_request_state_bytes.value_or(0),
+                          measured = s.state->MeasuredResources().per_request_state_bytes.value_or(0);
+      Require(claim != 0 && measured != 0, "the claim and the measurement state a per-request size");
+      Require(claim == measured, "the runner's claim for a session (" + std::to_string(claim) + " bytes) differs from what its state measures (" +
+                                     std::to_string(measured) + ")");
+      Require(claim > p.runner->ResourceClaim().per_request_state_bytes.value_or(0), "the speculative runner's claim includes the drafter");
     }
     if (c.drafts) {
       Require(got.drafted > 0, "the greedy request must have drafted");

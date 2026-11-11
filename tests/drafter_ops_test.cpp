@@ -470,16 +470,20 @@ struct Bookkeeping {
     eng->Append(static_cast<std::uint32_t>(at), std::span(t.dump.taps).subspan(at * F, n * F));
     Same("append");
   }
-  void Truncate(std::uint32_t p, bool expect_deep) {
+  /// TruncateTo(p); the context must then start at `expected_base` (the base, when the truncation is plain; the oldest row every
+  /// layer's ring still holds when it is deep; p when no row is left below p). The reference is given the same rows.
+  void Truncate(std::uint32_t p, std::uint32_t expected_base) {
     const std::uint32_t base_before = eng->Base();
     eng->TruncateTo(p);
-    const bool deep_now = eng->Base() != base_before;
-    Require(deep_now == expect_deep, "truncate to " + std::to_string(p) + ": expected a " + (expect_deep ? "deep (reset)" : "plain") +
-                                         " truncation, the base went " + std::to_string(base_before) + " -> " + std::to_string(eng->Base()));
-    deep += deep_now ? 1 : 0;
-    if (deep_now) {
-      Require(eng->Base() == p, "a deep truncation resets the context at the position");
-      ref.ResetTo(p);
+    Require(eng->Base() == expected_base, "truncate to " + std::to_string(p) + ": the context should start at " + std::to_string(expected_base) +
+                                              ", it starts at " + std::to_string(eng->Base()) + " (it started at " + std::to_string(base_before) + ")");
+    Require(eng->End() == p, "truncate: the end is the position");
+    if (expected_base != base_before) {
+      ++deep;
+      ref.ResetTo(expected_base);  // the rows the rings still hold, given to the reference again
+      if (p > expected_base) {
+        ref.AppendContext(std::span(t.dump.taps).subspan(std::size_t{expected_base} * F, std::size_t{p - expected_base} * F), p - expected_base);
+      }
     } else {
       ref.TruncateTo(p);
     }
@@ -525,13 +529,14 @@ void CheckBookkeeping(const Tiny& t, const Drafter& d) {
     b.Draft();
   }
   Require(b.eng->End() == 88, "the script appends the whole dump");
-  b.Truncate(86, false);  // inside the slack (the highest row ever held is 88)
+  b.Truncate(86, 0);      // inside the slack (the highest row ever held is 88)
   b.Draft();
-  b.Truncate(81, false);  // the edge: 88 - 81 = 7 rows dropped, one fewer than the slack of 8
+  b.Truncate(81, 0);      // the edge: 88 - 81 = 7 rows dropped, one fewer than the slack of 8
   b.Draft();
   b.Append(6);            // rewritten rows over the old ones
   b.Draft();
-  b.Truncate(80, true);   // 8 rows below the highest: the rings no longer hold what position 80's window needs
+  b.Truncate(80, 72);     // 8 rows below the highest: the rings no longer hold what position 80's window needs; they hold rows 72 to 87
+                          // (the sliding rings, 8 + 8 = 16 rows, are the smallest), so the context is rows 72 to 79 (stage 2: it was empty)
   b.Draft();
   b.Append(8);
   b.Draft();
@@ -539,17 +544,17 @@ void CheckBookkeeping(const Tiny& t, const Drafter& d) {
   b.Draft();
   b.Append(48);
   b.Draft();
-  b.Truncate(60, true);   // deep again, onto a base that is not 0 (the highest row held since Reset(40) is 88)
+  b.Truncate(60, 60);     // deep again, onto a base that is not 0 (the highest row held since Reset(40) is 88): no row below 60 is in a ring
   b.Draft();
   b.Append(28);
   b.Draft();
   b.Reset(0);
   b.Append(30);           // a context shorter than the windows
   b.Draft();
-  b.Truncate(0, false);   // to the base itself: an empty context, no row lost
+  b.Truncate(0, 0);       // to the base itself: an empty context, no row lost
   b.Draft();              // the block attends to itself only
   b.Append(20);
-  b.Truncate(20, false);  // truncating at the end changes nothing
+  b.Truncate(20, 0);      // truncating at the end changes nothing
   b.Draft();
   std::printf("  bookkeeping: appends in passes of 1..24 rows (5-row chunks inside), plain and deep truncations, resets to bases 40 and 0, more rows "
               "than the 72-row ring: %zu drafts equal the reference's (%zu deep truncations)\n",
@@ -644,6 +649,67 @@ void CheckTransfers(const Tiny& t, const Drafter& d) {
               static_cast<unsigned long long>((B + 2 * R * K) * sizeof(std::int32_t)));
 }
 
+/// Item 4 of docs/DRAFTER-S2.md "Stage 2b": truncations across the slack edge. With rings of 16 (sliding: 8 + slack 8) and 72 rows
+/// (full: 64 + 8) and 88 rows appended, every position from 40 to 87: the context starts where the rings still hold every layer's rows
+/// (high - 16 = 72), or at the position when nothing is left below it, or at 0 when the truncation is not deep (it drops fewer than
+/// the slack of 8 rows); the reference, given the same rows, drafts the same tokens from the same context rows.
+void CheckSlackEdge(const Tiny& t, const Drafter& d) {
+  DrafterOptions o;
+  o.kv_type = KvType::kF32;
+  o.ring_slack = 8;
+  o.max_append_rows = 5;
+  const std::uint32_t high = 88, slack = o.ring_slack;
+  std::uint32_t smallest = ~0U;
+  for (std::uint32_t l = 0; l < d.w.config.block_count; ++l)
+    smallest = std::min(smallest, (d.w.config.sliding[l] ? std::min(d.w.config.context_window, d.w.config.sliding_window) : d.w.config.context_window) + slack);
+  Require(smallest == 16, "the tiny drafter's smallest ring is 16 rows");
+  std::size_t drafts = 0, kept = 0, emptied = 0;
+  for (std::uint32_t p = 40; p < high; ++p) {
+    Bookkeeping b(t, d, o);
+    for (const std::size_t n : {16, 17, 5, 2, 24, 20, 4}) b.Append(n);
+    Require(b.eng->End() == high, "the sweep appends 88 rows");
+    const std::uint32_t expected = p + slack > high ? 0 : (p > high - smallest ? high - smallest : p);
+    b.Truncate(p, expected);
+    b.Draft();
+    drafts += b.drafts;
+    kept += expected != 0 && expected < p ? 1 : 0;
+    emptied += expected == p ? 1 : 0;
+  }
+  std::printf("  deep truncation across the slack edge: positions 40 to 87 of 88 rows (slack 8, smallest ring 16): the context keeps the rows the rings hold "
+              "(%zu truncations kept rows 72 up to the position, %zu left none below it), %zu drafts equal the reference's given the same rows\n",
+              kept, emptied, drafts);
+}
+
+/// Item 4: DrafterSessionBytes (what the runner's resource claim adds), DeviceBytes() (what the executor allocated, the projection
+/// scratch included) and the plan agree for every context storage, exactness, route and pass size. On the GPU DeviceBytes() reads the
+/// real scratch allocation, so this is also the check of the scratch formula (rocm::Q8ActivationBytes) against ggml's.
+void CheckAccounting(const Tiny& t, const Drafter& d) {
+  std::size_t configurations = 0;
+  for (const KvType kv : {KvType::kF16, KvType::kF32}) {
+    for (const bool exact : {false, true}) {
+      for (int mask = 0; mask < 8; ++mask) {
+        for (const auto& [slack, append] : {std::pair{8U, 5U}, std::pair{64U, 512U}, std::pair{1024U, 512U}}) {
+          DrafterOptions o;
+          o.kv_type = kv;
+          o.exact = exact;
+          o.q8 = {(mask & 1) != 0, (mask & 2) != 0, (mask & 4) != 0};
+          o.ring_slack = slack;
+          o.max_append_rows = append;
+          auto engine = MakeEngine(d, t.target, o);
+          const std::uint64_t want = DrafterSessionBytes(d.w.config, t.target.weights.output.rows, o);
+          Require(engine->DeviceBytes() == want, std::string("DeviceBytes() ") + std::to_string(engine->DeviceBytes()) + " but DrafterSessionBytes " +
+                                                     std::to_string(want) + " (" + (kv == KvType::kF16 ? "F16" : "F32") + " rings, " +
+                                                     (exact ? "exact, " : "") + "routes " + ToString(o.q8) + ", ring slack " + std::to_string(slack) +
+                                                     ", " + std::to_string(append) + " rows per pass)");
+          ++configurations;
+        }
+      }
+    }
+  }
+  std::printf("  accounting: DeviceBytes() equals DrafterSessionBytes in %zu configurations (F16 and F32 rings, exact or not, 8 route subsets, 3 ring/pass sizes)\n",
+              configurations);
+}
+
 void TinyCase(const ricursive_test::Model& target, const std::string& dir) {
   Tiny t{target, dir, LoadDump(dir + "/stage1/tiny/dump")};
   const Drafter q8 = OpenDrafter(dir + "/stage1/tiny/drafter-q8_0.gguf", target.weights.config);
@@ -689,6 +755,8 @@ void TinyCase(const ricursive_test::Model& target, const std::string& dir) {
   }
   // 3. bookkeeping.
   CheckBookkeeping(t, q8);
+  CheckSlackEdge(t, q8);
+  CheckAccounting(t, q8);
   // 4. twins of 1.
   {
     Walk w = base("");
