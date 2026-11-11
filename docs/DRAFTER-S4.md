@@ -185,3 +185,27 @@ context started at the session's position: output exact, acceptance lost on ever
   `hip/drafter_gpu.{hpp,cpp}` (returns `Acquire(...)`, the existing function, as a strong `shared_ptr`), and its only caller, `PinSharedDrafter` in `src/runner.cpp`
   (`#if RICURSIVE_HAVE_GPU_EXECUTOR`, device models with no `engine_factory`). Nothing else in `hip/` changed. The night run must check that the second request does not upload
   again (command in STAGE4-GPU.md).
+
+### Item B: a request that ends by its limit ends in plain generation's state
+
+**Superseded:** "How one step flows" point 3 (the correction token stays pending when the step ends), "The last token of a request stays pending" in the runner row, test 5's
+"a drafted request ends with its last token pending (`CheckpointPosition = prompt + emitted - 1`)" and disagreement 9 (the next request prefilled the pending token inside a pass)
+hold only for a step that did not use its whole budget.
+- What gufo's code does (read, not assumed): `StepMultiTokenDecode` passes `remaining = token_limit - published + (preview ? 1 : 0)` (`text_generation_scheduler.cpp` ~1583);
+  the preview token is counted in `published` and re-emitted as the step's first token, so a step that returns `remaining` tokens has published exactly `token_limit`, and the next
+  statement completes the request by length (`Commit`). The serial plan is the only one this runner declares, so no other call shortens a budget. "Budget used up" therefore means
+  "request over", unless a stop sequence or a cancellation ends it first (those go through `Cancel`, which executes nothing). Plain generation advances (evaluates) the last token before
+  `Commit`, so its checkpoint is L + E; a stop token is never advanced and all earlier tokens were (checkpoint L + E).
+- Fix (`SpeculativeDecoder::Step`): when a step used its whole budget and did not stop, the pending token is evaluated in a one-row pass (`ForwardToken`, which settles first, so the drafter hears the row
+  through the sink) and `published()` is cleared. Skipped at the context limit (plain would have stopped at selection).
+- Cost: one extra one-row target pass (about one plain decode step) per request that ends by its limit. Wasted when the request ends anyway without a follow-up, when a stop sequence matched
+  inside the step (plain would not have evaluated the token; `Cancel` keeps the rows, the checkpoint is longer than plain's) or when the client cancels the step it was in.
+- Stop sequences and cancellation (tested): plain's `Cancel` leaves the unadvanced token out, checkpoint L + n - 1. The drafted step had already evaluated every token it accepted, and `generated` of the pool holds all of them,
+  so the drafted checkpoint is longer: it extends plain's. A next prompt that continues past plain's checkpoint reuses the live slot as before; a prompt that diverges inside the drafted tail cannot reuse the live frontier and
+  starts from a snapshot or cold (speed, not output). Next-request output equals plain in both cases.
+- Failing first (`perf/stage4b-B-unfixed.log`): `B (limit 24): the session is at 46, plain generation leaves it at 47`. Fixed (`stage4b-B-fixed.log`): limits 1, 2, 3, 7, 24 (inside a draft), a stop token: position,
+  tokens, frontier logits and every checkpoint component byte-equal to plain; the next request with prefix reuse gives plain's output; cancelled and stop-sequence requests extend plain's checkpoint.
+- Production-mode gate entries: 4a and the runner's second request (stage 4 skipped them) now compare against plain given the same call sequence (`RunTruthAfter`; both sides evaluate the generated tokens in
+  one-row passes, then Sync), and are enabled in production mode; they run here on the exact back ends and are unverified on the production route until the night run. 4c stays exact-mode only, and cannot be otherwise: a drafted
+  session recomputes from 0 in prefill passes exactly where plain decoding rewinds (the recompute band above), so the same call sequence takes different routes on the two sides by construction.
+  Existing statements checked: test 5's pending-token assertion was replaced (above); nothing else of `speculative_test.cpp` was loosened.

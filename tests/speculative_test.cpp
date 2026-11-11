@@ -186,6 +186,47 @@ Truth RunTruth(const std::shared_ptr<EngineModel>& model, const std::vector<std:
   return t;
 }
 
+/// Plain decoding of `second` given the same call sequence as the drafted session saw: `first`'s prompt, its generated tokens
+/// one row at a time (a drafted request ends with every token evaluated), then Sync(second) and one-row steps. Taps cover every
+/// position of `second` (below the rewind they are the first run's).
+Truth RunTruthAfter(const std::shared_ptr<EngineModel>& model, const Truth& first, std::size_t first_used,
+                     const std::vector<std::int32_t>& second, std::size_t limit) {
+  Truth t;
+  t.prompt = second;
+  t.vocab = model->VocabSize();
+  t.tap_width = model->executor_config().capture_layers.size() * model->weights().config.embedding_length;
+  std::string error;
+  auto s = NewSession(model);
+  const auto take = [&] {
+    auto taps = s->TakeTaps();
+    if (t.tap_width == 0 || taps.rows == 0) return;
+    Require(taps.first_position * t.tap_width <= t.taps.size(), "truth: a hole in the taps");
+    t.taps.resize(taps.first_position * t.tap_width);
+    t.taps.insert(t.taps.end(), taps.data.begin(), taps.data.end());
+  };
+  Require(s->Sync(first.prompt, &error), "truth sync: " + error);
+  take();
+  for (std::size_t i = 0; i < first_used; ++i) {
+    Require(s->Evaluate(first.gen[i], &error), "truth evaluate: " + error);
+    take();
+  }
+  Require(s->Sync(second, &error), "truth second sync: " + error);
+  take();
+  t.rows.insert(t.rows.end(), s->Logits().begin(), s->Logits().end());
+  while (t.gen.size() < limit) {
+    const std::int32_t token = Argmax(s->Logits());
+    if (model->IsStopToken(token)) {
+      t.stopped = true;
+      break;
+    }
+    t.gen.push_back(token);
+    Require(s->Evaluate(token, &error), "truth evaluate: " + error);
+    take();
+    t.rows.insert(t.rows.end(), s->Logits().begin(), s->Logits().end());
+  }
+  return t;
+}
+
 /// A prompt of `length` tokens whose plain run ends in a stop token (want_stop, between 6 and
 /// limit-6 tokens in) or never reaches one within `limit` tokens.
 Truth FindTruth(const std::shared_ptr<EngineModel>& model, std::size_t length, std::uint64_t seed0, std::size_t limit,
@@ -576,9 +617,9 @@ void ReuseAndRestore(const TinyFixture& f, const DraftBackend& be, const std::st
   const auto model = ArmedModel(f, be, *base_setup, 32);  // a ring with slack: a checkpoint right after a rewind is capturable
   std::string error;
 
-  // 4a. prefix reuse: drafted generation, then a text sharing the first half, drafted again. (Production route: the
-  // Sync after the rewind has other pass boundaries than a fresh Sync of the text, which rounds differently; skipped.)
-  if (be.exact) {
+  // 4a. prefix reuse: drafted generation, then a text sharing the first half, drafted again. The truth is plain decoding given the SAME
+  // call sequence (Sync, one-row steps, Sync of the new text, one-row steps), so this holds on the production route as well.
+  {
     Rig rig(model);
     DraftedSession ds(rig.session(), *base_setup);
     const Truth a = FindTruth(model, 30, 700, limit + 18, false);
@@ -593,7 +634,7 @@ void ReuseAndRestore(const TinyFixture& f, const DraftBackend& be, const std::st
     const auto a_sequence = a.Sequence();
     auto b_prompt = std::vector<std::int32_t>(a_sequence.begin(), a_sequence.begin() + 24);
     for (std::size_t i = 0; i < 9; ++i) b_prompt.push_back((a_sequence[24 + i] + 5) % 256);
-    const Truth b = RunTruth(model, b_prompt, limit);
+    const Truth b = RunTruthAfter(model, a, limit, b_prompt, limit);
     Require(rig.session().Sync(b_prompt, &error), error);
     ds.decoder().Restart();
     Require(ContextLedger(ds, 0).empty(), be.name + "/" + f.name + " 4a: the drafter's context after the prefix-reuse Sync: " + ContextLedger(ds, 0));
@@ -605,7 +646,7 @@ void ReuseAndRestore(const TinyFixture& f, const DraftBackend& be, const std::st
     Require(run.error.empty(), be.name + "/" + f.name + " 4a second request: " + run.error);
     Require(check_b.compared > 0, "4a: nothing was proposed after the prefix reuse");
   }
-  if (be.exact) {
+  {
     std::printf("  %s/%s: 4a. prefix reuse after drafted steps: output equals plain, the drafter's context is the session's, proposals equal the reference\n",
                 be.name.c_str(), f.name.c_str());
   }
@@ -866,9 +907,11 @@ void RunnerTests(const TinyFixture& f, const DraftBackend& be, const std::string
     } else {
       Require(got.drafted == 0 && got.accepted == 0, std::string(c.name) + " must draft nothing");
     }
-    // The pending token: the cache holds all but the last emitted token (it is the next request's first row).
-    if (c.drafts && !got.stop && be.exact) {  // (production route: other pass boundaries than the plain side, see 4a)
-      Require(s.runner->CheckpointPosition(*s.state) == prompt.size() + got.tokens.size() - 1, "a drafted request ends with its last token pending");
+    // SUPERSEDED (docs/DRAFTER-S4.md, "Follow-ups", item B): a drafted request that ends by its limit used to end with its last token pending
+    // (checkpoint prompt + emitted - 1). It now ends where plain generation does, every token evaluated in a one-row pass: this holds in
+    // production mode too, because the second request below follows the same call sequence on both sides.
+    if (c.drafts && !got.stop) {
+      Require(s.runner->CheckpointPosition(*s.state) == prompt.size() + got.tokens.size(), "a drafted request ends with every token advanced, as plain");
       Require(p.runner->CheckpointPosition(*p.state) == prompt.size() + want.tokens.size(), "a plain request ends with every token advanced");
       // A second request on the same state: the conversation continues (prefix reuse, the pending token in the prompt).
       Tokens next = prompt;

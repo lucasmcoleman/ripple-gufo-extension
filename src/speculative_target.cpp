@@ -169,6 +169,16 @@ DecodeResult SpeculativeDecoder::Step(std::size_t max_tokens, sampling::SamplerS
   Session& s = *session_;
   Model& model = s.model();
   std::string error;
+  // A step that used its whole budget ended the request (gufo's scheduler passes the tokens the request may still
+  // emit, and finishes it by length when the step returns them all): the pending token is evaluated in a one-row
+  // pass, as plain decoding evaluates every token it advances, so that the session, its frontier logits and the
+  // checkpoint are where plain generation leaves them and the next request starts from rows computed the same way.
+  const auto finish_budget = [&] {
+    if (published_ && result.tokens.size() >= max_tokens && !result.stop && s.Position() < model.MaxContext()) {
+      (void)target_->ForwardToken(static_cast<sampling::TokenId>(frontier_), s.Position(), false);
+      published_ = false;
+    }
+  };
   if (!sampler.config().can_use_unmodified_argmax() || sampler.config().logprobs) {
     // The plain path, as TextModelRunner::DecodeStep does it.
     if (published_) throw std::logic_error("ricursive: a drafted token is pending on a request that does not draft");
@@ -192,7 +202,10 @@ DecodeResult SpeculativeDecoder::Step(std::size_t max_tokens, sampling::SamplerS
     }
     result.tokens.push_back(frontier_);
     published_ = true;
-    if (result.tokens.size() >= max_tokens) return result;
+    if (result.tokens.size() >= max_tokens) {
+      finish_budget();
+      return result;
+    }
   }
   const std::uint32_t position = s.Position();
   sequence_.assign(s.tokens().begin(), s.tokens().end());
@@ -218,6 +231,7 @@ DecodeResult SpeculativeDecoder::Step(std::size_t max_tokens, sampling::SamplerS
   }
   frontier_ = static_cast<std::int32_t>(verification.next_token);
   published_ = !result.stop;
+  finish_budget();
   return result;
 }
 

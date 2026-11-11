@@ -335,6 +335,89 @@ void ReuseTests(const TinyFixture& f, const DraftBackend& be, const std::string&
               be.name.c_str(), f.name.c_str(), compared);
 }
 
+// ---- B: the state a request leaves ---------------------------------------------------------------------------------
+
+/// Position, tokens, frontier logits and every checkpoint component (positions and bytes) of two slots.
+void RequireSameState(Serve& plain, Serve& spec, const std::string& what) {
+  Session &a = plain.session(), &b = spec.session();
+  Require(a.Position() == b.Position(), what + ": the session is at " + std::to_string(b.Position()) + ", plain generation leaves it at " + std::to_string(a.Position()));
+  Require(a.tokens() == b.tokens(), what + ": the session's tokens differ from plain's");
+  Require(SameBits(a.Logits(), b.Logits()) && !a.Logits().empty(), what + ": the frontier logits differ from plain's");
+  const Checkpoint ca = Capture(*plain.rig), cb = Capture(*spec.rig);
+  Require(ca.n == cb.n && ca.positions.size() == cb.positions.size(), what + ": the checkpoints have another shape");
+  for (std::size_t i = 0; i < ca.positions.size(); ++i) {
+    Require(ca.positions[i].id == cb.positions[i].id && ca.positions[i].valid_rows == cb.positions[i].valid_rows, what + ": checkpoint frontier of component " + std::to_string(i));
+    Require(ca.first[i] == cb.first[i] && ca.data[i] == cb.data[i], what + ": checkpoint component " + std::to_string(i) + " differs from plain's byte for byte");
+  }
+}
+
+struct EndCase {
+  std::string name;
+  Tokens prompt;
+  std::size_t limit;
+  Ending ending;
+  std::size_t n;
+};
+
+void EndTests(const TinyFixture& f, const DraftBackend& be, const std::string& dir) {
+  const Models m = MakeModels(f, be, dir);
+  const std::size_t limit = 22;
+  const Truth running = FindTruth(m.spec, 23, 100 + 23 * 7, limit + 18, false);
+  const Truth stopping = FindTruth(m.spec, 11, 9000, limit, true);
+  std::vector<EndCase> cases = {
+      {"limit 24", ToTokens(running.prompt), 24, Ending::kLimit, 0},
+      {"limit 1", ToTokens(running.prompt), 1, Ending::kLimit, 0},
+      {"limit 2", ToTokens(running.prompt), 2, Ending::kLimit, 0},
+      {"limit 3", ToTokens(running.prompt), 3, Ending::kLimit, 0},
+      {"limit 7", ToTokens(running.prompt), 7, Ending::kLimit, 0},
+      {"stop token", ToTokens(stopping.prompt), 60, Ending::kLimit, 0},
+      {"cancelled before step 2", ToTokens(running.prompt), 24, Ending::kCancel, 2},
+      {"stop sequence at token 5", ToTokens(running.prompt), 24, Ending::kStopSequence, 5},
+  };
+  std::size_t checked = 0;
+  for (const EndCase& c : cases) {
+    Serve spec(m.spec_runner, m.spec), plain(m.plain_runner, m.plain);
+    const Result rs = spec.Run(c.prompt, c.limit, c.ending, c.n), rp = plain.Run(c.prompt, c.limit, c.ending, c.n);
+    const std::string what = be.name + "/" + f.name + " B (" + c.name + ")";
+    if (c.ending == Ending::kCancel) {
+      // Cancelled after n steps: a drafted step carries more tokens than a plain one, so only the common part is compared.
+      const std::size_t common = std::min(rs.published.size(), rp.published.size());
+      Require(common > 0 && std::equal(rs.published.begin(), rs.published.begin() + common, rp.published.begin()),
+              what + ": the request's tokens differ from plain's");
+    } else {
+      Require(rs.published == rp.published && rs.stop == rp.stop, what + ": the request's tokens differ from plain's");
+    }
+    RequireLive(spec, rs, what);
+    RequireLive(plain, rp, what);
+    if (c.name == "stop token") Require(rs.stop && rp.stop, what + ": the request must end by a stop token");
+    const bool exact_end = c.ending == Ending::kLimit;  // limit and stop token end in plain's state
+    if (exact_end) {
+      RequireSameState(plain, spec, what);
+    } else {
+      // Cancelled and stop-sequence requests: plain leaves the unadvanced token out of its cache; the drafted request
+      // has already evaluated the whole step it was cut in, so its checkpoint is at least as deep and extends plain's.
+      Require(rs.checkpoint >= rp.checkpoint && std::equal(rp.checkpoint_tokens.begin(), rp.checkpoint_tokens.end(), rs.checkpoint_tokens.begin()),
+              what + ": the drafted checkpoint must extend plain's");
+    }
+    // The next request: the conversation continues; with prefix reuse it gives plain's output.
+    const Tokens next_plain = Extend(rp.checkpoint_tokens, 7, 3);
+    const Tokens next_spec = exact_end ? next_plain : Extend(rs.checkpoint_tokens, 7, 3);
+    const Result ns = spec.Run(next_spec, limit), np = plain.Run(next_spec, limit);
+    Require(ns.published == np.published && ns.cached > 0, what + ": the next request (prefix reuse) differs from plain's");
+    if (exact_end) RequireSameState(plain, spec, what + ", after the next request");
+    if (!exact_end) {
+      // The next prompt follows plain's cache, where the drafted slot holds more: a cold restart there, same output.
+      const Result nc = spec.Run(next_plain, limit), pc = plain.Run(next_plain, limit);
+      Require(nc.published == pc.published, what + ": a request that diverges inside the drafted checkpoint differs from plain's");
+    }
+    ++checked;
+  }
+  std::printf("  %s/%s: B. %zu request endings (limits inside a draft, a stop token, a cancellation, a stop sequence): limit and stop-token requests leave the session, "
+              "its frontier logits and every checkpoint component byte-equal to plain's, the next request with prefix reuse gives plain's output; "
+              "cancelled and stop-sequence requests leave a checkpoint that extends plain's\n",
+              be.name.c_str(), f.name.c_str(), checked);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -355,6 +438,10 @@ int main(int argc, char** argv) {
       for (const auto& f : TinyFixtures()) {
         if (wants("reuse", f)) {
           ReuseTests(f, be, dir);
+          ++groups;
+        }
+        if (wants("end", f)) {
+          EndTests(f, be, dir);
           ++groups;
         }
       }
