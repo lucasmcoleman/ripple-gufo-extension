@@ -129,6 +129,13 @@ void Dispatch(const DeviceTensor& w, const float* x, int rows, float* y, Scratch
     ggml::LaunchBatchedQuantGEMMFp32(w.type, w.data, x, y, n, m, k, stream);
     return;
   }
+  // Long-K Q4_K/Q5_K rows (ffn_down): the single-row GEMV re-reads the whole activation vector from L2
+  // for every row; the small-batch kernel at batch 1 stages it in LDS and is bit-equal to the GEMV
+  // (same per-lane order). Measured +22..25 % on 5120x40960; Q6_K was slower there and stays on the GEMV.
+  if ((w.type == GgmlType::kQ4_K || w.type == GgmlType::kQ5_K) && k >= 16384 &&
+      ggml::LaunchKQuantSmallBatchDoubleStage(w.type, w.data, x, y, 1, m, k, stream)) {
+    return;
+  }
   ggml::LaunchGEMV(w.data, w.type, x, y, m, k, stream);
 }
 
