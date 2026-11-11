@@ -78,7 +78,7 @@ class DrafterEngine {
 /// "Follow-ups", item C). A drafter that throws costs speed, never the request: the failed draft becomes an empty
 /// proposal, the context is reset to the current position and the failure is counted here. After kLimit
 /// consecutive failures drafting is switched off for the session, with one warning line; a cold start or an invalidation of the
-/// session (`TapSink::Replaced(0)`) clears the record, so a new conversation tries again (a restore above position 0 keeps it).
+/// session (`TapSink::Replaced(0)`) clears the record, so a new conversation tries again (a restore above position 0 keeps the slot's record; failed BUILDS are counted apart and not cleared).
 class DrafterHealth {
  public:
   static constexpr std::size_t kLimit = 3;
@@ -99,10 +99,12 @@ class DrafterHealth {
   void BuildFailed(std::string_view what) noexcept;
   [[nodiscard]] bool build_given_up() const noexcept { return build_failures_ >= kLimit; }
   [[nodiscard]] std::size_t build_failures() const noexcept { return build_failures_; }
-  /// The session's content was replaced from position 0 (`TapSink::Replaced(0)`): forgets every failure and switches
-  /// drafting on again (a new conversation tries the drafter again). A restore of a checkpoint arrives as `Replaced(0)` (the
-  /// reset that begins it) followed by `Replaced(n)`, n > 0: `Restored()` then puts back what `Clear()` took, a restore to a
-  /// position above 0 continues the conversation and keeps the record.
+  /// The session's content was replaced from position 0 (`TapSink::Replaced(0)`): forgets every failure of a built drafter and
+  /// switches drafting on again (a new conversation tries the drafter again; the run of failed builds is kept, see `BuildFailed`). A restore of a checkpoint arrives as `Replaced(0)` (the
+  /// reset that begins it) followed by `Replaced(n)`, n > 0: `Restored()` then puts back what `Clear()` took, so a restore to a
+  /// position above 0 keeps the SLOT's record, not the conversation's: gufo restores any matching checkpoint into the slot it chose, so a new
+  /// conversation restored from a shared prefix inherits the switch-off of whatever the slot held before (speed only: drafting stays off until
+  /// a cold start on the slot; the output is plain's either way).
   void Clear() noexcept;
   void Restored() noexcept;
   [[nodiscard]] std::size_t failures() const noexcept { return failures_; }
