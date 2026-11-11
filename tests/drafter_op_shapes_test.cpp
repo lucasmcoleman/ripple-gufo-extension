@@ -161,7 +161,7 @@ struct RopeOut {
 struct AttnCase {
   std::string what;
   KvType type{KvType::kF32};
-  std::uint32_t capacity{0}, first{0}, anchor{0}, window{0};
+  std::uint32_t capacity{0}, first{0}, anchor{0}, window{0}, tokens{kBlock};  ///< block rows (16, or fewer where the context is long: see AttentionSpecs)
   std::vector<float> q, k_blk, v_blk;
   const std::uint8_t *ring_k{nullptr}, *ring_v{nullptr};
 };
@@ -233,10 +233,10 @@ class OpsSide final : public Side {
     const float *kb = Up(c.k_blk), *vb = Up(c.v_blk);
     const void* rk = UpBytes(c.ring_k, ring_bytes);
     const void* rv = UpBytes(c.ring_v, ring_bytes);
-    float* out = Alloc<float>(std::size_t{kBlock} * kNH * kD);
-    ops_->DraftAttention(q, rk, rv, c.type, c.capacity, c.first, c.anchor, kb, vb, out, kBlock, kNH, kNKV, kD, c.window,
+    float* out = Alloc<float>(std::size_t{c.tokens} * kNH * kD);
+    ops_->DraftAttention(q, rk, rv, c.type, c.capacity, c.first, c.anchor, kb, vb, out, c.tokens, kNH, kNKV, kD, c.window,
                          static_cast<float>(1.0 / std::sqrt(static_cast<double>(kD))));
-    auto result = Down<float>(out, std::size_t{kBlock} * kNH * kD);
+    auto result = Down<float>(out, std::size_t{c.tokens} * kNH * kD);
     Release();
     return result;
   }
@@ -401,7 +401,7 @@ class NaiveSide final : public Side {
   }
 
   std::vector<float> Attention(const AttnCase& c) override {
-    std::vector<float> out(std::size_t{kBlock} * kNH * kD);
+    std::vector<float> out(std::size_t{c.tokens} * kNH * kD);
     const double scale = 1.0 / std::sqrt(static_cast<double>(kD));
     const std::uint32_t group = kNH / kNKV;
     const auto slot_of = [&](std::uint32_t position) {
@@ -410,7 +410,7 @@ class NaiveSide final : public Side {
       return slot;
     };
 #pragma omp parallel for collapse(2) schedule(dynamic)
-    for (int t = 0; t < static_cast<int>(kBlock); ++t) {
+    for (int t = 0; t < static_cast<int>(c.tokens); ++t) {
       for (int h = 0; h < static_cast<int>(kNH); ++h) {
         const std::int64_t p = std::int64_t{c.anchor} + t;
         const auto visible = [&](std::int64_t j) { return c.window == 0 || std::llabs(p - j) < static_cast<std::int64_t>(c.window); };
@@ -420,7 +420,7 @@ class NaiveSide final : public Side {
         std::vector<std::pair<bool, std::size_t>> where;  // (context?, slot or block row)
         for (std::uint32_t j = c.first; j < c.anchor; ++j)
           if (visible(j)) where.emplace_back(true, slot_of(j));
-        for (std::uint32_t i = 0; i < kBlock; ++i)
+        for (std::uint32_t i = 0; i < c.tokens; ++i)
           if (visible(std::int64_t{c.anchor} + i)) where.emplace_back(false, i);
         score.resize(where.size());
         double mx = -INFINITY;
@@ -632,9 +632,11 @@ Verdict CompareRope(const RopeCase& c, const RopeOut& a, const RopeOut& b, const
       ++elements;
       const std::uint16_t ba = HalfBits(x), bb = HalfBits(y);
       if (ba != bb) {
-        const bool sign_differs = ((ba ^ bb) & 0x8000) != 0, nonzero = ((ba | bb) & 0x7FFF) != 0;
-        const int step = std::abs(static_cast<int>(ba & 0x7FFF) - static_cast<int>(bb & 0x7FFF));
-        if ((sign_differs && nonzero) || step > 1) bad = true;  // more than one binary16 step
+        // Allowed: one binary16 step of the larger value, or 2e-6 absolute (a result near zero whose float rounding differs in sign).
+        int exponent = 0;
+        (void)std::frexp(std::max(std::fabs(x), std::fabs(y)), &exponent);
+        const double allowed = std::max(std::ldexp(1.0, exponent - 11), 2e-6);
+        if (std::fabs(static_cast<double>(x) - y) > allowed) bad = true;
         ++half_steps;
       }
     }
@@ -706,7 +708,7 @@ void RunRope(Side& a, Side& b, Rng& rng, const Rings& rings, KvType type, Report
 
 struct AttnSpec {
   const char* name;
-  std::uint32_t cap, window, anchor, first;
+  std::uint32_t cap, window, anchor, first, tokens;
 };
 
 AttnCase MakeAttn(Rng& rng, const Rings& rings, KvType type, const AttnSpec& s) {
@@ -717,9 +719,10 @@ AttnCase MakeAttn(Rng& rng, const Rings& rings, KvType type, const AttnSpec& s) 
   c.window = s.window;
   c.anchor = s.anchor;
   c.first = s.first;
-  c.q = Normals(rng, std::size_t{kBlock} * kNH * kD, 2.0);  // scores N(0, 4) with unit keys and the 1/sqrt(128) scale
-  c.k_blk = Normals(rng, std::size_t{kBlock} * kKVW, 1.0);
-  c.v_blk = Normals(rng, std::size_t{kBlock} * kKVW, 1.0);
+  c.tokens = s.tokens;
+  c.q = Normals(rng, std::size_t{s.tokens} * kNH * kD, 2.0);  // scores N(0, 4) with unit keys and the 1/sqrt(128) scale
+  c.k_blk = Normals(rng, std::size_t{s.tokens} * kKVW, 1.0);
+  c.v_blk = Normals(rng, std::size_t{s.tokens} * kKVW, 1.0);
   c.ring_k = rings.K(type);
   c.ring_v = rings.V(type);
   return c;
@@ -727,22 +730,25 @@ AttnCase MakeAttn(Rng& rng, const Rings& rings, KvType type, const AttnSpec& s) 
 
 std::vector<AttnSpec> AttentionSpecs() {
   return {
+      // Contexts of 4,096 rows and more run 4 block rows, not 16: the host operation is sequential (50 to 80 s for 16 rows at 16,384
+      // keys), and the per-row key range, the ring slots and the cross-wave sums do not depend on the row count (the GPU's gate runs the same
+      // rows). Shorter contexts run the real 16.
       // sliding layers: window 4,096, ring 5,120 rows (4,096 + 1,024 slack)
-      {"sliding, 87 context rows", kSlideCap, kSlideWindow, 87, 0},
-      {"sliding, 500 context rows", kSlideCap, kSlideWindow, 500, 0},
-      {"sliding, 4096 context rows", kSlideCap, kSlideWindow, 4096, 0},
-      {"sliding, ring just full (5120 rows)", kSlideCap, kSlideWindow, kSlideCap, 0},
-      {"sliding, one past the ring's wrap (position 5120 in slot 0)", kSlideCap, kSlideWindow, kSlideCap + 1, 1},
-      {"sliding, second lap, block straddling a slot boundary", kSlideCap, kSlideWindow, 2 * kSlideCap + 7, kSlideCap + 7},
-      {"sliding, position 20000", kSlideCap, kSlideWindow, 20000, 20000 - kSlideCap},
+      {"sliding, 87 context rows", kSlideCap, kSlideWindow, 87, 0, 16},
+      {"sliding, 500 context rows", kSlideCap, kSlideWindow, 500, 0, 16},
+      {"sliding, 4096 context rows", kSlideCap, kSlideWindow, 4096, 0, 4},
+      {"sliding, ring just full (5120 rows)", kSlideCap, kSlideWindow, kSlideCap, 0, 4},
+      {"sliding, one past the ring's wrap (position 5120 in slot 0)", kSlideCap, kSlideWindow, kSlideCap + 1, 1, 4},
+      {"sliding, second lap, block straddling a slot boundary", kSlideCap, kSlideWindow, 2 * kSlideCap + 7, kSlideCap + 7, 4},
+      {"sliding, position 20000", kSlideCap, kSlideWindow, 20000, 20000 - kSlideCap, 4},
       // the full layer: no window, the last 16,384 rows, ring 17,408 rows
-      {"full, 87 context rows", kFullCap, 0, 87, 0},
-      {"full, 500 context rows", kFullCap, 0, 500, 0},
-      {"full, 4096 context rows", kFullCap, 0, 4096, 0},
-      {"full, base above 0 (rows 8900 to 8999)", kFullCap, 0, 9000, 8900},
-      {"full, 16384 context rows (the window)", kFullCap, 0, kContextWindow, 0},
-      {"full, one past the ring's wrap (position 17408 in slot 0), 16384-row clamp", kFullCap, 0, kFullCap + 1, kFullCap + 1 - kContextWindow},
-      {"full, position 30000 (rows 13616 to 29999 wrap)", kFullCap, 0, 30000, 30000 - kContextWindow},
+      {"full, 87 context rows", kFullCap, 0, 87, 0, 16},
+      {"full, 500 context rows", kFullCap, 0, 500, 0, 16},
+      {"full, 4096 context rows", kFullCap, 0, 4096, 0, 4},
+      {"full, base above 0 (rows 8900 to 8999)", kFullCap, 0, 9000, 8900, 16},
+      {"full, 16384 context rows (the window)", kFullCap, 0, kContextWindow, 0, 4},
+      {"full, one past the ring's wrap (position 17408 in slot 0), 16384-row clamp", kFullCap, 0, kFullCap + 1, kFullCap + 1 - kContextWindow, 4},
+      {"full, position 30000 (rows 13616 to 29999 wrap)", kFullCap, 0, 30000, 30000 - kContextWindow, 4},
   };
 }
 
@@ -1154,7 +1160,7 @@ void RunAll() {
       bool failed = false;
       std::string what;
       if (in_attention) {
-        const AttnSpec s{"sliding, one past the ring's wrap", kSlideCap, kSlideWindow, kSlideCap + 1, 1};
+        const AttnSpec s{"sliding, one past the ring's wrap", kSlideCap, kSlideWindow, kSlideCap + 1, 1, 4};
         const AttnCase c = MakeAttn(rng, rings, type, s);
         failed = Exceeds(WorstRowRel(a->Attention(c), twin.Attention(c), kD), tol.attn_rel);
         what = "attention reads the slot of a context row past the wrap one too high";
