@@ -216,6 +216,19 @@
         "testing"
       ],
       "role": "test"
+    },
+    "ricursive_profile_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_decode_bench": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
     }
   },
   "licenses": [

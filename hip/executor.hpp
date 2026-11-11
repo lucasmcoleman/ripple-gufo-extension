@@ -10,9 +10,11 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "hip/ops.hpp"
+#include "hip/profile.hpp"
 #include "src/executor_iface.hpp"
 #include "src/weights.hpp"
 
@@ -63,6 +65,13 @@ class OpsExecutor : public Executor {
   [[nodiscard]] bool DeviceUsable() noexcept { return ops_->Usable(); }
   [[nodiscard]] Ops& ops() noexcept { return *ops_; }
 
+  /// True when RICURSIVE_PROFILE=1 was set when this executor was created.
+  [[nodiscard]] bool Profiling() const noexcept { return prof_ != nullptr; }
+  /// The per-stage timing report (docs/PERF-PROFILE.md); empty when profiling
+  /// is off or no pass ran. Asking for it also stops the destructor from
+  /// printing the same passes to stderr again.
+  [[nodiscard]] std::string ProfileReport();
+
  private:
   struct Buffers;
   void DoForward(std::span<const std::int32_t> tokens,
@@ -85,11 +94,23 @@ class OpsExecutor : public Executor {
   [[nodiscard]] std::size_t CacheRows(std::uint32_t layer) const noexcept;
   [[nodiscard]] void* CacheBase(std::uint32_t layer, KvPart part) const noexcept;
 
+  /// Stage boundary: with profiling on, waits for the device and charges the
+  /// time since the last boundary to `stage`; otherwise one boolean test.
+  void Lap(std::uint32_t layer, profile::LayerStage stage, std::size_t bytes = 0) {
+    if (prof_) LapSlow(profile::Id(Info().sliding[layer], stage), bytes);
+  }
+  void Lap(profile::PassStage stage, std::size_t bytes = 0) {
+    if (prof_) LapSlow(profile::Id(stage), bytes);
+  }
+  void LapSlow(profile::StageId id, std::size_t bytes);
+
   std::unique_ptr<Ops> ops_;
   const ModelHandles& model_;
   std::shared_ptr<const void> keep_alive_;
   ExecFaults faults_;
   bool exact_;
+  std::unique_ptr<profile::StageProfile> prof_;  ///< null unless RICURSIVE_PROFILE=1
+  std::uint64_t profile_reported_{0};            ///< passes already in a ProfileReport()
   std::unique_ptr<Buffers> buf_;  ///< destroyed before ops_ (declared after)
 };
 

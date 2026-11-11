@@ -193,6 +193,7 @@ gufo_extension_target(
   NAME gufo_ricursive_exec
   SOURCES
     hip/executor.cpp
+    hip/profile.cpp
   LINK_LIBRARIES
     gufo_ricursive
     gufo_ext_runtime
@@ -223,6 +224,10 @@ _ricursive_test(executor_host TIMEOUT 1800
   SOURCES tests/executor_test.cpp tests/executor_backends_host.cpp
   LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
     gufo_ricursive_reference gufo_ricursive)
+
+# Per-stage timing accumulator and report (docs/PERF-PROFILE.md), fake clock.
+_ricursive_test(profile
+  SOURCES tests/profile_test.cpp LINK_LIBRARIES gufo_ricursive_exec gufo_ricursive)
 
 # GPU side: the S2 kernels (strict floating point, docs/S2-KERNELS.md), the
 # device model and the GPU ops, in their own target on top of
@@ -430,5 +435,19 @@ gufo_extension_target(
 )
 if(TARGET ricursive_gpu_logits)
   set_target_properties(ricursive_gpu_logits PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+
+# Tool, built on request (docs/PERF-PROFILE.md): ricursive_decode_bench MODEL.gguf
+#   --tokens FILE.i32 --prompt-tokens N --generate M [--backend cpu|host|gpu]
+#   [--rows R] [--context-cap N] [--logits-out FILE]
+# Prompt then greedy generation through the engine's Session, no HTTP.
+gufo_extension_target(
+  NAME ricursive_decode_bench
+  SOURCES tools/decode_bench.cpp tools/decode_bench_host.cpp
+  LINK_LIBRARIES gufo_ricursive gufo_ricursive_hostops gufo_ricursive_exec
+    gufo_ricursive_gpuexec gufo_ext_runtime gufo_ext_core gufo_ext_hip
+)
+if(TARGET ricursive_decode_bench)
+  set_target_properties(ricursive_decode_bench PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 # --- integration end ---

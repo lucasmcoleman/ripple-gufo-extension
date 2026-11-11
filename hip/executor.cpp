@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -99,6 +101,9 @@ OpsExecutor::OpsExecutor(std::unique_ptr<Ops> ops, const ModelHandles& model,
       faults_(faults),
       exact_(config.exact),
       buf_(std::make_unique<Buffers>(*ops_)) {
+  if (const char* env = std::getenv("RICURSIVE_PROFILE"); env != nullptr && std::strcmp(env, "1") == 0) {
+    prof_ = std::make_unique<profile::StageProfile>();
+  }
   const ExecutorInfo& info = Info();
   const Config& c = model_.config;
   if (faults_.ring_shortfall >= info.ring_rows) {
@@ -138,7 +143,26 @@ OpsExecutor::OpsExecutor(std::unique_ptr<Ops> ops, const ModelHandles& model,
       M, std::max<std::size_t>({E, Q, FF}));
 }
 
-OpsExecutor::~OpsExecutor() = default;
+OpsExecutor::~OpsExecutor() {
+  if (prof_ && prof_->TotalPasses() > profile_reported_) {
+    try {
+      const std::string report = prof_->Report();
+      std::fputs(report.c_str(), stderr);
+    } catch (...) {  // a report that cannot be printed must not throw from a destructor
+    }
+  }
+}
+
+void OpsExecutor::LapSlow(profile::StageId id, std::size_t bytes) {
+  ops_->Synchronize();  // the same wait the executor uses before reading results back
+  prof_->Mark(id, bytes);
+}
+
+std::string OpsExecutor::ProfileReport() {
+  if (!prof_) return {};
+  profile_reported_ = prof_->TotalPasses();
+  return prof_->Report();
+}
 
 std::size_t OpsExecutor::CacheRows(std::uint32_t layer) const noexcept {
   return Info().sliding[layer] ? Info().ring_rows : Info().max_context;
@@ -197,23 +221,30 @@ void OpsExecutor::Layer(std::uint32_t il, std::uint32_t n, std::uint32_t p0,
   const int il_tap = static_cast<int>(il);
   const bool sliding = info.sliding[il];
   const bool tapped = static_cast<bool>(tap);
+  using profile::LayerStage;
 
   // attn_norm; Q, K and the gate project from the normed input.
   ops.RmsNorm(b.h, L.attn_norm, b.a, n, E, eps);
+  Lap(il, LayerStage::kAttnNorm);
   Emit(tap, "attn_norm", il_tap, b.a, n, E);
   // Value residual: V projects from x0 + sigmoid(lambda) * (a - x0). The mix
   // goes to its own buffer (x0 is kept for the whole pass).
   if (!faults_.stale_scratch || il == 0) {
     ops.ValueMix(b.x0, b.a, L.attn_vres_lambda, b.vin, n, E);
   }
+  Lap(il, LayerStage::kValueMix);
   Emit(tap, "vres_in", il_tap, b.vin, n, E);
   const float* qk_in = faults_.value_mix_into_qk ? b.vin : b.a;
   const float* v_in = faults_.value_mix_into_qk ? b.a : b.vin;
   ops.Project(L.attn_q, qk_in, static_cast<int>(n), b.q, exact_);
+  Lap(il, LayerStage::kProjQ, L.attn_q.bytes);
   ops.Project(L.attn_k, qk_in, static_cast<int>(n), b.k, exact_);
+  Lap(il, LayerStage::kProjK, L.attn_k.bytes);
   ops.Project(L.attn_gate, faults_.gate_from_residual ? b.h : b.a,
               static_cast<int>(n), b.gate, exact_);
+  Lap(il, LayerStage::kProjGate, L.attn_gate.bytes);
   ops.Project(L.attn_v, v_in, static_cast<int>(n), b.v, exact_);
+  Lap(il, LayerStage::kProjV, L.attn_v.bytes);
   Emit(tap, "Vcur", il_tap, b.v, n, KV);
 
   if (tapped) {
@@ -240,6 +271,7 @@ void OpsExecutor::Layer(std::uint32_t il, std::uint32_t n, std::uint32_t p0,
   ops.QkNormRopeAppend(b.q, b.k, b.v, L.attn_q_norm, L.attn_k_norm, b.kc[il],
                        b.vc[il], info.kv_type, n, H, KVH, eps, append_at,
                        capacity, rotary, c.rope_freq_base);
+  Lap(il, LayerStage::kQkNormRopeKv);
   Emit(tap, "Qcur", il_tap, b.q, n, Q);
   if (tapped) {
     // K as stored (after norm and RoPE), read back from the cache.
@@ -268,6 +300,7 @@ void OpsExecutor::Layer(std::uint32_t il, std::uint32_t n, std::uint32_t p0,
   const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(D)));
   ops.Attention(b.q, b.kc[il], b.vc[il], info.kv_type, b.o, n, H, KVH, window,
                 p0, capacity, scale);
+  Lap(il, LayerStage::kAttention);
   Emit(tap, "attn_out", il_tap, b.o, n, Q);
 
   // out = attn_output(o * sigmoid(gate)).
@@ -276,8 +309,10 @@ void OpsExecutor::Layer(std::uint32_t il, std::uint32_t n, std::uint32_t p0,
     Emit(tap, "attn_gate", il_tap, b.tq, n, Q);
   }
   ops.SigmoidGate(b.o, b.gate, b.o, n, Q);
+  Lap(il, LayerStage::kSigmoidGate);
   Emit(tap, "attn_gated", il_tap, b.o, n, Q);
   ops.Project(L.attn_output, b.o, static_cast<int>(n), b.branch, exact_);
+  Lap(il, LayerStage::kProjAttnOut, L.attn_output.bytes);
   const float* post_attn =
       faults_.swap_post_norms ? L.post_ffw_norm : L.post_attention_norm;
   const float* post_ffn =
@@ -288,15 +323,21 @@ void OpsExecutor::Layer(std::uint32_t il, std::uint32_t n, std::uint32_t p0,
     Emit(tap, "attn_post_norm", il_tap, b.te, n, E);
   }
   ops.ResidualPostNorm(b.h, b.branch, post_attn, n, E, eps);
+  Lap(il, LayerStage::kPostAttnResidual);
   Emit(tap, "ffn_inp", il_tap, b.h, n, E);
 
   ops.RmsNorm(b.h, L.ffn_norm, b.f, n, E, eps);
+  Lap(il, LayerStage::kFfnNorm);
   Emit(tap, "ffn_norm", il_tap, b.f, n, E);
   ops.Project(L.ffn_gate, b.f, static_cast<int>(n), b.g, exact_);
+  Lap(il, LayerStage::kProjFfnGate, L.ffn_gate.bytes);
   ops.Project(L.ffn_up, b.f, static_cast<int>(n), b.u, exact_);
+  Lap(il, LayerStage::kProjFfnUp, L.ffn_up.bytes);
   ops.ClampedSwiGlu(b.g, b.u, b.g, n, FF, c.swiglu_clamp[il]);
+  Lap(il, LayerStage::kSwiGlu);
   Emit(tap, "ffn_swiglu", il_tap, b.g, n, FF);
   ops.Project(L.ffn_down, b.g, static_cast<int>(n), b.branch, exact_);
+  Lap(il, LayerStage::kProjFfnDown, L.ffn_down.bytes);
   Emit(tap, "ffn_out", il_tap, b.branch, n, E);
   if (tapped) {
     ops.Memset(b.te, 0, std::size_t{n} * E * sizeof(float));
@@ -304,6 +345,7 @@ void OpsExecutor::Layer(std::uint32_t il, std::uint32_t n, std::uint32_t p0,
     Emit(tap, "ffn_post_norm", il_tap, b.te, n, E);
   }
   ops.ResidualPostNorm(b.h, b.branch, post_ffn, n, E, eps);
+  Lap(il, LayerStage::kPostFfnResidual);
   Emit(tap, "l_out", il_tap, b.h, n, E);
 }
 
@@ -322,10 +364,13 @@ void OpsExecutor::Run(std::span<const std::int32_t> tokens, std::uint32_t p0,
 
   // x0 = embed * embedding_scale, kept for every layer's value mix; h starts
   // as the same row and becomes the residual stream.
+  if (prof_) prof_->BeginPass(n, p0 + n);
   ops.EmbedRows(model_.table, tokens, 1.0F, b.h);
+  Lap(profile::PassStage::kEmbed);
   if (faults_.x0_before_scale) ops.CopyInternal(b.x0, b.h, row_bytes);
   ops.ScaleRows(b.h, b.h, n, E, c.embedding_scale);
   if (!faults_.x0_before_scale) ops.CopyInternal(b.x0, b.h, row_bytes);
+  Lap(profile::PassStage::kEmbedScale);
   Emit(tap, "embd_scaled", -1, b.h, n, E);
 
   for (std::uint32_t il = 0; il < info.layers; ++il) Layer(il, n, p0, tap);
@@ -340,17 +385,22 @@ void OpsExecutor::Run(std::span<const std::int32_t> tokens, std::uint32_t p0,
       ops.CopyIn(b.ids, &row, sizeof(row));
       ops.GatherRows(b.h, b.ids, b.hg, 1, n, E);
       src = b.hg;
+      Lap(profile::PassStage::kRowGather);
     }
     ops.RmsNorm(src, model_.output_norm, b.hn, rows, E, c.rms_eps);
+    Lap(profile::PassStage::kFinalNorm);
     Emit(tap, "result_norm", -1, b.hn, rows, E);
     ops.Project(model_.output, b.hn, static_cast<int>(rows), b.logits, exact_);
+    Lap(profile::PassStage::kOutputProj, model_.output.bytes);
     Emit(tap, "result_output", -1, b.logits, rows, info.vocab);
     if (logits.size() != std::size_t{rows} * info.vocab) {
       throw std::logic_error("ricursive executor: logit buffer size mismatch");
     }
     ops.CopyOut(logits.data(), b.logits, logits.size() * sizeof(float));
+    Lap(profile::PassStage::kLogitsReadback);
   }
   ops.Synchronize();
+  if (prof_) prof_->EndPass();
 }
 
 void OpsExecutor::DoForward(std::span<const std::int32_t> tokens,
