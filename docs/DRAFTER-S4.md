@@ -305,5 +305,8 @@ In `DraftedSession::For`, a held drafter whose health says `disabled()` is retur
 ### Item 5: no allocation inside a noexcept catch handler
 `DescribeCurrent()` (runner.cpp) and `Describe()` (drafter_backend.cpp) built a `std::string` inside a `catch` of a `noexcept` function; a `bad_alloc` there (a long `runtime_error` message) would end the process. Both are replaced by `DescribeCurrentException()`, which copies the message into a fixed 256-byte `ErrorText` (truncated) and never allocates; the callers pass its `string_view`. Check, `BuildFailTests`: an engine factory that throws a 20,000-character message: the request completes as plain, the record's `last_error()` is under 300 bytes and the warning line on stderr under 600. (A real `bad_alloc` was not provoked.)
 
+### Item 6: the taps comparison is back in exact mode
+Stage 4c item 3 took the reference taps of the exact-mode `reuse` check from `RunTruthAfter` (the call-sequence oracle); the fresh plain session `RunTruth` was compared on tokens and logits only, so the taps of the fresh run were no longer compared with anything. In exact mode `ReuseTests` now also requires `SameBits(truth2.taps, fresh.taps)` (and that the taps exist), as stage rule 4 asks.
+
 ### Item 7: the command-line drivers are not covered
 Stage 4c made **serving** survive a drafter that cannot be built. The command-line drivers (`drivers.cpp`, about line 259) still build the drafted session directly, so a drafter that cannot be built still fails `ricursive prompt` / `ricursive chat` with `--speculative`. The drivers were not changed.
