@@ -58,16 +58,16 @@ run() {  # extra env assignments as arguments; output to $ROOT/last.txt, exit co
 row() { grep -E "^$1 +$2 " "$ROOT/last.txt"; }
 
 run
-check "all pass: exit 0, 56 PASS rows" '[ $RC -eq 0 ] && [ "$(grep -cE " PASS +[0-9.]+  ?" "$ROOT/last.txt")" -ge 56 ] && ! grep -E "^[a-z_]+ +[A-Za-z0-9_:.-]+ +(FAIL|NOT-RUN|LOCKED|SKIP)" "$ROOT/last.txt" | grep -q .'
-check "all pass: one wrapper call per invocation (56)" '[ "$(wc -l <"$CALLS")" -eq 56 ]'
-check "all pass: one log per invocation + summary" '[ "$(ls "$(ls -d "$ROOT"/out/* | tail -1)" | wc -l)" -eq 57 ]'
+check "all pass: exit 0, 64 PASS rows" '[ $RC -eq 0 ] && [ "$(grep -cE " PASS +[0-9.]+  ?" "$ROOT/last.txt")" -ge 64 ] && ! grep -E "^[a-z_]+ +[A-Za-z0-9_:.-]+ +(FAIL|NOT-RUN|LOCKED|SKIP)" "$ROOT/last.txt" | grep -q .'
+check "all pass: one wrapper call per invocation (64)" '[ "$(wc -l <"$CALLS")" -eq 64 ]'
+check "all pass: one log per invocation + summary" '[ "$(ls "$(ls -d "$ROOT"/out/* | tail -1)" | wc -l)" -eq 65 ]'
 
 run FAKE_FAIL='kernel_ops'
 check "kernel_ops FAIL: exit 1" '[ $RC -eq 1 ]'
 check "kernel_ops FAIL: first failure line shown" 'row kernel_ops all | grep -q "FAIL: injected failure in ricursive_kernel_ops_test"'
 check "kernel_ops FAIL: attention, executor test and contract NOT-RUN" 'row attention_ops small | grep -q NOT-RUN && row executor_test taps:tinyA | grep -q NOT-RUN && row executor_contract gpu-f16 | grep -q NOT-RUN'
 check "kernel_ops FAIL: projection_ops and embed still run and PASS" 'row projection_ops reject | grep -q " PASS " && row embed gpu | grep -q " PASS "'
-check "kernel_ops FAIL: not-run gates never reach the wrapper (1+23+1 calls)" '[ "$(wc -l <"$CALLS")" -eq 25 ]'
+check "kernel_ops FAIL: not-run gates never reach the wrapper (1+31+1 calls)" '[ "$(wc -l <"$CALLS")" -eq 33 ]'
 
 run FAKE_FAIL='executor_gpu_test twins:tinyB'
 check "one executor invocation FAIL: others PASS, contract NOT-RUN, exit 1" '[ $RC -eq 1 ] && row executor_test twins:tinyA | grep -q " PASS " && row executor_test twins:tinyB | grep -q " FAIL " && row executor_contract gpu-f16 | grep -q NOT-RUN'
@@ -87,10 +87,10 @@ check "embed SKIP(77): exit 2, executor_test NOT-RUN" '[ $RC -eq 2 ] && row embe
 run FAKE_LOCK_REFUSE='.'
 check "lock refused: exit 2, LOCKED(75) with the wrapper line" '[ $RC -eq 2 ] && row kernel_ops all | grep -q "LOCKED(75).*refusing to start"'
 check "lock refused: exactly one wrapper call, no retry" '[ "$(wc -l <"$CALLS")" -eq 1 ]'
-check "lock refused: independent gates not tried (LOCKED), dependents NOT-RUN" '[ "$(grep -Ec "^[a-z_]+ .*LOCKED\(75\)" "$ROOT/last.txt")" -eq 25 ] && [ "$(grep -Ec "^[a-z_]+ .* NOT-RUN" "$ROOT/last.txt")" -eq 31 ] && grep -q "not tried" "$ROOT/last.txt"'
+check "lock refused: independent gates not tried (LOCKED), dependents NOT-RUN" '[ "$(grep -Ec "^[a-z_]+ .*LOCKED\(75\)" "$ROOT/last.txt")" -eq 33 ] && [ "$(grep -Ec "^[a-z_]+ .* NOT-RUN" "$ROOT/last.txt")" -eq 31 ] && grep -q "not tried" "$ROOT/last.txt"'
 
 run FAKE_LOCK_REFUSE='ricursive_embed_test'
-check "lock lost mid-run: earlier gates PASS, embed LOCKED, dependents NOT-RUN, no retry" 'row kernel_ops all | grep -q " PASS " && row embed gpu | grep -q "LOCKED(75)" && row executor_test taps:tinyA | grep -q "NOT-RUN" && [ "$(wc -l <"$CALLS")" -eq 30 ]'
+check "lock lost mid-run: earlier gates PASS, embed LOCKED, dependents NOT-RUN, no retry" 'row kernel_ops all | grep -q " PASS " && row embed gpu | grep -q "LOCKED(75)" && row executor_test taps:tinyA | grep -q "NOT-RUN" && [ "$(wc -l <"$CALLS")" -eq 38 ]'
 
 run FAKE_SLEEP='attention_ops_test small' INVOCATION_TIMEOUT=1
 check "timeout: FAIL with timed out note" 'row attention_ops small | grep -q " FAIL " && row attention_ops small | grep -q "timed out"'
@@ -104,7 +104,7 @@ check "missing binary: FAIL, wrapper never called" '[ $RC -eq 1 ] && row embed g
 mv "$ROOT/bin/hidden" "$ROOT/bin/ricursive_embed_test"
 
 run LIST=1
-check "LIST=1: prints 56 invocations, runs nothing" '[ "$(grep -cE "^[a-z_]+ +[A-Za-z0-9_:.-]+ +(ricursive_|@)" "$ROOT/last.txt")" -eq 56 ] && [ "$(wc -l <"$CALLS")" -eq 0 ]'
+check "LIST=1: prints 64 invocations, runs nothing" '[ "$(grep -cE "^[a-z_]+ +[A-Za-z0-9_:.-]+ +(ricursive_|@)" "$ROOT/last.txt")" -eq 64 ] && [ "$(wc -l <"$CALLS")" -eq 0 ]'
 
 [ $fail -eq 0 ] && echo "ALL SELFTESTS PASS" || echo "SELFTEST FAILURES"
 exit $fail

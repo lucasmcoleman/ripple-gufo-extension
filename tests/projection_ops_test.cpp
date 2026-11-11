@@ -674,15 +674,18 @@ void RunShape(Backend& b, const ShapeCase& c, const Options& opt) {
 }
 
 /// Routing cases of the 1-row Q4_K/Q5_K path (project.cpp sends every such row to the staged small-batch
-/// kernel, 4 waves x 2 rows = 8 rows per block, 128 sub-blocks per stage). M = 47 and 5123 leave partial last
-/// blocks (47 is less than one 48-row block of the earlier 16x3 geometry), K = 16640 is 32 full stages plus a
-/// partly filled one, 16384 is exactly 32 stages, 16128 is just short of them. (Originally written for a K >= 16384
-/// threshold; the threshold is gone, the shapes still cover the stage boundaries.)
+/// kernel, 4 waves x 2 rows = 8 rows per block, 128 sub-blocks = 2048 inputs per stage). M = 47 and 5123 leave
+/// partial last blocks, M = 1 and 7 are below one 8-row block. K = 16384 is exactly 8 stages, 16640 is 8 stages
+/// plus a 16-sub-block partial stage, 16128 is 7 stages plus a 112-sub-block partial stage, K = 256 and 512 are
+/// 16 and 32 sub-blocks, far inside one stage. (Originally written for a K >= 16384 threshold; the threshold is
+/// gone, the shapes still cover the stage boundaries.)
 std::vector<ShapeCase> RouteCases() {
   std::vector<ShapeCase> cases;
   for (GgmlType t : {GgmlType::kQ4_K, GgmlType::kQ5_K}) {
-    for (std::size_t m : {std::size_t{47}, std::size_t{5123}}) {
-      for (std::size_t k : {std::size_t{16640}, std::size_t{16384}, std::size_t{16128}}) {
+    for (std::size_t m : {std::size_t{47}, std::size_t{5123}, std::size_t{1}, std::size_t{7}}) {
+      const bool small = m < 8;
+      for (std::size_t k : small ? std::vector<std::size_t>{256, 512}
+                                 : std::vector<std::size_t>{16640, 16384, 16128}) {
         cases.push_back({std::string("route_") + (t == GgmlType::kQ4_K ? "q4k_" : "q5k_") + std::to_string(m) + "x" +
                              std::to_string(k),
                          t, m, k});
@@ -731,8 +734,22 @@ void RunRoute(Backend& b, const ShapeCase& c, const Options& opt) {
     RequireBitEqual(out.data(), single.data(), 1, m,
                     c.name + ": input pointer +" + std::to_string(off * 4) + " bytes vs aligned 1-row result");
   }
+  {  // multi-row pass (4 rows) on an input that is not 16-byte aligned: Project must fall back, same bits
+    Buf xs(b, 4 * k + 4);
+    std::vector<float> shifted(1, 0.0F);
+    shifted.insert(shifted.end(), xh.begin(), xh.begin() + static_cast<std::ptrdiff_t>(4 * k));
+    xs.Set(shifted);
+    for (bool exact : {false, true}) {
+      b.Project(mat->Tensor(), xs.ptr() + 1, 4, h.y.ptr(), exact);
+      bool guards = true;
+      const auto out = h.y.Fetch(4 * m, &guards);
+      Require(guards, c.name + ": misaligned 4-row input wrote outside the output");
+      RequireBitEqual(out.data(), single.data(), 4, m,
+                      c.name + ": 4 rows at input +4 bytes" + (exact ? " exact" : "") + " vs aligned 1-row results");
+    }
+  }
   std::cout << c.name << ": 1-row Project memcmp-equal to the plain GEMV (16 x rows), rows 2..16 bit-equal, "
-            << "inputs misaligned by 4/8/12 bytes bit-equal, guards intact\n";
+            << "inputs misaligned by 4/8/12 bytes (also 4 rows at +4 bytes) bit-equal, guards intact\n";
 }
 
 void RunDense(Backend& b, GgmlType type, std::size_t m, std::size_t k) {

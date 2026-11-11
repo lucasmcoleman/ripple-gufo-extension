@@ -174,7 +174,8 @@ set(_ricursive_projection_cases q4k_10240x5120 q8_0_1024x5120
   route_q4k_47x16640 route_q4k_47x16384 route_q4k_47x16128
   route_q4k_5123x16640 route_q4k_5123x16384 route_q4k_5123x16128
   route_q5k_47x16640 route_q5k_47x16384 route_q5k_47x16128
-  route_q5k_5123x16640 route_q5k_5123x16384 route_q5k_5123x16128)
+  route_q5k_5123x16640 route_q5k_5123x16384 route_q5k_5123x16128
+  route_q4k_1x256 route_q5k_1x256 route_q4k_1x512 route_q5k_1x512 route_q4k_7x256 route_q5k_7x256 route_q4k_7x512 route_q5k_7x512)
 _ricursive_test(projection_ops NO_TEST
   SOURCES tests/projection_ops_test.cpp
   LINK_LIBRARIES gufo_ricursive_hip gufo_ricursive gufo_ext_hip)

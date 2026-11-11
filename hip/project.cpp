@@ -24,6 +24,8 @@ void Check(hipError_t err, const char* what) {
   }
 }
 
+bool Aligned16(const float* p) noexcept { return reinterpret_cast<std::uintptr_t>(p) % 16 == 0; }
+
 bool IsDense(GgmlType type) noexcept { return type == GgmlType::kF32 || type == GgmlType::kBF16; }
 
 }  // namespace
@@ -116,6 +118,12 @@ void Dispatch(const DeviceTensor& w, const float* x, int rows, float* y, Scratch
     // the GEMV bit for bit. LaunchBatchedQuantGEMMFp32 itself accepts any batch (eight-row passes).
     for (std::size_t r = 0; r < n; r += kSplitRows) {
       const std::size_t group = std::min<std::size_t>(kSplitRows, n - r);
+      if (!Aligned16(x)) {  // see the multi-row path below
+        for (std::size_t i = 0; i < group; ++i) {
+          ggml::LaunchGEMV(w.data, w.type, x + (r + i) * k, y + (r + i) * m, m, k, stream);
+        }
+        continue;
+      }
       ggml::LaunchBatchedQuantGEMMFp32(w.type, w.data, x + r * k, y + r * m, group, m, k, stream);
     }
     return;
@@ -127,6 +135,15 @@ void Dispatch(const DeviceTensor& w, const float* x, int rows, float* y, Scratch
     return;
   }
   if (rows > 1) {
+    // The batched kernels stage the input with 16-byte loads, so they assume a 16-byte-aligned x. Row
+    // r starts at x + r * k floats, k a multiple of 32, so every row is aligned when row 0 is. Otherwise run
+    // the plain GEMV row by row: each row of the batched kernel equals the GEMV bit for bit.
+    if (!Aligned16(x)) {
+      for (std::size_t r = 0; r < n; ++r) {
+        ggml::LaunchGEMV(w.data, w.type, x + r * k, y + r * m, m, k, stream);
+      }
+      return;
+    }
     ggml::LaunchBatchedQuantGEMMFp32(w.type, w.data, x, y, n, m, k, stream);
     return;
   }
@@ -140,7 +157,7 @@ void Dispatch(const DeviceTensor& w, const float* x, int rows, float* y, Scratch
   // faster than the GEMV on every Q4_K/Q5_K shape of the model, so the rule depends on the type only.
   // Q6_K spills in this kernel and Q8_0 gained nothing: both stay on the GEMV.
   if ((w.type == GgmlType::kQ4_K || w.type == GgmlType::kQ5_K) &&
-      reinterpret_cast<std::uintptr_t>(x) % 16 == 0 &&
+      Aligned16(x) &&
       ggml::LaunchKQuantSingleRow(w.type, w.data, x, y, m, k, stream)) {
     return;
   }

@@ -85,7 +85,8 @@ invocations() {
                q4k_5120x40960 q5k_5120x40960 q6k_100352x5120 f32-tiny twins reject \
                route_q4k_47x16640 route_q4k_47x16384 route_q4k_47x16128 route_q4k_5123x16640 route_q4k_5123x16384 \
                route_q4k_5123x16128 route_q5k_47x16640 route_q5k_47x16384 route_q5k_47x16128 route_q5k_5123x16640 \
-               route_q5k_5123x16384 route_q5k_5123x16128; do
+               route_q5k_5123x16384 route_q5k_5123x16128 \
+               route_q4k_1x256 route_q5k_1x256 route_q4k_1x512 route_q5k_1x512 route_q4k_7x256 route_q5k_7x256 route_q4k_7x512 route_q5k_7x512; do
         echo "$c|ricursive_projection_ops_test|$c|"
       done ;;
     embed)
