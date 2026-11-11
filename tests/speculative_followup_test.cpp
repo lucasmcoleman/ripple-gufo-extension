@@ -275,9 +275,11 @@ void ReuseTests(const TinyFixture& f, const DraftBackend& be, const std::string&
   const std::vector<std::int32_t> prompt2_ids(prompt2.begin(), prompt2.end());
   const Truth truth2 = RunTruthAfter(m.spec, first, first.gen.size(), prompt2_ids, limit);
   if (be.exact) {
-    // Exact back end: also the fresh plain session (nothing in it depends on pass boundaries).
+    // Exact back end: also the fresh plain session (nothing in it depends on pass boundaries): tokens, every logits row and, as before stage 4c, the taps
+    // the drafter's reference is fed (stage 4c-fix item 6: the check on the taps had been dropped when the oracle changed to `truth2`).
     const Truth fresh = RunTruth(m.spec, prompt2_ids, limit);
-    Require(truth2.gen == fresh.gen && SameBits(truth2.rows, fresh.rows), be.name + "/" + f.name + " A: plain through the call sequence differs from a fresh plain session");
+    Require(!truth2.taps.empty() && truth2.gen == fresh.gen && SameBits(truth2.rows, fresh.rows) && SameBits(truth2.taps, fresh.taps),
+            be.name + "/" + f.name + " A: plain through the call sequence differs from a fresh plain session (tokens, logits or taps)");
   }
   std::unique_ptr<ProposalCheck> check;
   std::size_t compared = 0;
