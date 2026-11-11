@@ -302,5 +302,8 @@ Item B made a request that ends by its limit leave plain's state; two other endi
 ### Item 4: a switched-off drafter is not reset or warned about again
 In `DraftedSession::For`, a held drafter whose health says `disabled()` is returned (after the decoder's `Restart()`) without `ResetTo` and without `WarnOff`: its ingest ignores rows once it is off, so its context is stale on purpose, and the bind used to "repair" it at every request, counting a failed reset and printing a warning each time when the reset threw. Check, `DisabledBindTests`: after the switch-off, ten more requests with every `ResetTo` throwing: zero further reset calls, zero warning lines (counted on stderr), tokens and end state equal plain's.
 
+### Item 5: no allocation inside a noexcept catch handler
+`DescribeCurrent()` (runner.cpp) and `Describe()` (drafter_backend.cpp) built a `std::string` inside a `catch` of a `noexcept` function; a `bad_alloc` there (a long `runtime_error` message) would end the process. Both are replaced by `DescribeCurrentException()`, which copies the message into a fixed 256-byte `ErrorText` (truncated) and never allocates; the callers pass its `string_view`. Check, `BuildFailTests`: an engine factory that throws a 20,000-character message: the request completes as plain, the record's `last_error()` is under 300 bytes and the warning line on stderr under 600. (A real `bad_alloc` was not provoked.)
+
 ### Item 7: the command-line drivers are not covered
 Stage 4c made **serving** survive a drafter that cannot be built. The command-line drivers (`drivers.cpp`, about line 259) still build the drafted session directly, so a drafter that cannot be built still fails `ricursive prompt` / `ricursive chat` with `--speculative`. The drivers were not changed.
