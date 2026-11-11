@@ -100,6 +100,7 @@ double Ms(Clock::duration d) { return std::chrono::duration<double, std::milli>(
 }  // namespace
 
 int main(int argc, char** argv) {
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);  // a timeout or a GPU fault must not lose the line that explains it (review of stage 2b, finding 6)
   if (argc < 3) {
     Usage();
     return 2;

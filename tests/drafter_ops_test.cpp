@@ -1063,6 +1063,7 @@ int Tiny(const std::string& target_path, const std::string& dir) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);  // a timeout or a GPU fault must not lose the line that explains it (review of stage 2b, finding 6)
   if (argc >= 4 && std::string(argv[1]) == "tiny") return Tiny(argv[2], argv[3]);
   if (argc >= 2 && std::string(argv[1]) == "real") return Real(argc, argv);
   if (argc >= 2 && std::string(argv[1]) == "long") return Long(argc, argv);

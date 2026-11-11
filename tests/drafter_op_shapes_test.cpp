@@ -1273,5 +1273,6 @@ void RunAll() {
 }  // namespace
 
 int main() {
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);  // a timeout or a GPU fault must not lose the line that explains it (review of stage 2b, finding 6)
   return ricursive_test::Run([] { RunAll(); });
 }
