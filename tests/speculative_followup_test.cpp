@@ -838,8 +838,7 @@ void BuildFailTests(const TinyFixture& f, const DraftBackend& be, const std::str
       Serve spec(CreateRunnerForModel(spec_model, "", setup), spec_model), plain(CreateRunnerForModel(plain_model, "", nullptr), plain_model);
       const std::string what = be.name + "/" + f.name + " C build, cancelled before step 2, no drafter";
       const Result rs = spec.Run(run_prompt, 24, Ending::kCancel, 2), rp = plain.Run(run_prompt, 24, Ending::kCancel, 2);
-      const std::size_t common = std::min(rs.published.size(), rp.published.size());
-      Require(common > 0 && std::equal(rs.published.begin(), rs.published.begin() + static_cast<std::ptrdiff_t>(common), rp.published.begin()), what + ": the tokens differ from plain's");
+      Require(!rs.published.empty() && rs.published == rp.published, what + ": the published tokens must equal plain's in full (" + std::to_string(rs.published.size()) + " against " + std::to_string(rp.published.size()) + ")");
       RequireLive(spec, rs, what);
       RequireLive(plain, rp, what);
       // the documented state: both have advanced every published token of two steps: L + 2 rows, plain's checkpoint
