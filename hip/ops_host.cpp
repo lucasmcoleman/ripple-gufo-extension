@@ -78,21 +78,38 @@ class HostOps final : public Ops {
     std::memset(dst, byte, bytes);
   }
   void CopyIn(void* dst, const void* host_src, std::size_t bytes) override {
+    if (counters_ != nullptr) {
+      ++counters_->copy_in_calls;
+      counters_->copy_in_bytes += bytes;
+    }
     Range("CopyIn", "dst", dst, bytes);
     std::memcpy(dst, host_src, bytes);
   }
   void CopyOut(void* host_dst, const void* src, std::size_t bytes) override {
+    if (counters_ != nullptr) {
+      ++counters_->copy_out_calls;
+      counters_->copy_out_bytes += bytes;
+    }
     Range("CopyOut", "src", src, bytes);
-    Synchronize();
+    Check();
     std::memcpy(host_dst, src, bytes);
   }
   void CopyInternal(void* dst, const void* src, std::size_t bytes) override {
+    if (counters_ != nullptr) {
+      ++counters_->copy_internal_calls;
+      counters_->copy_internal_bytes += bytes;
+    }
     Range("CopyInternal", "dst", dst, bytes);
     Range("CopyInternal", "src", src, bytes);
     NoOverlap("CopyInternal", dst, bytes, src, bytes);
     std::memcpy(dst, src, bytes);
   }
   void Synchronize() override {
+    if (counters_ != nullptr) ++counters_->synchronize_calls;
+    Check();
+  }
+  /// The guard check of a synchronization point (not counted).
+  void Check() {
     std::string bad = corruption_;
     for (const auto& [ptr, block] : blocks_) {
       if (bad.empty()) bad = Corruption(ptr, block);
@@ -110,6 +127,10 @@ class HostOps final : public Ops {
   void EmbedRows(const EmbeddingTable& table,
                  std::span<const std::int32_t> tokens, float scale,
                  float* out) override {
+    if (counters_ != nullptr) {
+      ++counters_->embed_calls;
+      counters_->embed_rows += tokens.size();
+    }
     Range("EmbedRows", "out", out, tokens.size() * table.hidden * 4);
     // Written here, not through EmbedRowsHost (hip/embed.cpp lives in the HIP
     // target): one DequantizeRow per token row and one fp32 multiply.

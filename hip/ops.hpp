@@ -292,6 +292,16 @@ struct HostOpsCounters {
   std::uint64_t project_q8{0};   ///< ProjectQ8 calls
   std::uint64_t q8_rows{0};      ///< rows of the ProjectQ8 calls
   std::vector<const void*> q8_weights;  ///< the weight data pointer of every ProjectQ8 call, in order
+  // What crosses between host and device and where the host waits (docs/DRAFTER-S2.md, "Stage 2b", item 3). On the GPU
+  // every one of these returns after the device finished all earlier work (EmbedRows, CopyIn and CopyOut synchronize
+  // the stream; Synchronize is the explicit wait): a call here is one synchronization point there.
+  std::uint64_t embed_calls{0}, embed_rows{0};
+  std::uint64_t copy_in_calls{0}, copy_in_bytes{0};
+  std::uint64_t copy_out_calls{0}, copy_out_bytes{0};
+  std::uint64_t copy_internal_calls{0}, copy_internal_bytes{0};
+  std::uint64_t synchronize_calls{0};
+  /// Calls that wait for the device.
+  [[nodiscard]] std::uint64_t SyncPoints() const noexcept { return embed_calls + copy_in_calls + copy_out_calls + synchronize_calls; }
 };
 
 /// Test-only deliberate defects of the host operations (docs/DRAFTER-S2.md, the twins).

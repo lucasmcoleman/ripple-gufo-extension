@@ -603,6 +603,47 @@ void CheckRoutes(const Tiny& t, const Drafter& d) {
               "(by call counting: the host has no model of the 8-bit activation rounding)\n", configurations);
 }
 
+/// Item 3 of docs/DRAFTER-S2.md "Stage 2b": what crosses between host and device and where the host waits, counted on the host
+/// operations (every EmbedRows, CopyIn, CopyOut and Synchronize of the host operations is a point where the GPU's stream is
+/// waited for). Per executor: the MASK rows are embedded once, at construction. Per draft step: one row embedded, the anchor
+/// token copied in, one device-to-device copy of the 15 MASK rows, one copy-out of the tokens and candidates; no other wait.
+void CheckTransfers(const Tiny& t, const Drafter& d) {
+  const DrafterConfig& c = d.w.config;
+  const std::uint64_t B = c.block_size, R = B - 1, K = c.selector_top_k, E = c.embedding_length, F = c.FeatureWidth();
+  HostOpsCounters n;
+  HostOpsOptions host;
+  host.counters = &n;
+  DrafterOptions o = F32Walk("").opts;
+  auto engine = MakeEngine(d, t.target, o, {}, host);
+  Require(n.embed_calls == 1 && n.embed_rows == R && n.copy_in_calls == 0 && n.copy_out_calls == 0,
+          "building an executor embeds the " + std::to_string(R) + " MASK rows once (" + std::to_string(n.embed_calls) + " embed calls of " +
+              std::to_string(n.embed_rows) + " rows, " + std::to_string(n.copy_in_calls) + " copies in)");
+  engine->Append(0, std::span(t.dump.taps).subspan(0, 20 * F));  // passes of 16 and 4 rows
+  Require(n.copy_in_calls == 2 && n.copy_in_bytes == 20 * F * sizeof(float) && n.copy_out_calls == 0 && n.embed_calls == 1,
+          "a context pass is one copy in of its feature rows and no wait");
+  for (const std::uint32_t want : {15U, 3U}) {
+    const HostOpsCounters before = n;
+    (void)engine->Draft(t.dump.ids[20], 20, want);
+    const auto delta = [&](std::uint64_t now, std::uint64_t then) { return now - then; };
+    Require(delta(n.embed_calls, before.embed_calls) == 1 && delta(n.embed_rows, before.embed_rows) == 1,
+            "a draft step embeds one row (the anchor's)");
+    Require(delta(n.copy_in_calls, before.copy_in_calls) == 1 && delta(n.copy_in_bytes, before.copy_in_bytes) == sizeof(std::int32_t),
+            "a draft step copies in the anchor token only");
+    Require(delta(n.copy_internal_calls, before.copy_internal_calls) == 1 &&
+                delta(n.copy_internal_bytes, before.copy_internal_bytes) == R * E * sizeof(float),
+            "a draft step copies the MASK rows on the device");
+    Require(delta(n.copy_out_calls, before.copy_out_calls) == 1 &&
+                delta(n.copy_out_bytes, before.copy_out_bytes) == (B + 2 * R * K) * sizeof(std::int32_t),
+            "a draft step reads back the tokens and candidates in one copy");
+    Require(n.synchronize_calls == before.synchronize_calls && n.SyncPoints() - before.SyncPoints() == 3,
+            "a draft step waits for the device three times: the embedded row, the token copy, the read-back");
+  }
+  std::printf("  transfers: executor construction embeds the %llu MASK rows once; a draft step (any d) embeds 1 row, copies in 4 bytes, copies the MASK "
+              "rows on the device (%llu bytes), copies out %llu bytes in one call and waits 3 times (embedded row, token copy, read-back)\n",
+              static_cast<unsigned long long>(R), static_cast<unsigned long long>(R * E * sizeof(float)),
+              static_cast<unsigned long long>((B + 2 * R * K) * sizeof(std::int32_t)));
+}
+
 void TinyCase(const ricursive_test::Model& target, const std::string& dir) {
   Tiny t{target, dir, LoadDump(dir + "/stage1/tiny/dump")};
   const Drafter q8 = OpenDrafter(dir + "/stage1/tiny/drafter-q8_0.gguf", target.weights.config);
@@ -641,6 +682,7 @@ void TinyCase(const ricursive_test::Model& target, const std::string& dir) {
   CheckHint(t, q8);
   if (host) {
     CheckRoutes(t, q8);
+    CheckTransfers(t, q8);
     Walk w = F16Walk("");
     w.opts.q8 = {true, true, true};
     MustPass(t, q8, w, "1. Q8_0 drafter, F16 context storage, every projection group on the 8-bit route (host: the same arithmetic)");

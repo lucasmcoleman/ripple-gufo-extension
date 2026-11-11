@@ -62,8 +62,8 @@ Sizes Plan(const DrafterConfig& c, std::uint32_t vocab, const DrafterOptions& o)
   s.append_rows = std::max<std::uint32_t>(1, std::min(o.max_append_rows, min_capacity));
   const std::uint64_t M = s.append_rows;
   s.context_pass = M * F + 2 * M * E + 2 * M * KV;
-  // h a x0 attn fin (E), q o (Q), kb vb bk bv (KV), dyn, g u (FF), logits, hproj
-  s.block = 5 * B * E + 2 * B * Q + 4 * B * KV + B * DYN + 2 * B * FF + R * vocab + R * c.selector_rank;
+  // h a x0 attn fin (E), q o (Q), kb vb bk bv (KV), dyn, g u (FF), logits, hproj, the 15 MASK rows (E)
+  s.block = 5 * B * E + 2 * B * Q + 4 * B * KV + B * DYN + 2 * B * FF + R * vocab + R * c.selector_rank + R * E /*MASK rows*/;
   s.select = B /*tokens*/ + 2 * R * K /*candidates*/ + 2 * R * P * K /*partials*/;
   // The projection scratch holds the Q8_1 activations of the 8-bit routes only: the context pass at more than 16 rows
   // (Project's own W8A8 route) or on the chosen route, the block pass and the head when chosen. `exact` uses none.
@@ -188,6 +188,9 @@ struct DrafterExecutor::Buffers {
   // block pass
   float *h{}, *a{}, *x0{}, *attn{}, *fin{}, *q{}, *o{}, *kb{}, *vb{}, *bk{}, *bv{}, *dyn{}, *g{}, *u{},
       *logits{}, *hproj{};
+  float* mask{};  ///< the 15 MASK rows of the block input, embedded once per executor
+  /// One buffer for what a draft step reads back, so that it is one copy-out: tokens [B] (tokens[0] the anchor, written
+  /// before the step), candidate ids [R][K], candidate scores [R][K] (each region begins right after the previous one).
   std::int32_t* tokens{};
   float *cand_scores{}, *part_scores{};
   std::int32_t *cand_ids{}, *part_ids{};
@@ -320,9 +323,10 @@ DrafterExecutor::DrafterExecutor(std::unique_ptr<Ops> ops, std::shared_ptr<const
   b.u = b.Take(B * FF);
   b.logits = b.Take(R * vocab);
   b.hproj = b.Take(R * c.selector_rank);
-  b.tokens = b.Take<std::int32_t>(B);
-  b.cand_scores = b.Take(R * K);
-  b.cand_ids = b.Take<std::int32_t>(R * K);
+  b.mask = b.Take(R * E);
+  b.tokens = b.Take<std::int32_t>(B + 2 * R * K);
+  b.cand_ids = b.tokens + B;
+  b.cand_scores = reinterpret_cast<float*>(b.tokens + B + R * K);
   b.part_scores = b.Take(R * P * K);
   b.part_ids = b.Take<std::int32_t>(R * P * K);
   const std::size_t esize = options_.kv_type == KvType::kF16 ? 2 : 4;
@@ -331,6 +335,10 @@ DrafterExecutor::DrafterExecutor(std::unique_ptr<Ops> ops, std::shared_ptr<const
     b.vr.push_back(b.Take<std::byte>(std::size_t{capacity_[l]} * KV * esize));
   }
   for (const auto& [rows, cols] : plan.reserve) ops_->ReserveProjection(rows, cols);
+  {  // The MASK rows never change: embed them once (this call waits for the device, once per executor).
+    const std::vector<std::int32_t> mask_ids(R, static_cast<std::int32_t>(c.mask_token_id));
+    ops_->EmbedRows(target_.table, mask_ids, kMaskScale, b.mask);
+  }
 }
 
 DrafterExecutor::~DrafterExecutor() = default;
@@ -464,11 +472,14 @@ DrafterExecutor::Draft DrafterExecutor::DraftStep(std::int32_t anchor_token, std
   };
   const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(D)));
 
-  // Block input: the anchor token and MASK rows of the target's embedding table, unscaled.
-  std::vector<std::int32_t> ids(B, static_cast<std::int32_t>(c.mask_token_id));
-  ids[0] = anchor_token;
+  // Block input: the anchor token and MASK rows of the target's embedding table, unscaled. Only the anchor's row is
+  // embedded (on the host) and uploaded per step; the 15 MASK rows are copied on the device from the copy made at
+  // construction. The anchor token goes to the selector's buffer now, while the stream is idle, so that no host
+  // transfer waits for work in the middle of the step.
   if (prof_) LapStart(false);
-  ops.EmbedRows(target_.table, ids, kMaskScale, b.h);
+  ops.CopyIn(b.tokens, &anchor_token, sizeof(std::int32_t));
+  ops.EmbedRows(target_.table, std::span<const std::int32_t>(&anchor_token, 1), kMaskScale, b.h);
+  ops.CopyInternal(b.h + E, b.mask, std::size_t{B - 1} * E * sizeof(float));
   Lap("embed");
   Emit(stage, "emb", -1, b.h, B, E);
 
@@ -539,18 +550,20 @@ DrafterExecutor::Draft DrafterExecutor::DraftStep(std::int32_t anchor_token, std
   Emit(stage, "hproj", -1, b.hproj, d, c.selector_rank);
   const std::uint32_t top_k =
       faults_.selector_top_k_limit != 0 ? std::min(c.selector_top_k, faults_.selector_top_k_limit) : c.selector_top_k;
-  ops.CopyIn(b.tokens, &anchor_token, sizeof(std::int32_t));
   ops.DraftSelect(b.logits, b.hproj, drafter_->selector_predecessor, drafter_->selector_successor, b.tokens,
                   b.cand_scores, b.cand_ids, b.part_scores, b.part_ids, d, vocab, c.selector_rank, top_k);
   Lap("select");
-  std::vector<std::int32_t> tokens(d + 1);
-  ops.CopyOut(tokens.data(), b.tokens, tokens.size() * sizeof(std::int32_t));
-  result.tokens.assign(tokens.begin() + 1, tokens.end());
+  // One copy-out (3.9 KB for the real configuration, whatever d is) returns the tokens and the candidates.
+  const std::size_t sel_rows = B - 1, sel_k = c.selector_top_k;
+  std::vector<std::int32_t> readback(B + 2 * sel_rows * sel_k);
+  ops.CopyOut(readback.data(), b.tokens, readback.size() * sizeof(std::int32_t));
+  result.tokens.assign(readback.begin() + 1, readback.begin() + 1 + d);
   result.top_k = top_k;
+  const auto* ids_at = readback.data() + B;
   result.candidates.resize(std::size_t{d} * top_k);
   result.scores.resize(std::size_t{d} * top_k);
-  ops.CopyOut(result.candidates.data(), b.cand_ids, result.candidates.size() * sizeof(std::int32_t));
-  ops.CopyOut(result.scores.data(), b.cand_scores, result.scores.size() * sizeof(float));
+  std::memcpy(result.candidates.data(), ids_at, result.candidates.size() * sizeof(std::int32_t));
+  std::memcpy(result.scores.data(), ids_at + sel_rows * sel_k, result.scores.size() * sizeof(float));
   std::uint32_t full_layer = 0;  // the context the draft read is the full layer's (the widest)
   for (std::uint32_t l = 0; l < c.block_count; ++l) {
     if (!c.sliding[l]) {
