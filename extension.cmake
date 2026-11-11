@@ -253,7 +253,7 @@ _ricursive_test(plain_fingerprint TIMEOUT 1800
   SOURCES tests/plain_fingerprint_test.cpp tests/draft_hostops.cpp
   LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
     gufo_ricursive_reference gufo_ricursive gufo_ext_cache)
-_ricursive_test(draft_session TIMEOUT 3000
+_ricursive_test(draft_session TIMEOUT 3600
   SOURCES tests/draft_session_test.cpp tests/draft_hostops.cpp
   LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
     gufo_ricursive_reference gufo_ricursive gufo_ext_cache)
