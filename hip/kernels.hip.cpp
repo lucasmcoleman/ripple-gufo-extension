@@ -257,8 +257,10 @@ __global__ void QkNormRopeAppendKernel(
 
 // ---- attention ---------------------------------------------------------------
 
-/// grid (tokens, kv_heads), block 128. A block serves the kGroup query heads
-/// of one KV head for one row at position p. Keys stream in tiles of 128
+/// grid (tokens, heads / kGroup), block 128. A block serves kGroup consecutive
+/// query heads (all in one KV head: kGroup divides heads / kv_heads) for one
+/// row at position p; kGroup is the whole group for launches of more than
+/// four rows and 1 or 2 for the short ones (HeadsPerBlock). Keys stream in tiles of 128
 /// from the first visible key: thread t scores key t of the tile for every
 /// head (K row from the cache, q from LDS), the tile's max and sum are
 /// reduced over the block, then thread d adds the tile's V column d with
@@ -392,9 +394,9 @@ __global__ void AttentionKernel(const float* __restrict__ q,
 
 /// Query heads per block for a launch: a block that serves a whole KV group
 /// reuses each K/V row for all its heads, which wins when many rows fill the
-/// GPU; with few rows only kv_heads blocks exist, so each head gets its own
-/// block pair (every head's arithmetic is independent of the others, so the bits
-/// do not change).
+/// GPU; with few rows that leaves only kv_heads blocks, so up to four rows use
+/// blocks of two heads (one head when the group is odd). Every head's
+/// arithmetic is independent of the others, so the bits do not change.
 std::uint32_t HeadsPerBlock(std::uint32_t group, std::uint32_t tokens) {
   if (tokens > 4) return group;
   return group % 2 == 0 ? 2U : 1U;  // measured: 2 heads per block beat 1, 5 and 10 (docs/PERF-KERNELS.md)
@@ -418,9 +420,6 @@ bool DispatchAttention(std::uint32_t group, const float* q, const void* k,
                        std::uint32_t start_pos, std::uint32_t tokens,
                        std::uint32_t capacity, float scale,
                        hipStream_t stream) {
-  if (group != 1 && group != 2 && group != 10) {
-    return false;
-  }
 #define RICURSIVE_ATTN_CASE(G)                                              \
   case G:                                                                   \
     LaunchAttention<G, CacheT>(q, k, v, out, heads, kv_heads, window,       \
@@ -429,7 +428,6 @@ bool DispatchAttention(std::uint32_t group, const float* q, const void* k,
   switch (HeadsPerBlock(group, tokens)) {
     RICURSIVE_ATTN_CASE(1)
     RICURSIVE_ATTN_CASE(2)
-    RICURSIVE_ATTN_CASE(5)
     RICURSIVE_ATTN_CASE(10)
     default:
       return false;
