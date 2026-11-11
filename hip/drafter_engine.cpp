@@ -27,13 +27,4 @@ DrafterEngine::Block OpsDrafterEngine::Draft(std::int32_t anchor_token, std::uin
   return block;
 }
 
-std::unique_ptr<OpsDrafterEngine> MakeHostOpsDrafterEngine(const DrafterWeights& drafter, const ModelWeights& target,
-                                                           const DrafterOptions& options,
-                                                           const DrafterExecFaults& faults,
-                                                           const HostOpsOptions& host) {
-  auto exec = std::make_unique<DrafterExecutor>(CreateHostOps(host), BuildHostDrafterHandles(drafter),
-                                                BuildHostDrafterTarget(target), nullptr, options, faults);
-  return std::make_unique<OpsDrafterEngine>(std::move(exec));
-}
-
 }  // namespace gufo::models::ricursive

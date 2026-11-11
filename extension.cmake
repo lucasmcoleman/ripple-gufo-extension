@@ -215,6 +215,7 @@ gufo_extension_target(
 gufo_extension_target(
   NAME gufo_ricursive_hostops
   SOURCES
+    hip/drafter_engine_host.cpp
     hip/ops_host.cpp
   LINK_LIBRARIES
     gufo_ricursive_exec
