@@ -203,6 +203,9 @@ def main():
             return EPS_FLOOR
         return x
 
+    if floor["mean"] == 0.0:
+        print("   WARNING: the floor is exactly 0 (the two floor runs are bit-identical): the 10x rule then compares against the 1e-9 "
+              "raise, not against real noise; the verdict is not meaningful (llama.cpp batches >= 32 are identical, use a 16-row run B)")
     f_mean, f_p99, f_max = floorval(floor["mean"]), floorval(floor["p99"]), floorval(floor["max"])
     f_dis = max(floor["disagree"], 1.0 / g["n"])
     lim_mean, lim_p99, lim_max, lim_dis = f_mean * scale, f_p99 * scale, f_max * scale, f_dis * scale
