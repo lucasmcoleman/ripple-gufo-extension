@@ -516,8 +516,9 @@ DraftedSession::DraftedSession(Session& session, const SpeculativeSetup& setup) 
   }
   engine_ = engine.get();
   engine->ResetTo(session.Position());  // rows the session already holds were never delivered
-  ingest_ = std::make_unique<DrafterIngest>(*engine);
-  auto backend = std::make_unique<DFlash2DraftBackend>(std::move(engine), setup.faults);
+  health_ = std::make_unique<DrafterHealth>();
+  ingest_ = std::make_unique<DrafterIngest>(*engine, health_.get());
+  auto backend = std::make_unique<DFlash2DraftBackend>(std::move(engine), setup.faults, health_.get());
   backend_ = backend.get();
   decoder_ = std::make_unique<SpeculativeDecoder>(session, std::move(backend), setup.max_draft_tokens);
   session.SetTapSink(ingest_.get());

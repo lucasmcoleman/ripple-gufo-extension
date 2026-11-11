@@ -209,3 +209,16 @@ hold only for a step that did not use its whole budget.
   one-row passes, then Sync), and are enabled in production mode; they run here on the exact back ends and are unverified on the production route until the night run. 4c stays exact-mode only, and cannot be otherwise: a drafted
   session recomputes from 0 in prefill passes exactly where plain decoding rewinds (the recompute band above), so the same call sequence takes different routes on the two sides by construction.
   Existing statements checked: test 5's pending-token assertion was replaced (above); nothing else of `speculative_test.cpp` was loosened.
+
+### Item C: a drafter failure costs speed, never the request
+
+**Superseded:** "The drafter's output never changes what is emitted" held for wrong tokens only; an exception inside `Propose` used to fail the request.
+- `DrafterHealth` (per session, shared by `DrafterIngest` and `DFlash2DraftBackend`). A throwing `Draft` becomes an empty proposal (the step runs plain), the context is reset to the current position
+  (`ResetTo`; a `ResetTo` that throws is counted and swallowed, the desync path then retries on the next step), the failure is counted. After 3 consecutive failures drafting is switched off for the session with one
+  warning line on stderr; the ingest then stops feeding rows. A failed `Append`/`TruncateTo`/`ResetTo` in the ingest counts too (it was already absorbed and reset); a proposal that succeeds ends the run
+  of failures unless rows failed to arrive since the previous proposal, so a persistent ingest fault also switches drafting off. Failures of the target keep their existing handling.
+  `DraftedSession::health()` exposes `failures()`, `consecutive()`, `disabled()`, `last_error()`.
+- Failing first (`perf/stage4b-C-unfixed.log`): `C (Draft throws at calls 1 and 3): the request failed: injected Draft failure`. Fixed (`stage4b-C-fixed.log`): an engine wrapper that throws at chosen calls of
+  `Draft`, `Append`, and `ResetTo` (5 plans: two isolated Draft failures: 2 counted, still on; every Draft, and from call 2 on: 3 counted, off, not tried again on the next request; three Append failures:
+  3 ingest failures, 3 counted, off; one Append failure plus the two following `ResetTo` calls failing: counted, on): every request completes, tokens and end state equal plain's, also for the next request.
+- The existing tests now assert zero failures (`ContextLedger` of `speculative_test.cpp` and `spec_util.hpp`, the twin loop, and the runner test): a real drafter bug cannot hide behind the fallback.

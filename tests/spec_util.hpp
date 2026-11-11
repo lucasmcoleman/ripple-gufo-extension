@@ -309,9 +309,9 @@ std::string ContextLedger(DraftedSession& ds, std::uint32_t base) {
     return "the drafter holds rows [" + std::to_string(e.Base()) + ", " + std::to_string(e.End()) + ") but the session is at " +
            std::to_string(ds.decoder().session().Position()) + " (expected from " + std::to_string(base) + ")";
   }
-  if (ds.backend().desyncs() != 0 || ds.ingest().failures() != 0) {
-    return "the drafter's bookkeeping reported " + std::to_string(ds.backend().desyncs()) + " desyncs and " +
-           std::to_string(ds.ingest().failures()) + " failures";
+  if (ds.backend().desyncs() != 0 || ds.ingest().failures() != 0 || ds.health().failures() != 0 || ds.health().disabled()) {
+    return "the drafter's bookkeeping reported " + std::to_string(ds.backend().desyncs()) + " desyncs, " + std::to_string(ds.ingest().failures()) +
+           " ingest failures and " + std::to_string(ds.health().failures()) + " drafter failures (a real drafter bug must not hide behind the fallback)";
   }
   return "";
 }

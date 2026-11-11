@@ -101,12 +101,15 @@ class DraftedSession {
   [[nodiscard]] DrafterEngine& engine() noexcept { return *engine_; }
   [[nodiscard]] DFlash2DraftBackend& backend() noexcept { return *backend_; }
   [[nodiscard]] DrafterIngest& ingest() noexcept { return *ingest_; }
+  /// What went wrong inside this session's drafter (failures, and whether drafting was switched off).
+  [[nodiscard]] const DrafterHealth& health() const noexcept { return *health_; }
 
  private:
   Session* session_;
   const SpeculativeSetup* setup_;
   DrafterEngine* engine_;
   DFlash2DraftBackend* backend_;
+  std::unique_ptr<DrafterHealth> health_;
   std::unique_ptr<DrafterIngest> ingest_;
   std::unique_ptr<SpeculativeDecoder> decoder_;
 };

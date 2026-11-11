@@ -519,9 +519,9 @@ std::string ContextLedger(DraftedSession& ds, std::uint32_t base) {
     return "the drafter holds rows [" + std::to_string(e.Base()) + ", " + std::to_string(e.End()) + ") but the session is at " +
            std::to_string(ds.decoder().session().Position()) + " (expected from " + std::to_string(base) + ")";
   }
-  if (ds.backend().desyncs() != 0 || ds.ingest().failures() != 0) {
-    return "the drafter's bookkeeping reported " + std::to_string(ds.backend().desyncs()) + " desyncs and " +
-           std::to_string(ds.ingest().failures()) + " failures";
+  if (ds.backend().desyncs() != 0 || ds.ingest().failures() != 0 || ds.health().failures() != 0 || ds.health().disabled()) {
+    return "the drafter's bookkeeping reported " + std::to_string(ds.backend().desyncs()) + " desyncs, " + std::to_string(ds.ingest().failures()) +
+           " ingest failures and " + std::to_string(ds.health().failures()) + " drafter failures (a real drafter bug must not hide behind the fallback)";
   }
   return "";
 }
@@ -593,6 +593,7 @@ void RealTests(const TinyFixture& f, const DraftBackend& be, const std::string& 
         return std::string();  // keep going: the output must stay exact
       });
       if (!run.error.empty()) ++exact_failures;
+      Require(ds.health().failures() == 0 && ds.ingest().failures() == 0, "a twin must not make the drafter fail (the fallback would hide it)");
       twin_proposals += ds.backend().proposals();
       twin_wrong += check.mismatched + check.range_wrong;
     }
@@ -902,6 +903,10 @@ void RunnerTests(const TinyFixture& f, const DraftBackend& be, const std::string
     const Generated got = Drive(s, prompt, 0, limit, c.config);
     Require(got.tokens == want.tokens && got.stop == want.stop,
             be.name + "/" + f.name + " runner, " + c.name + ": the tokens differ from the runner without speculation");
+    {
+      const DraftedSession* ds = DraftingOf(*s.state);
+      Require(ds != nullptr && ds->health().failures() == 0 && !ds->health().disabled(), "the runner's drafter must not have failed (the fallback would hide it)");
+    }
     if (c.drafts) {
       Require(got.drafted > 0, "the greedy request must have drafted");
     } else {

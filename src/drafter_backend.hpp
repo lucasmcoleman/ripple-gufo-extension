@@ -20,6 +20,7 @@
 #include <gufo/ext/draft_backend.hpp>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -72,13 +73,37 @@ class DrafterEngine {
   [[nodiscard]] virtual std::uint64_t DeviceBytes() const noexcept { return 0; }
 };
 
+/// What went wrong inside one session's drafter, shared by its ingest and its backend (docs/DRAFTER-S4.md,
+/// "Follow-ups", item C). A drafter that throws costs speed, never the request: the failed draft becomes an empty
+/// proposal, the context is reset to the current position and the failure is counted here. After kLimit
+/// consecutive failures drafting is switched off for the session, with one warning line.
+class DrafterHealth {
+ public:
+  static constexpr std::size_t kLimit = 3;
+  /// Records one failure; `where` names the call, `what` the exception's message; `in_ingest`: it happened
+  /// while rows were being fed (between two proposals), not inside a proposal.
+  void Failed(std::string_view where, std::string_view what, bool in_ingest) noexcept;
+  /// A proposal whose draft succeeded: ends a run of failures unless rows failed to arrive since the previous one.
+  void DraftSucceeded() noexcept;
+  [[nodiscard]] std::size_t failures() const noexcept { return failures_; }
+  [[nodiscard]] std::size_t consecutive() const noexcept { return consecutive_; }
+  [[nodiscard]] bool disabled() const noexcept { return disabled_; }
+  [[nodiscard]] const std::string& last_error() const noexcept { return last_error_; }
+
+ private:
+  std::size_t failures_{0}, consecutive_{0};
+  bool disabled_{false}, failed_since_proposal_{false};
+  std::string last_error_;
+};
+
 /// Feeds the rows a Session keeps into a DrafterEngine. A row at a position the engine
 /// does not continue is a rewind (rows from there are replaced) or a hole (the context
 /// restarts at that position): either way the engine never holds rows that are not the
 /// session's.
 class DrafterIngest final : public TapSink {
  public:
-  explicit DrafterIngest(DrafterEngine& engine) : engine_(&engine) {}
+  /// `health` (optional) counts the calls that threw; once drafting is switched off the rows are not fed any more.
+  explicit DrafterIngest(DrafterEngine& engine, DrafterHealth* health = nullptr) : engine_(&engine), health_(health) {}
   void Rows(std::uint32_t first_position, std::uint32_t rows, std::span<const float> data) noexcept override;
   void Rewound(std::uint32_t position) noexcept override;
   void Replaced(std::uint32_t position) noexcept override;
@@ -88,6 +113,7 @@ class DrafterIngest final : public TapSink {
 
  private:
   DrafterEngine* engine_;
+  DrafterHealth* health_;
   std::size_t failures_{0};
   std::size_t rows_given_{0};
 };
@@ -99,7 +125,10 @@ struct DraftBackendFaults {
 
 class DFlash2DraftBackend final : public speculative::IDraftBackend {
  public:
-  explicit DFlash2DraftBackend(std::unique_ptr<DrafterEngine> engine, DraftBackendFaults faults = {});
+  /// `health` (optional, must outlive the backend): where failures of the engine are counted. Without it a
+  /// failure is still absorbed (an empty proposal) but not counted and never switches drafting off.
+  explicit DFlash2DraftBackend(std::unique_ptr<DrafterEngine> engine, DraftBackendFaults faults = {},
+                               DrafterHealth* health = nullptr);
 
   [[nodiscard]] DrafterEngine& engine() noexcept { return *engine_; }
   [[nodiscard]] const DrafterEngine& engine() const noexcept { return *engine_; }
@@ -129,6 +158,7 @@ class DFlash2DraftBackend final : public speculative::IDraftBackend {
  private:
   std::unique_ptr<DrafterEngine> engine_;
   DraftBackendFaults faults_;
+  DrafterHealth* health_;
   std::size_t proposals_{0};
   std::size_t desyncs_{0};
   DrafterEngine::Block last_block_;

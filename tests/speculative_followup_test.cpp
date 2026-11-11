@@ -224,6 +224,7 @@ Models MakeModels(const TinyFixture& f, const DraftBackend& be, const std::strin
 
 std::string Ledger(DraftedSession& ds, std::uint32_t base) {
   auto& e = ds.engine();
+  if (ds.health().failures() != 0) return "the drafter reported failures";
   if (e.End() != ds.decoder().session().Position() || e.Base() != base) {
     return "the drafter holds rows [" + std::to_string(e.Base()) + ", " + std::to_string(e.End()) + ") but the session is at " +
            std::to_string(ds.decoder().session().Position()) + " (expected from " + std::to_string(base) + ")";
@@ -418,6 +419,125 @@ void EndTests(const TinyFixture& f, const DraftBackend& be, const std::string& d
               be.name.c_str(), f.name.c_str(), checked);
 }
 
+// ---- C: a drafter that fails costs speed, never the request ------------------------------------------------------
+
+/// Which calls of the engine throw (0-based per kind), counted across every engine built from the setup.
+struct FaultPlan {
+  std::set<std::size_t> draft, append;
+  std::size_t draft_from{SIZE_MAX};   ///< every Draft from this call on throws
+  std::size_t resets_after_append{0};  ///< when an Append throws, this many following ResetTo calls throw too
+  std::size_t drafts{0}, appends{0}, resets{0}, pending_resets{0};
+};
+
+class FlakyEngine final : public DrafterEngine {
+ public:
+  FlakyEngine(std::unique_ptr<DrafterEngine> inner, std::shared_ptr<FaultPlan> plan) : inner_(std::move(inner)), plan_(std::move(plan)) {}
+  const DrafterConfig& config() const noexcept override { return inner_->config(); }
+  std::vector<std::uint32_t> TapLayers() const override { return inner_->TapLayers(); }
+  std::uint32_t Base() const noexcept override { return inner_->Base(); }
+  std::uint32_t End() const noexcept override { return inner_->End(); }
+  void ResetTo(std::uint32_t base) override {
+    ++plan_->resets;
+    if (plan_->pending_resets > 0) {
+      --plan_->pending_resets;
+      throw std::runtime_error("injected ResetTo failure");
+    }
+    inner_->ResetTo(base);
+  }
+  void TruncateTo(std::uint32_t position) override { inner_->TruncateTo(position); }
+  void Append(std::uint32_t first_position, std::span<const float> features) override {
+    if (plan_->append.contains(plan_->appends++)) {
+      plan_->pending_resets = plan_->resets_after_append;
+      throw std::runtime_error("injected Append failure");
+    }
+    inner_->Append(first_position, features);
+  }
+  Block Draft(std::int32_t anchor_token, std::uint32_t anchor_position) override {
+    Hit();
+    return inner_->Draft(anchor_token, anchor_position);
+  }
+  Block Draft(std::int32_t anchor_token, std::uint32_t anchor_position, std::uint32_t max_tokens) override {
+    Hit();
+    return inner_->Draft(anchor_token, anchor_position, max_tokens);
+  }
+  std::uint64_t DeviceBytes() const noexcept override { return inner_->DeviceBytes(); }
+
+ private:
+  void Hit() {
+    const std::size_t call = plan_->drafts++;
+    if (plan_->draft.contains(call) || call >= plan_->draft_from) throw std::runtime_error("injected Draft failure");
+  }
+  std::unique_ptr<DrafterEngine> inner_;
+  std::shared_ptr<FaultPlan> plan_;
+};
+
+std::shared_ptr<const SpeculativeSetup> Flaky(const SpeculativeSetup& base, const std::shared_ptr<FaultPlan>& plan) {
+  auto setup = std::make_shared<SpeculativeSetup>(base);
+  const auto inner = base.engine_factory;
+  setup->engine_factory = [inner, plan](const SpeculativeSetup& s, const EngineModel& model) -> std::unique_ptr<DrafterEngine> {
+    return std::make_unique<FlakyEngine>(inner(s, model), plan);
+  };
+  return setup;
+}
+
+void FailTests(const TinyFixture& f, const DraftBackend& be, const std::string& dir) {
+  const auto base = Setup(f, dir, 4);
+  const std::size_t limit = 24;
+  const Tokens prompt = ToTokens(SyntheticTokens(55 + f.window, 27));
+  struct Case {
+    const char* name;
+    std::function<void(FaultPlan&)> arm;
+    std::size_t failures;  ///< what the drafter's health must have counted after the first request
+    bool disabled;
+    std::size_t ingest{0};  ///< and the ingest's own counter (0: not checked)
+  };
+  const std::vector<Case> cases = {
+      {"Draft throws at calls 1 and 3", [](FaultPlan& p) { p.draft = {1, 3}; }, 2, false},
+      {"Draft throws on every call", [](FaultPlan& p) { p.draft_from = 0; }, 3, true},
+      {"Draft throws from call 2 on", [](FaultPlan& p) { p.draft_from = 2; }, 3, true},
+      {"Append throws at calls 2, 3, 4 (the ingest path)", [](FaultPlan& p) { p.append = {2, 3, 4}; }, 3, true, 3},
+      {"Append throws once and the two following ResetTo calls too", [](FaultPlan& p) {
+         p.append = {3};
+         p.resets_after_append = 2;
+       }, 2, false, 1},
+  };
+  std::size_t checked = 0;
+  for (const Case& c : cases) {
+    const auto plan = std::make_shared<FaultPlan>();
+    c.arm(*plan);
+    const auto setup = Flaky(*base, plan);
+    const auto spec_model = ArmedModel(f, be, *setup);
+    const auto plain_model = PlainModel(f, be);
+    Serve spec(CreateRunnerForModel(spec_model, "", setup), spec_model), plain(CreateRunnerForModel(plain_model, "", nullptr), plain_model);
+    const std::string what = be.name + "/" + f.name + " C (" + c.name + ")";
+    Result rs;
+    try {
+      rs = spec.Run(prompt, limit);
+    } catch (const std::exception& e) {
+      Require(false, what + ": the request failed: " + e.what());
+    }
+    const Result rp = plain.Run(prompt, limit);
+    Require(rs.published == rp.published, what + ": the tokens differ from plain's");
+    RequireSameState(plain, spec, what);
+    DraftedSession* ds = DraftingOf(*spec.state);
+    Require(ds->health().failures() == c.failures && ds->health().disabled() == c.disabled,
+            what + ": the drafter counted " + std::to_string(ds->health().failures()) + " failures" + (ds->health().disabled() ? ", switched off" : "") +
+                " (expected " + std::to_string(c.failures) + (c.disabled ? ", switched off" : ", still on") + ")");
+    if (c.ingest > 0) Require(ds->ingest().failures() == c.ingest, what + ": the ingest counted " + std::to_string(ds->ingest().failures()) + " failures");
+    const std::size_t before = ds->health().failures();
+    // The second turn of the conversation, with the engine still failing as planned.
+    const Tokens next = Extend(rp.checkpoint_tokens, 7, 5);
+    const Result ns = spec.Run(next, limit), np = plain.Run(next, limit);
+    Require(ns.published == np.published, what + ": the second request differs from plain's");
+    const DraftedSession* ds2 = DraftingOf(*spec.state);
+    Require(ds2 == ds, what + ": the second request must keep the session's drafting");
+    if (c.disabled) Require(ds2->health().failures() == before, what + ": a drafter switched off must not be tried again");
+    ++checked;
+  }
+  std::printf("  %s/%s: C. %zu failure plans (Draft, Append, ResetTo): every request completes with plain's tokens and plain's end state\n", be.name.c_str(), f.name.c_str(),
+              checked);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -442,6 +562,10 @@ int main(int argc, char** argv) {
         }
         if (wants("end", f)) {
           EndTests(f, be, dir);
+          ++groups;
+        }
+        if (wants("fail", f)) {
+          FailTests(f, be, dir);
           ++groups;
         }
       }
