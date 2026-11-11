@@ -302,6 +302,17 @@ _ricursive_test(drafter_ops TIMEOUT 1800
     gufo_ricursive gufo_ext_cache
   ARGS tiny "${RICURSIVE_STAGE}/fixtures/tinyB.gguf" "${RICURSIVE_STAGE}/perf")
 
+# The drafter's operations one by one at the real model's shapes (docs/DRAFTER-S2.md, "Stage 2b"): the host operations against a
+# naive implementation in the test (RICURSIVE_TEST_BACKEND unset); the GPU operations against the host operations
+# (gpu-exact, gpu: only through tests/run-gpu-gates.sh).
+_ricursive_test(drafter_op_shapes TIMEOUT 1800
+  SOURCES tests/drafter_op_shapes_test.cpp
+  LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec gufo_ricursive gufo_ext_cache)
+if(TARGET ricursive_drafter_op_shapes_test)
+  find_package(OpenMP REQUIRED)
+  target_link_libraries(ricursive_drafter_op_shapes_test PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
 # GPU side: the S2 kernels (strict floating point, docs/S2-KERNELS.md), the
 # device model and the GPU ops, in their own target on top of
 # gufo_ricursive_hip (projections, embedding). GPU tests are labelled `gpu`,

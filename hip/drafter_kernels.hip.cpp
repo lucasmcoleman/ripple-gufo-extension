@@ -302,9 +302,9 @@ __global__ void DraftSiluMulKernel(float* __restrict__ gate, const float* __rest
 
 __device__ __forceinline__ void InsertCandidate(float score, std::int32_t id, float* scores,
                                                 std::int32_t* ids, std::uint32_t top_k) {
-  if (score <= scores[top_k - 1U]) return;
+  if (!DraftRanksAbove(score, id, scores[top_k - 1U], ids[top_k - 1U])) return;
   std::uint32_t insertion = top_k - 1U;
-  while (insertion > 0U && score > scores[insertion - 1U]) {
+  while (insertion > 0U && DraftRanksAbove(score, id, scores[insertion - 1U], ids[insertion - 1U])) {
     scores[insertion] = scores[insertion - 1U];
     ids[insertion] = ids[insertion - 1U];
     --insertion;
@@ -327,8 +327,10 @@ __device__ void MergeLists(float* scores, std::int32_t* ids, std::uint32_t top_k
       std::uint32_t mine = 0;
       std::uint32_t other = 0;
       for (std::uint32_t index = 0; index < top_k; ++index) {
+        // The total order of DraftRanksAbove (equal scores: the lower token id), not "the lower slot".
         const bool take_mine =
-            other >= top_k || (mine < top_k && mine_scores[mine] >= other_scores[other]);
+            other >= top_k ||
+            (mine < top_k && !DraftRanksAbove(other_scores[other], other_ids[other], mine_scores[mine], mine_ids[mine]));
         if (take_mine) {
           merged_scores[index] = mine_scores[mine];
           merged_ids[index] = mine_ids[mine];
@@ -454,7 +456,7 @@ __global__ void DraftFinalizeKernel(const float* __restrict__ partial_scores,
         const float score = shared_scores[candidate_index] + transition;
         candidate_scores[std::uint64_t(row) * top_k + candidate_index] = score;
         candidate_ids[std::uint64_t(row) * top_k + candidate_index] = shared_ids[candidate_index];
-        if (score > best_score) {
+        if (DraftRanksAbove(score, shared_ids[candidate_index], best_score, shared_ids[best_index])) {
           best_score = score;
           best_index = candidate_index;
         }

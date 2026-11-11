@@ -646,12 +646,12 @@ class HostOps final : public Ops {
     Range(op, "candidate_ids", candidate_ids, std::size_t{rows} * K * 4);
     Range(op, "partial_scores", partial_scores, std::size_t{rows} * P * K * 4);
     Range(op, "partial_ids", partial_ids, std::size_t{rows} * P * K * 4);
-    // Sorted descending lists of K (score, id); strictly larger scores enter, so of equal scores the
-    // one seen first stays (ascending ids within a row).
+    // Lists of K (score, id) in the order of km::DraftRanksAbove (the kernels' comparison): of equal scores the lower
+    // token id ranks first, in every list and in the final choice.
     auto insert = [&](float score, std::int32_t id, float* scores, std::int32_t* ids) {
-      if (score <= scores[K - 1]) return;
+      if (!km::DraftRanksAbove(score, id, scores[K - 1], ids[K - 1])) return;
       std::uint32_t at = K - 1;
-      while (at > 0 && score > scores[at - 1]) {
+      while (at > 0 && km::DraftRanksAbove(score, id, scores[at - 1], ids[at - 1])) {
         scores[at] = scores[at - 1];
         ids[at] = ids[at - 1];
         --at;
@@ -708,7 +708,7 @@ class HostOps final : public Ops {
         const float score = top_scores[c] + t;
         candidate_scores[std::size_t{row} * K + c] = score;
         candidate_ids[std::size_t{row} * K + c] = top_ids[c];
-        if (score > best_score) {
+        if (km::DraftRanksAbove(score, top_ids[c], best_score, top_ids[best_index])) {
           best_score = score;
           best_index = c;
         }

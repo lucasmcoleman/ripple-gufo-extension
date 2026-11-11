@@ -259,7 +259,7 @@ class Ops {
   /// tokens[1 + r] receives row r's choice. For row r the candidates are the selector_top_k
   /// largest logits (candidate_ids [rows][top_k], by descending logit, equal logits by
   /// ascending id), score_k = logit_k + sum_i (pred[prev][i] * hidden[r][i]) * succ[id_k][i]
-  /// (candidate_scores [rows][top_k]), the choice the largest score (the first on ties),
+  /// (candidate_scores [rows][top_k]), the choice the largest score (equal scores: the lowest token id, rocm::DraftRanksAbove),
   /// prev = the previous row's choice. The codebooks are [vocab][selector_rank] matrices of
   /// F32, BF16, Q8_0 or Q4_K. partial_scores / partial_ids: scratch of
   /// rows * DraftSelectPartials(vocab_size) * selector_top_k elements.

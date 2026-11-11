@@ -20,6 +20,14 @@ inline constexpr std::uint32_t kDraftSelectTokensPerBlock = 2048;
 /// Threads that cooperate on one candidate's low-rank transition score.
 inline constexpr std::uint32_t kDraftTransitionLanes = kDraftSelectThreads / kDraftMaxTopK;
 
+/// The selector's total order, shared by the host operations and the kernels (docs/DRAFTER-S2.md, "Stage 2b"): a
+/// candidate (score, id) ranks above (score2, id2) iff its score is larger, or the scores are equal and its token id is
+/// lower. Used for the top-k lists (by logit) and for the final choice (by score): equal values always resolve to the
+/// lowest token id, whatever order the lists were merged in, as DrafterReference does. A NaN ranks above nothing.
+RICURSIVE_HD bool DraftRanksAbove(float score, std::int32_t id, float score2, std::int32_t id2) {
+  return score > score2 || (score == score2 && id < id2);
+}
+
 /// Partial top-k lists per logits row: the vocabulary in blocks of kDraftSelectTokensPerBlock.
 RICURSIVE_HD std::uint32_t DraftSelectPartials(std::uint32_t vocab_size) {
   return (vocab_size + kDraftSelectTokensPerBlock - 1) / kDraftSelectTokensPerBlock;

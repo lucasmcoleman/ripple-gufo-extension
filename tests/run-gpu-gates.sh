@@ -14,6 +14,11 @@
 #   embed             -                   (embed_test gpu: host lookup + device copy)
 #   executor_test     kernel_ops attention_ops projection_ops embed   (every filter)
 #   executor_contract executor_test       (contract suite on the GPU backend)
+#   drafter_op_shapes kernel_ops projection_ops
+#                                         (docs/DRAFTER-S2.md, "Stage 2b": ricursive_drafter_op_shapes_test, each new drafter
+#                                          operation alone at the real model's shapes, the GPU operations against the host
+#                                          operations: gpu-exact = F32 rings, gpu = F16 rings (production). Run before
+#                                          drafter_ops: the cheapest and most diagnostic check of the new kernels)
 #   drafter_ops       kernel_ops projection_ops embed
 #                                         (docs/DRAFTER-S2.md: ricursive_drafter_ops_test with the drafter on the GPU
 #                                          operations against DrafterReference on the tiny drafters: gpu-exact = F32
@@ -69,7 +74,7 @@ ONLY=${ONLY:-}
 STAGE_DIR=${RICURSIVE_STAGE:-/server/staging/ripple-gufo}   # fixtures/tinyB.gguf and perf/ (the drafters' fixtures)
 
 GATES=(kernel_ops attention_ops projection_ops embed executor_test executor_contract
-       drafter_ops engine_tests engine_logits engine_prompt)
+       drafter_op_shapes drafter_ops engine_tests engine_logits engine_prompt)
 declare -A DEPS=(
   [kernel_ops]=""
   [attention_ops]="kernel_ops"
@@ -77,6 +82,7 @@ declare -A DEPS=(
   [embed]=""
   [executor_test]="kernel_ops attention_ops projection_ops embed"
   [executor_contract]="executor_test"
+  [drafter_op_shapes]="kernel_ops projection_ops"
   [drafter_ops]="kernel_ops projection_ops embed"
   [engine_tests]="executor_contract drafter_ops"
   [engine_logits]="executor_contract"
@@ -116,6 +122,10 @@ invocations() {
       # The contract test's main() has no filter; the backends file honours this variable.
       for b in gpu-f32-exact gpu-f16; do
         echo "$b|ricursive_executor_contract_gpu_test||RICURSIVE_CONTRACT_BACKEND=$b"
+      done ;;
+    drafter_op_shapes)
+      for b in gpu-exact gpu; do
+        echo "$b|ricursive_drafter_op_shapes_test||RICURSIVE_TEST_BACKEND=$b"
       done ;;
     drafter_ops)
       for b in gpu-exact gpu; do
