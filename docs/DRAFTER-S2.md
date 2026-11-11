@@ -251,7 +251,7 @@ and the engine really held 261.2 MiB: its scratch was reserved at (512, 40,960) 
 ### Item 5: the bench and tonight's commands
 
 `ricursive_drafter_bench`: a 16,384-row context in the default list, `--engine head|factory` (the production `MakeGpuDrafterEngine` over the target's device copy; uploads the whole target first), `--q8 SET/SET...` (route sets in one process, the drafter's weights pinned between them), `--attention NAME` (`DrafterOptions::attention_kernel`,
-validated at construction; only `default` exists; `Ops::DraftAttention` takes no kernel yet: stage 2c adds the argument), the cost of creating an engine (first, and a second from the resident weights), allocated against claimed session bytes, medians with p10/p90/min/max and the per-stage profile as before. `drafter_ops_test real` now also compares every named stage with the oracle's stage file (relative RMSE table);
+validated at construction; only `default` exists; `Ops::DraftAttention` takes no kernel yet: stage 2c adds the argument **[SUPERSEDED, stage 2c: `default` and `tiled` exist; stage 2c added a second method, `Ops::DraftAttentionTiled`, instead of an argument, and `--attention` takes a list `default/tiled` for an A/B in one process. See "Stage 2c".]**), the cost of creating an engine (first, and a second from the resident weights), allocated against claimed session bytes, medians with p10/p90/min/max and the per-stage profile as before. `drafter_ops_test real` now also compares every named stage with the oracle's stage file (relative RMSE table);
 `drafter_ops_test long` writes (host) or compares (GPU) drafts at 5,121 / 16,385 / 17,409 / 20,000 rows on real weights. **Not run**: both need 20 GB of free host memory (35 available) and `free -g` showed 12 GiB at the time; they were built and syntax-checked only. The ordered run list is `/server/staging/ripple-gufo/perf/STAGE2-GPU.md`.
 
 ### Proof that the target's path is unchanged
@@ -259,3 +259,151 @@ validated at construction; only `default` exists; `Ops::DraftAttention` takes no
 `git diff 72ced1a --stat` is empty for `hip/kernels.*`, `hip/kernels_math.hpp`, `hip/executor.*`, `hip/embed.*`, `hip/profile.*`, `hip/ggml/`, `src/engine.*`, `src/executor_iface.*`, `src/cpu_executor.cpp`, `src/reference.cpp`, and the tests `plain_fingerprint`, `executor_contract`, `executor`, `engine`, `kernel_ops`, `attention_ops`, `projection_ops`.
 `hip/project.cpp` only gained `ProjectW8A8` (nothing removed). `Ops` gained `ProjectQ8` and `ProjectionScratchBytes`; the target's executor calls neither; the host `Project` body was moved into a helper behind a call counter, bit for bit. `ReserveProjection` on the host now records a size (no allocation). Existing test lines removed are the gate-count constants (124 -> 126), the stage 2 bookkeeping expectations that item 4 supersedes,
 and the two engine-factory option lines (now `EffectiveDrafterOptions`); no check was loosened.
+
+## Stage 2c: the second attention kernel (2026-11-11, branch `drafter-s2c` from `drafter-s4d` 5a54398, job 1692)
+
+A second kernel for `DraftAttention`, **`tiled`**, in which each K/V tile of a K/V head is loaded from memory once and used by every query that
+sees it (16 block rows x 10 query heads). The existing kernel (`DraftAttentionKernel`) is unchanged and stays the default; `tiled` is chosen by name
+(`DrafterOptions::attention_kernel`, `ricursive_drafter_bench --attention default/tiled`, `RICURSIVE_TEST_ATTENTION=tiled` in the tests). **Compiled for gfx1151,
+never run on a GPU.** Everything called tested below ran on the CPU, on its structural twin. Logs: `/server/staging/ripple-gufo/perf/stage2c-*.log`.
+
+| file | what |
+| --- | --- |
+| `hip/drafter_math.hpp` | the shared index arithmetic: `DraftTiledSplits` (the key plan), `DraftTiledSplitKeys`, `DraftTiledSlot` (ring slot without a modulo), `DraftTiledThreads`, `DraftTiledScratchFloats`, `DraftTiledRecord`; constants `kDraftTiledKeys` = 32, `kDraftTiledMaxSplits` = 16 |
+| `hip/drafter_kernels.{hpp,hip.cpp}` | `DraftTiledAttentionKernel<kD, CacheT>` (kD 32, 64, 128; F16 or F32 ring), `DraftTiledCombineKernel`, the launcher `rocm::DraftAttentionTiled` |
+| `hip/ops.hpp`, `hip/ops_gpu.cpp`, `hip/ops_host.cpp` | `Ops::DraftAttentionTiled` (a new method: `Ops::DraftAttention` and its two implementations are untouched); the host implementation is the **structural twin** `TiledAttentionWorkgroup` / `TiledAttentionCombine`; `HostOpsOptions::tiled_fault` (three test-only defects) |
+| `hip/drafter_executor.{hpp,cpp}` | `kDraftAttentionKernels = {default, tiled}`; with `tiled` the executor allocates the partials scratch (in `DrafterSessionBytes`) and calls `DraftAttentionTiled`; refuses a head dimension other than 32/64/128 at construction |
+| tests, gates, bench | below |
+
+### Design
+
+**Geometry.** Grid `(splits + 1, kv_heads)`, block `DraftTiledThreads(tokens, group)` = 2 threads per query rounded up to whole waves of 32: **320 threads (10 waves) for the
+real shapes** (16 rows x 10 heads), 128 for the tiny drafters (16 x 4). Workgroup `(split, kvh)` serves every query `qi = t x group + g` of K/V head `kvh` over one key range:
+- **Key numbering.** The context keys of all rows are numbered `n = 0 .. ctx_keys - 1` from the first row's first visible context row: every row's range ends at the anchor and its
+  begin `max(ctx_first, p + 1 - window)` does not decrease with the row, so the union of the rows' ranges is the first row's (`DraftTiledSplits`; checked by brute force against
+  `DraftVisibleKeys` on 414 plans, below). Each query keeps its own visible range `[vis_lo, vis_hi)` in that numbering, from `DraftVisibleKeys` (the function the old kernel and the host
+  operation use), and masks the keys outside it: a ring that has wrapped, a context shorter than the window, a base above 0 and the sliding window's per-row start are all
+  `DraftVisibleKeys`'s.
+- **Splits.** `tiles = ceil(ctx_keys / 32)`, `tiles_per_split = ceil(tiles / 16)`, `splits = ceil(tiles / tiles_per_split)` (at most 16, never empty, whole tiles but the last);
+  split `splits` is the block's own 16 rows (fp32, one tile). 500 context rows: 16 splits of 1 tile; 4,096: 16 of 8 tiles; 16,384: 16 of 32 tiles. **136 workgroups per
+  layer** for the real shapes (17 x 8), each of 10 waves.
+- **Ring slot without a modulo per key**: one modulo per workgroup (`slot0 = (ctx_begin + n0) % capacity`), then `DraftTiledSlot(slot0, rel)` = `slot0 + rel` minus `capacity` if
+  it is not below it. Exact because `rel < ctx_keys <= capacity` (the launcher refuses `ctx_keys > capacity`, as the old one refused a row's range larger than the ring).
+- **Per tile (32 keys)**: the workgroup stages the tile's K and V rows of its head as fp32 into LDS (chunks of 8 elements, `LoadKeys8` as the old kernel: 16-byte loads; keys past
+  the split are zeros), one barrier; every thread scores the 32 keys with its half of q (dimensions `d = 4 (2 j + half) + e`: the two halves of a query are interleaved by 16 bytes)
+  and adds its partner's half with `__shfl_xor(p, 1)` (half 0 forms `p0 + p1`, half 1 `p1 + p0`: the same float); both threads of a pair therefore hold the same scores, max and sum;
+  then the online-softmax update of its 64 output dimensions; one barrier before the next tile is staged. No block-wide reduction at all.
+- **Partials and combine.** Each query writes `acc[head_dim], m, l` to the scratch (`[kv_heads][splits + 1][tokens x group][head_dim + 2]` floats, scalar stores); a second
+  kernel, grid `(tokens, heads)`, block `head_dim`, combines the splits in order 0 .. splits (block rows last) and writes `out`. Scratch: `(16 + 1) x tokens x heads x (head_dim + 2)`
+  floats = **10.8 MiB** per session at the real shapes, one buffer for all layers, in `DrafterSessionBytes` only when `tiled` is chosen.
+
+**Softmax, and why it is exact up to rounding.** Within a split, per query, after every tile: `m` = the largest score seen, `l = sum exp(s - m)`, `acc = sum exp(s - m) v` over the
+visible keys seen so far. A tile with largest score `t_max`: `m' = max(m, t_max)`, `alpha = exp(m - m')`, `p_i = exp(s_i - m')`, `l' = l alpha + sum p_i`, `acc' = acc alpha + sum p_i v_i`:
+multiplying the old sums by `exp(m - m')` re-expresses them relative to `m'`, so the invariant holds after the tile in exact arithmetic. Combine: `M = max_s m_s`, `w_s = exp(m_s - M)`,
+`out = sum_s w_s acc_s / sum_s w_s l_s = sum_all exp(s - M) v / sum_all exp(s - M)` = softmax(s) V, exactly in real arithmetic; in fp32 the only errors are the rounding of the dot
+products, `expf`, the products and the sums (every exponent argument is <= 0, so nothing overflows). Edge cases: a query that sees no key of a tile and none before keeps its state
+(`m' = -inf`: the update is skipped; it would compute `exp(-inf - -inf)` = NaN); a split in which a query saw no key has `m = -inf`, `l = 0` and weight 0; every query sees at least
+its own block row (`|p - p| = 0 < window`, or window 0), so `M` is finite and `l > 0`.
+
+### Numbers (computed from the configuration by a script, not measured; 4 sliding layers with window 4,096, 1 full layer with 16,384; 16 rows; F16 ring, fp32 block rows)
+
+| per draft step | 500 context rows | 4,096 | 16,384 |
+| --- | --- | --- | --- |
+| K/V bytes read, old kernel (each K/V head's keys read by 16 rows x 5 head pairs = 80 workgroups) | 831.2 MiB | 6,439.4 MiB | 10,279.4 MiB |
+| K/V bytes read, `tiled` (once) | 10.4 MiB | 80.6 MiB | 128.6 MiB |
+| `tiled`'s other traffic: partials written and read by the combine | 107.9 MiB | 107.9 MiB | 107.9 MiB |
+| `tiled`'s other traffic: q rows (every workgroup reads its 160 rows; old: 2 rows per workgroup, 3.1 MiB) | 53.1 MiB | 53.1 MiB | 53.1 MiB |
+| multiply-adds (q.k and p.v, 128 each per key), old | 0.845 G | 6.726 G | 10.752 G |
+| multiply-adds executed by `tiled` (tiles padded to 32 keys, masked keys included) | 0.891 G (+5.4%) | 6.763 G (+0.6%) | 10.790 G (+0.3%) |
+| workgroups per layer | old 640 x 128 threads; `tiled` 136 x 320 threads + combine 1,280 x 128 | same | same |
+| LDS per workgroup | old 4,352 B (two heads); `tiled` 32,768 B (2 x 32 keys x 128 x 4) | same | same |
+
+**What limits it.** Memory traffic falls from 0.8 to 10 GiB per step to 0.17 to 0.29 GiB (at 500 rows the partials and q rows are 94% of `tiled`'s traffic: see "left on the table").
+The multiply-adds are the same as the old kernel's, so the limit becomes the arithmetic: every fp32 FMA takes one operand from LDS (each thread reads the tile's K and V rows of its
+half: 16 `float4` LDS reads per key for 64 FMAs each, the 16 lanes of a half-wave reading the same address) and the compiler places the kernel at 8 waves per SIMD (192 VGPRs). Which of FMA issue, LDS reads
+or the 136-workgroup granularity binds is for tonight's measurement. For orientation only (an extrapolation, not a measurement): the target's attention kernel, the same loop structure as the
+old drafter kernel, took 285.9 us for 1 row x 80 heads x 4,100 keys (`docs/PERF-KERNELS.md`); 16 rows of it would be about 4.6 ms per sliding layer at 4,096 rows and about 18 ms for the
+full layer at 16,384, about 37 ms of a step's 41 ms budget. No time is predicted for `tiled`.
+**Why this geometry** (from the measurements in the repository): `docs/PERF-KERNELS.md` ("Multi-row attention") found the target's multi-row attention cost to be per workgroup and per tile
+(loads, syncs, block reductions), not per product, and fewer, larger workgroups faster; `tiled` has 136 workgroups, two barriers per 32-key tile and no block-wide reduction. The same
+document measured a K tile staged in LDS **2x slower** for the target's kernel (row stride 17 chunks, 44 KB LDS): there one staged K row served at most 10 heads of one row, here 160 queries;
+whether staging pays here is exactly what the A/B measures. Head dimension 128 in two halves keeps q (64) and the accumulator (64) in registers: 192 VGPRs, no spill.
+**Left on the table** (simplicity first): fewer splits at short contexts (a minimum split length would cut the partials and q traffic that dominate at 500 rows, at the cost of fewer
+workgroups); the matrix units (WMMA) for q.k and p.v; F16 K/V in LDS (half the LDS reads, a conversion per read); several queries per thread (fewer LDS reads per FMA); the combine folded
+into the main kernel (needs a cross-workgroup completion count: atomics, which the first night should not debug); a 16-key tile (16 KiB LDS, fewer registers).
+
+### Compiler report (gfx1151, the extension's flags `-O3 -fno-fast-math -ffp-contract=off`, `-Rpass-analysis=kernel-resource-usage` and the device assembly; `perf/stage2c-resource-usage.log`)
+
+| kernel | VGPRs | SGPRs | scratch (spills) | LDS bytes | occupancy (waves/SIMD) | wave size |
+| --- | --- | --- | --- | --- | --- | --- |
+| `DraftTiledAttentionKernel<128, __half>` and `<128, float>` (the real shapes) | 192 | 37 | 0 (VGPR spills 0, SGPR spills 0) | 32,768 | 8 | 32 (`.amdhsa_wavefront_size32 1`) |
+| `DraftTiledAttentionKernel<64, *>` | 125 | 37-38 | 0 | 16,384 | 10 | 32 |
+| `DraftTiledAttentionKernel<32, *>` (the tiny drafters) | 102 | 38 | 0 | 8,192 | 12 | 32 |
+| `DraftTiledCombineKernel` | 8 | 23 | 0 | 0 | 16 | 32 |
+
+LDS limit per workgroup: 64 KB on gfx1151 per this document (stage 2, "Why the vendored attention was replaced"); 32,768 B is half of it. **The existing kernels' device code did not change**: the
+device assembly of all 10 kernels that were in `hip/drafter_kernels.hip.cpp` at 5a54398 (`DraftAttentionKernel` x 4, `DraftQkNormRopeKernel` x 2, conv, silu, partial top-k, finalize) is
+identical, line for line (block labels normalised), compiled with the same command from the base sources and from this branch (`perf/stage2c-isa-existing-kernels.log`).
+
+### Every way the kernel differs from its structural twin (what the night run should suspect first)
+
+The twin (`hip/ops_host.cpp`, `TiledAttentionWorkgroup<kD>` / `TiledAttentionCombine`) has the kernel's statements in the kernel's order and calls the same `drafter_math.hpp` functions; a GPU
+thread is an iteration over `tid`, a barrier is the end of a loop over all threads, the shuffle reads the partner's partial from the array the loop just filled.
+1. **Concurrency.** The twin cannot show a race: a missing or misplaced `__syncthreads()` (two per tile: after staging, before the next staging), or a shuffle in divergent code (the
+   kernel executes `__shfl_xor` in every lane, active or not, outside any branch). Suspect first if results differ between runs or only for long contexts (many tiles).
+2. **Lanes of a pair in one wave.** The partner of thread `tid` is `tid ^ 1`; true for any wave size (compiled wave32). The twin assumes it.
+3. **Loads.** The kernel reads K/V in 16-byte vectors (`uint4` of 8 halves, two `float4`): ring rows, block rows and head offsets must be 16-byte aligned (true for `kv_width x 2` bytes and head
+   dimensions that are multiples of 32, as for the old kernel); the twin reads scalars. q loads and record stores are scalar in both (a record is `head_dim + 2` floats, not 16-byte aligned).
+4. **LDS layout.** The kernel's `float4 ks[32 x kD / 4]` at index `i x kD/4 + 2 c8 (+1)` (staging) and `i x kD/4 + 2 j + half` (reading) are the twin's floats `i x kD + 8 c8 .. + 7` and
+   `i x kD + 4 (2 j + half) .. + 3`.
+5. **Staging loop.** The kernel's threads take chunks `c = tid, tid + blockDim.x, ...`; the twin takes every chunk once in order. The same set iff `blockDim.x` is what
+   `DraftTiledThreads` returns (the launcher passes exactly that).
+6. **`expf`** on the device vs `std::exp` (float) on the host: a few ulp. `fmaf` / `std::fma` (both correctly rounded), `fmaxf` / `std::fmax`, and the plain `+ * /` are the same IEEE
+   operations (the kernel file has no FP contraction; the host build has no `-march`, so GCC cannot contract into FMA instructions). The twin is therefore not bit-identical, only within rounding.
+7. **Index checks.** The twin checks every ring slot (`slot < capacity`, else it loads zeros and the operation fails: the wrap twin's failure mode) and the host checks every pointer range,
+   including the part of the scratch the workgroups write; the kernel checks nothing per element (the launcher validates the arguments as the twin does).
+8. **Workgroup order.** The twin runs the workgroups on OpenMP threads, the combine after all of them (the second launch on the same stream on the GPU); no result depends on the order.
+9. **Inactive threads** (`2 x tokens x group` below the rounded block size; none at the real shapes' 16 rows, 16 of 96 at the op-level test's 4-row cases): both form the pointer to
+   q row 0 but read nothing through it (`active ? qrow[...] : 0.0F`), hold zeros, see no key and write nothing.
+
+### Tests (2026-11-11, CPU; the structural twin is what ran)
+
+- **The operation-level test at the real shapes** (`RICURSIVE_TEST_ATTENTION=tiled ricursive_drafter_op_shapes_test`, ctest `ricursive.drafter_op_shapes_tiled`, attention only): the twin
+  (A) against the existing host operation `DraftAttention` (B), at all 14 context situations of the test (87, 500 and 4,096 rows, the sliding ring just full, one past the sliding wrap, a
+  second lap with the block across a slot boundary, position 20,000, full layer at 87, 500, 4,096 rows, a base above 0, 16,384 rows, one past the full ring's wrap with the 16,384-row clamp,
+  position 30,000), F32 and F16 rings: **28 of 28 within the tolerance 5e-5** (the GPU's attention tolerance of the test header: the twin computes in fp32 as the GPU does); worst
+  3.69e-6 (sliding, ring just full, F16), largest F32 3.21e-6 (full, 16,384 rows). 31 checks, 0 failed, 161.1 s (`perf/stage2c-op-shapes-tiled.log`).
+- **Twins that must fail it** (through the structural twin, `HostOpsOptions::tiled_fault`, on three cases: sliding 500 rows, one past the sliding wrap, full at position 30,000):
+  every tile one key late (a tile boundary off by one key): fails, worst 1.22 / 0.468 / 0.176; the splits combined without rescaling to the common maximum: fails, 1.31 / 1.23 / 1.29;
+  the ring slot without its wrap check: fails on both wrapping cases by the host's slot check ("a context key's ring slot is not below the capacity"; on the GPU this would read past
+  the ring), and on the non-wrapping case (500 rows) it passes with 1.91e-6, as it must (no slot wraps there). **This twin fails through the host's own slot guard, which the kernel does
+  not have: it is evidence that the guard catches a missing wrap, not numeric evidence that the comparison would** (the comparison never sees the wrong values). The first two twins fail
+  by the comparison itself. None passed; none had to be strengthened.
+- **The tiny walks with the twin** (`RICURSIVE_TEST_ATTENTION=tiled ricursive_drafter_ops_test tiny`, ctest `ricursive.drafter_ops_tiled`; `perf/stage2c-drafter-ops-tiled.log`): every
+  stage-1 check against `DrafterReference` passes as with the default kernel: Q8_0 F32 80 of 80 anchors, worst stage 1.05e-6 (1e-5); Q4_K F32 80, 1.42e-6; Q8_0 F16 80, 2.89e-4 (1e-3);
+  top-k 32 F32 80, 1.17e-6; top-k 32 F16 77 of 80 with 3 near-ties (gap at most 3.33e-4; stage 2's table above reports 3 near-tie blocks for the default kernel too; whether they are the same blocks was not compared); the bookkeeping, the slack sweep, the accounting
+  (`DeviceBytes() == DrafterSessionBytes` in 96 configurations, now with the tiled scratch) and the twins of stage 2 (window off by one, rotary, convolution: all fail) as before.
+  The key plan by brute force (`CheckTiledSplits`, host part of the same test): 414 plans (windows 0 to 4,096, 1 to 16 rows, anchors to 30,000, bases to 13,616): the union equals the first
+  row's range and contains every row's, the splits are consecutive, non-empty, whole tiles, at most 16; `DraftTiledSlot` equals `position % capacity` on 2,517,591 (key, capacity) pairs.
+- **The gate list** takes the kernel: 4 entries in two gates of their own, `drafter_op_shapes_tiled` and `drafter_ops_tiled` (`gpu-exact`, `gpu` each; prerequisites as their
+  default-kernel twins; **no gate depends on them**, so a tiled failure never marks a default-kernel invocation NOT-RUN; review of stage 2c, finding 2, which superseded the first
+  version: the entries were inside `drafter_op_shapes` / `drafter_ops`, on which `engine_tests` depends). `LIST=1 | wc -l`: **130 before, 134 after**; per gate 2 / 2 / 2 / 2 for
+  `drafter_op_shapes`, `drafter_ops` and the two tiled gates; 4 entries carry `RICURSIVE_TEST_ATTENTION=tiled`. Self-test counts raised by exactly those (130 -> 134 PASS rows and wrapper
+  calls, 131 -> 135 logs, 97 -> 101 NOT-RUN after a refused lock; 33 LOCKED unchanged: the tiled gates depend on `kernel_ops`); the fake test binaries now see `RICURSIVE_TEST_ATTENTION`
+  and one check was added: a failure of every tiled invocation fails exactly the two tiled gates and leaves `drafter_ops` and `engine_tests` PASS with nothing NOT-RUN. **22 checks, all pass**
+  (`perf/stage2cfix-selftest.log`; 21 before).
+- **The bench**: `--attention default/tiled` runs the whole table per kernel in one process (smoke on the host ops with the tiny drafter: both tables print, allocated equals claimed
+  bytes, 9.1 MiB default and 9.4 MiB tiled; `perf/stage2c-bench-host-smoke.log`). Not run on the GPU.
+- **CPU suite**: `ctest -R '^ricursive\.' -L cpu` in `build-test`, started 17:02 on 9fe94f2 (the code of the three commits above; the later commits change the bench, these
+  tests and documents): **32 of 32 passed, 0 failed, total test time 2181.62 s** (`ctest exit=0`; no `Failed` or `Timeout` line), including `plain_fingerprint` (5.55 s, golden hashes untouched),
+  `drafter_ops_tiled` 15.41 s and `drafter_op_shapes_tiled` 80.21 s (`perf/stage2c-ctest-cpu.log`).
+
+### Proof that the target's path and the existing kernel are unchanged
+
+`git diff 5a54398 --stat` is empty for `hip/kernels.*`, `hip/kernels_math.hpp`, `hip/project.*`, `hip/executor.*`, `hip/embed.*`, `hip/profile.*`, `hip/ggml/`, `src/` and the tests
+`plain_fingerprint`, `executor_contract`, `executor`, `engine`, `kernel_ops`, `attention_ops`, `projection_ops`. `Ops::DraftAttention`, its host implementation and its GPU launcher are
+unchanged (a new method was added beside them), and the existing kernels' device assembly is identical (above). Lines removed outside the documents: the executor's one
+`DraftAttention` call (now inside `if (tiled_) ... else` with the same arguments), the unknown-name message (now lists `tiled`), `kDraftAttentionKernels`, the `OpsSide` constructor and
+attention call of the op-level test (same call when not tiled), its "only default" guard (now default or tiled), its header line, `EffectiveOptions`' kernel line (a check that names its
+own kernel now keeps it, so the unknown-name check still runs under `RICURSIVE_TEST_ATTENTION=tiled`), the gate self-test counts, the bench's `--attention` parsing and help text. No
+check was loosened or removed.
