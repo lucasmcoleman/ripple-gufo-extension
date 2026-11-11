@@ -1101,6 +1101,12 @@ void RunProjectQ8(Side& a, Side& b, Rng& rng, Report& report, bool gpu) {
 void RunAll() {
   const Backend& be = TheBackend();
   const auto t_start = Clock::now();
+  if (const char* kernel = std::getenv("RICURSIVE_TEST_ATTENTION")) {
+    // The attention kernel by name (DrafterOptions::attention_kernel). Ops::DraftAttention takes no kernel yet: stage 2c adds the
+    // argument and passes it in OpsSide::Attention; until then only "default" is accepted so that nothing is silently ignored.
+    Require(std::string(kernel) == "default", std::string("RICURSIVE_TEST_ATTENTION=") + kernel + ": only 'default' exists");
+    std::printf("  attention kernel: %s\n", kernel);
+  }
   std::printf("  backend %s (A = %s, B = %s)\n", be.name.c_str(), be.gpu ? "the GPU operations" : "the host operations",
               be.gpu ? "the host operations" : "the naive implementation of this file");
   Rng rng(20261111);

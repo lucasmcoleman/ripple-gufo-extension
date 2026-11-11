@@ -4,6 +4,7 @@
 //
 //   drafter_ops_test tiny TARGET.gguf STAGE_DIR
 //   drafter_ops_test real DRAFTER.gguf TARGET.gguf DUMP_DIR STAGES.bin [max_seconds]
+//   drafter_ops_test long DRAFTER.gguf TARGET.gguf DUMP_DIR FILE [anchor,anchor,...]
 //
 // RICURSIVE_TEST_BACKEND unset or cpu: the host operations (ctest ricursive.drafter_ops). gpu-exact: the
 // same checks with the drafter on the GPU operations and F32 context storage; gpu: F16 context storage, the
@@ -22,7 +23,14 @@
 //   4. twins that must fail (1): attention window off by one row, rotary on the no-rotary layer,
 //      convolution reading across the block start;
 //   plus the draft-length hint, DequantAt against gufo::quant::DequantizeRow and DraftVisibleKeys by brute force.
-// real: the real drafter weights on the host ops against the oracle's stage file (not part of ctest).
+// real: the real drafter weights on the host ops against the oracle's stage file (not part of ctest): the named stages (relative RMSE
+//   per stage, a table of the largest) and the tokens; with RICURSIVE_TEST_BACKEND=gpu|gpu-exact the same on the GPU operations.
+// long (docs/DRAFTER-S2.md, "Stage 2b"): a synthetic context on the real weights (the dump's rows repeated cyclically) up to anchors beyond
+//   16,384 rows and across both ring wraps (default anchors 5121, 16385, 17409, 20000). On the host backend it WRITES the drafts (tokens,
+//   candidates, scores) of every anchor to FILE (about 25 ms per context row on 4 threads: 8 minutes for 20,000 rows; no GPU needed, so
+//   it is made before the GPU window); on a GPU backend it drafts the same anchors and COMPARES with FILE. Production options (F16 rings);
+//   gpu-exact = FP32 activations, gpu = the production 8-bit route of the context passes.
+// RICURSIVE_TEST_ATTENTION=NAME picks the attention kernel by name (DrafterOptions::attention_kernel) for every engine built here.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -139,8 +147,10 @@ Backend& TheBackend() {
   return b;
 }
 
-std::unique_ptr<OpsDrafterEngine> MakeEngine(const Drafter& d, const ricursive_test::Model& target, const DrafterOptions& options,
+std::unique_ptr<OpsDrafterEngine> MakeEngine(const Drafter& d, const ricursive_test::Model& target, const DrafterOptions& requested,
                                              const DrafterExecFaults& faults = {}, const HostOpsOptions& host = {}) {
+  DrafterOptions options = requested;
+  if (const char* kernel = std::getenv("RICURSIVE_TEST_ATTENTION")) options.attention_kernel = kernel;  // by name (stage 2c)
   if (!TheBackend().gpu) return MakeHostOpsDrafterEngine(d.w, target.weights, options, faults, host);
   Require(!host.conv_across_block_start, "the convolution twin exists on the host operations only");
   // The GPU executor of the drafter is built by the factory (weights uploaded once per drafter); the faults are
@@ -849,6 +859,13 @@ int Real(int argc, char** argv) {
     auto engine = MakeEngine(d, target, o);
     DrafterExecutor& exec = engine->executor();
     const std::size_t F = d.w.config.FeatureWidth();
+    {  // item 4: the memory plan equals what the executor holds, at the real configuration
+      const std::uint64_t claimed = DrafterSessionBytes(d.w.config, target.weights.output.rows, o), allocated = engine->DeviceBytes();
+      std::printf("  one session: %.2f MiB allocated (DeviceBytes, projection scratch %.2f MiB included), %.2f MiB claimed (DrafterSessionBytes)\n",
+                  static_cast<double>(allocated) / 1048576.0, static_cast<double>(exec.ops().ProjectionScratchBytes()) / 1048576.0,
+                  static_cast<double>(claimed) / 1048576.0);
+      Require(allocated == claimed, "the real drafter's DeviceBytes() differs from DrafterSessionBytes");
+    }
     // The named stages are compared with the oracle's stage file as well as the tokens (docs/DRAFTER-S2.md, "Stage 2b": a pooled token
     // percentage can hide a subtle error that a stage shows): relative RMSE per stage, the worst over the context chunks and the anchors.
     // F16 context storage and, on the GPU, the 8-bit activation route of the context passes (chunks of 128 rows) round: the tolerance is
@@ -923,6 +940,110 @@ int Real(int argc, char** argv) {
   });
 }
 
+/// The drafts of one anchor, as written to and read from the `long` file.
+struct LongDraft {
+  std::uint32_t anchor{0};
+  std::vector<std::int32_t> tokens, candidates;
+  std::vector<float> scores;
+};
+
+int Long(int argc, char** argv) {
+  return Run([&] {
+    Require(argc >= 6, "usage: long DRAFTER.gguf TARGET.gguf DUMP_DIR FILE [anchor,anchor,...]");
+    std::vector<std::uint32_t> anchors{5121, 16385, 17409, 20000};
+    if (argc > 6) {
+      anchors.clear();
+      std::stringstream list(argv[6]);
+      for (std::string item; std::getline(list, item, ',');) anchors.push_back(static_cast<std::uint32_t>(std::stoul(item)));
+      Require(std::is_sorted(anchors.begin(), anchors.end()) && !anchors.empty(), "the anchors must be ascending");
+    }
+    const std::string file = argv[5];
+    const ricursive_test::Model target = OpenModel(argv[3]);
+    const Drafter d = OpenDrafter(argv[2], target.weights.config);
+    const Dump dump = LoadDump(argv[4]);
+    Require(dump.layers == d.w.config.tap_layers, "the dump's tap layers differ from the drafter's configuration");
+    DrafterOptions o;  // production options: F16 context storage
+    auto engine = MakeEngine(d, target, o);
+    const std::size_t F = d.w.config.FeatureWidth();
+    const std::uint32_t B = d.w.config.block_size - 1, K = d.w.config.selector_top_k;
+    std::vector<LongDraft> drafts;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::printf("  backend %s: a context of up to %u rows built from the %zu rows of the dump, repeated\n", TheBackend().name.c_str(), anchors.back(),
+                dump.n);
+    for (const std::uint32_t s : anchors) {
+      while (engine->End() < s) {
+        const std::size_t first = engine->End(), n = std::min<std::size_t>(2048, s - first);
+        std::vector<float> rows(n * F);
+        for (std::size_t r = 0; r < n; ++r) std::copy_n(&dump.taps[((first + r) % dump.n) * F], F, &rows[r * F]);
+        engine->Append(static_cast<std::uint32_t>(first), rows);
+      }
+      const auto a = std::chrono::steady_clock::now();
+      const auto draft = engine->executor().DraftStep(dump.ids[s % dump.n], s, B);
+      std::printf("    anchor %u drafted (context rows %u to %u read by the full layer) in %.1f s; %.0f s since the start\n", s, draft.context_first,
+                  draft.context_end, std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count(),
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+      Require(draft.top_k == K && draft.tokens.size() == B, "a whole block was drafted");
+      drafts.push_back({s, draft.tokens, draft.candidates, draft.scores});
+    }
+    if (!TheBackend().gpu) {
+      std::ofstream out(file, std::ios::binary);
+      const std::uint32_t count = static_cast<std::uint32_t>(drafts.size());
+      out.write(reinterpret_cast<const char*>(&count), 4);
+      for (const LongDraft& l : drafts) {
+        out.write(reinterpret_cast<const char*>(&l.anchor), 4);
+        out.write(reinterpret_cast<const char*>(l.tokens.data()), static_cast<std::streamsize>(l.tokens.size() * 4));
+        out.write(reinterpret_cast<const char*>(l.candidates.data()), static_cast<std::streamsize>(l.candidates.size() * 4));
+        out.write(reinterpret_cast<const char*>(l.scores.data()), static_cast<std::streamsize>(l.scores.size() * 4));
+      }
+      Require(out.good(), "cannot write " + file);
+      std::printf("  %zu anchors written to %s (the reference for the GPU run)\n", drafts.size(), file.c_str());
+      return;
+    }
+    std::ifstream in(file, std::ios::binary);
+    Require(in.good(), "cannot open " + file + " (made by this test on the host backend)");
+    std::uint32_t count = 0;
+    in.read(reinterpret_cast<char*>(&count), 4);
+    Require(count == drafts.size(), "the file holds " + std::to_string(count) + " anchors, this run drafted " + std::to_string(drafts.size()));
+    std::size_t rows = 0, equal = 0, sets_equal = 0, set_rows = 0;
+    for (const LongDraft& mine : drafts) {
+      LongDraft ref;
+      ref.tokens.resize(B);
+      ref.candidates.resize(std::size_t{B} * K);
+      ref.scores.resize(std::size_t{B} * K);
+      in.read(reinterpret_cast<char*>(&ref.anchor), 4);
+      in.read(reinterpret_cast<char*>(ref.tokens.data()), static_cast<std::streamsize>(ref.tokens.size() * 4));
+      in.read(reinterpret_cast<char*>(ref.candidates.data()), static_cast<std::streamsize>(ref.candidates.size() * 4));
+      in.read(reinterpret_cast<char*>(ref.scores.data()), static_cast<std::streamsize>(ref.scores.size() * 4));
+      Require(in.good() && ref.anchor == mine.anchor, "the file's anchors are not this run's");
+      std::size_t same = 0, first = 0, sets = 0;
+      while (first < B && mine.tokens[first] == ref.tokens[first]) ++first;
+      for (std::size_t r = 0; r < B; ++r) {
+        same += mine.tokens[r] == ref.tokens[r] ? 1 : 0;
+        sets += std::equal(mine.candidates.begin() + static_cast<std::ptrdiff_t>(r * K), mine.candidates.begin() + static_cast<std::ptrdiff_t>((r + 1) * K),
+                           ref.candidates.begin() + static_cast<std::ptrdiff_t>(r * K))
+                    ? 1
+                    : 0;
+      }
+      std::vector<float> gs, hs;  // scores of the rows up to the first difference, on the common candidate slots
+      for (std::size_t r = 0; r <= std::min<std::size_t>(first, B - 1); ++r)
+        for (std::size_t k = 0; k < K; ++k)
+          if (mine.candidates[r * K + k] == ref.candidates[r * K + k]) {
+            gs.push_back(mine.scores[r * K + k]);
+            hs.push_back(ref.scores[r * K + k]);
+          }
+      std::printf("    anchor %u: %zu of %u token rows equal (first difference at row %zu), candidate lists equal in %zu of %u rows, score rel RMSE %s\n",
+                  mine.anchor, same, B, first, sets, B, Sci(RelRmse(gs, hs)).c_str());
+      rows += B;
+      equal += same;
+      set_rows += B;
+      sets_equal += sets;
+    }
+    std::printf("  GPU against the host at long contexts: %zu of %zu token rows equal (%.1f%%), candidate lists equal in %zu of %zu rows\n", equal, rows,
+                100.0 * static_cast<double>(equal) / static_cast<double>(rows), sets_equal, set_rows);
+    Require(equal * 100 >= rows * 95, "fewer than 95% of the token rows equal the host's");
+  });
+}
+
 int Tiny(const std::string& target_path, const std::string& dir) {
   return Run([&] {
     const ricursive_test::Model target = OpenModel(target_path);
@@ -935,6 +1056,7 @@ int Tiny(const std::string& target_path, const std::string& dir) {
 int main(int argc, char** argv) {
   if (argc >= 4 && std::string(argv[1]) == "tiny") return Tiny(argv[2], argv[3]);
   if (argc >= 2 && std::string(argv[1]) == "real") return Real(argc, argv);
-  std::fprintf(stderr, "usage: drafter_ops_test tiny TARGET.gguf STAGE_DIR | real DRAFTER TARGET DUMP STAGES [s]\n");
+  if (argc >= 2 && std::string(argv[1]) == "long") return Long(argc, argv);
+  std::fprintf(stderr, "usage: drafter_ops_test tiny TARGET.gguf STAGE_DIR | real DRAFTER TARGET DUMP STAGES [s] | long DRAFTER TARGET DUMP FILE [anchors]\n");
   return 2;
 }
