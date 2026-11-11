@@ -41,6 +41,7 @@ struct Hooks {
   std::function<void(Serve&)> after_acquire;  ///< a restore, before the state learns the position
   std::function<void(Serve&)> after_prefill;
   std::function<void(Serve&)> after_step;
+  bool full_prefix{false};  ///< the slot may hold the whole prompt (a restored checkpoint at the prompt's end): no prefill pass, decoding starts from its frontier logits
 };
 
 enum class Ending { kLimit, kStopSequence, kCancel };
@@ -49,7 +50,7 @@ struct Result {
   Tokens published;  ///< what the client sees (the request's tokens)
   Tokens generated;  ///< what the pool recorded: every selection of every step
   bool stop{false};
-  std::size_t cached{0}, checkpoint{0}, drafted{0}, accepted{0}, steps{0};
+  std::size_t cached{0}, checkpoint{0}, drafted{0}, accepted{0}, steps{0}, prefill_rows{0};
   Tokens checkpoint_tokens;  ///< prompt + generated, cut at the runner's checkpoint position
 };
 
@@ -82,7 +83,7 @@ struct Serve {
     Acquire();
     if (hooks.after_acquire) hooks.after_acquire(*this);
     const auto& live = session().tokens();
-    const bool prefix = live.size() < prompt.size() && std::equal(live.begin(), live.end(), prompt.begin());
+    const bool prefix = (live.size() < prompt.size() || (hooks.full_prefix && live.size() == prompt.size())) && std::equal(live.begin(), live.end(), prompt.begin());
     if (!prefix && session().Position() != 0) Require(rig->adapter->Invalidate(*rig->slot), "cold start: invalidate");
     r.cached = prefix ? live.size() : 0;
     prefill.clear();
@@ -91,6 +92,7 @@ struct Serve {
     for (std::size_t offset = r.cached; offset < prompt.size();) {
       const auto step = runner->Prefill(*state, prompt, offset, std::size_t{1} << 20);
       Require(step.consumed_tokens > 0, "prefill made no progress");
+      r.prefill_rows += step.consumed_tokens;
       prefill.emplace_back(offset, step.consumed_tokens);
       offset += step.consumed_tokens;
     }
@@ -826,8 +828,37 @@ void FlowTests(const TinyFixture& f, const DraftBackend& be, const std::string& 
     Require(r2.cached == ck.n && r2.published == p2.published, tag + " cut " + std::to_string(cut) + ": the restored continuation differs from plain");
     ++checked;
   }
+  // 4. a restore into a slot whose drafter holds an old branch past the restored position, then a request with NO prompt rows left to prefill (the whole
+  // prompt is the restored checkpoint, decoding starts from its frontier logits). Nothing feeds the drafter's ingest before the first proposal, so the
+  // drafter's context is the restore's own doing: it must be reset to the restored position by the session's `Replaced(n)`, and the first
+  // proposal must find it there (no desync). A request with prompt rows after the restore would hide a missing reset: its first pass truncates or
+  // resets the context by itself (stage 4b's mutant "Replaced is a no-op" survived for that reason).
+  {
+    Serve a(m.spec_runner, m.spec), b(m.spec_runner, m.spec), pa(m.plain_runner, m.plain), pb(m.plain_runner, m.plain);
+    const Result r1 = a.Run(prompt_a, 7), p1 = pa.Run(prompt_a, 7);
+    Require(r1.published == p1.published, tag + " restore without prompt rows: the first request differs from plain");
+    const Checkpoint ck = Capture(*a.rig);
+    const Result old_branch = b.Run(prompt_b, limit), p_old = pb.Run(prompt_b, limit);  // the drafter of b holds rows past the restored position
+    Require(old_branch.published == p_old.published && b.session().Position() > ck.n, tag + " restore without prompt rows: the old branch must reach past the restored position");
+    Hooks hr;
+    hr.full_prefix = true;
+    hr.after_acquire = [&](Serve& s) { Require(Restore(*s.rig, ck), "restore refused"); };
+    Hooks hp;
+    hp.full_prefix = true;
+    const Result r2 = b.Run(r1.checkpoint_tokens, limit, Ending::kLimit, 0, hr), p2 = pa.Run(r1.checkpoint_tokens, limit, Ending::kLimit, 0, hp);
+    Require(r2.cached == ck.n && r2.prefill_rows == 0 && p2.prefill_rows == 0, tag + " restore without prompt rows: the request must start from the restored frontier without a prefill pass");
+    Require(r2.published == p2.published, tag + " restore without prompt rows: the tokens differ from plain's");
+    Require(r2.drafted > 0, tag + " restore without prompt rows: the request must have drafted");
+    DraftedSession* ds = DraftingOf(*b.state);
+    Require(ds != nullptr, tag + " restore without prompt rows: no drafting");
+    Require(ds->backend().desyncs() == 0 && ds->ingest().failures() == 0 && ds->health().failures() == 0,
+            tag + " restore without prompt rows: the first proposal found the drafter's context off the restored position (" + std::to_string(ds->backend().desyncs()) +
+                " desyncs): the session's Replaced(n) did not reset it");
+    RequireSameState(pa, b, tag + " restore without prompt rows");
+    ++checked;
+  }
   std::printf("  %s/%s: D. %zu flows through the runner as gufo's pool issues them (two sessions interleaved inside each other's steps, a cancellation then a new request, "
-              "a limit inside a draft then a restore into another slot): tokens equal plain's\n",
+              "a limit inside a draft then a restore into another slot, a restore with no prompt rows after it and no desync): tokens equal plain's\n",
               be.name.c_str(), f.name.c_str(), checked);
 }
 
