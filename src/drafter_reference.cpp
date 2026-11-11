@@ -100,10 +100,25 @@ std::vector<std::uint32_t> DrafterReference::TapLayers() const {
   return taps;
 }
 
-void DrafterReference::Reset() {
-  rows_ = 0;
+void DrafterReference::Reset() { ResetTo(0); }
+
+void DrafterReference::ResetTo(std::size_t base) {
+  base_ = base;
+  rows_ = base;
   for (auto& k : k_) k.clear();
   for (auto& v : v_) v.clear();
+}
+
+void DrafterReference::TruncateTo(std::size_t position) {
+  if (position >= rows_) return;
+  if (position <= base_) {
+    ResetTo(position);
+    return;
+  }
+  const std::size_t kv = w_.config.KvWidth();
+  for (auto& k : k_) k.resize((position - base_) * kv);
+  for (auto& v : v_) v.resize((position - base_) * kv);
+  rows_ = position;
 }
 
 bool DrafterReference::LayerHasRope(std::size_t layer) const noexcept {
@@ -241,7 +256,10 @@ DrafterReference::Draft DrafterReference::DraftStep(std::int32_t bonus_token,
                                 std::to_string(rows_) + " context rows held");
   }
   const std::size_t s = anchor_position;
-  const std::size_t lo = (c.context_window != 0 && s > c.context_window) ? s - c.context_window : 0;
+  // Rows below base_ were never given: they are not read, whatever the window says.
+  const std::size_t hi = (faults_.context_one_row_short && s > base_) ? s - 1 : s;
+  const std::size_t lo = std::min(
+      std::max<std::size_t>((c.context_window != 0 && s > c.context_window) ? s - c.context_window : 0, base_), hi);
   const float eps = c.rms_eps;
   const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(D)));
 
@@ -277,7 +295,7 @@ DrafterReference::Draft DrafterReference::DraftStep(std::int32_t bonus_token,
 
     // Keys: context rows lo..s-1, then the block's own rows. Sliding layers see |q - k| < window.
     const bool sliding = c.sliding[il];
-    const std::size_t nctx = s - lo;
+    const std::size_t nctx = hi - lo;
     std::vector<float> o(B * Q);
     for (std::size_t r = 0; r < B; ++r) {
       const std::size_t qpos = s + r;
@@ -291,10 +309,10 @@ DrafterReference::Draft DrafterReference::DraftStep(std::int32_t bonus_token,
         const std::size_t kvh = hd / c.GqaGroup();
         const float* qh = &q[r * Q + hd * D];
         auto key = [&](std::size_t j) {
-          return j < nctx ? &k_[il][(lo + j) * KV + kvh * D] : &kb[(j - nctx) * KV + kvh * D];
+          return j < nctx ? &k_[il][(lo + j - base_) * KV + kvh * D] : &kb[(j - nctx) * KV + kvh * D];
         };
         auto val = [&](std::size_t j) {
-          return j < nctx ? &v_[il][(lo + j) * KV + kvh * D] : &vb[(j - nctx) * KV + kvh * D];
+          return j < nctx ? &v_[il][(lo + j - base_) * KV + kvh * D] : &vb[(j - nctx) * KV + kvh * D];
         };
         std::vector<float> sc(keys.size());
         float mx = -std::numeric_limits<float>::infinity();
@@ -358,6 +376,8 @@ DrafterReference::Draft DrafterReference::DraftStep(std::int32_t bonus_token,
 
   // ---- candidate selector: top-k per row, then the greedy left-to-right walk ---------------
   Draft out;
+  out.context_first = lo;
+  out.context_end = hi;
   out.candidates.resize(R * KT);
   out.scores.resize(R * KT);
   const std::size_t rank = c.selector_rank;

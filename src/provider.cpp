@@ -19,5 +19,12 @@ void ricursive_provider_register(gufo::ext::Registry& registry) {
       .chat_driver = &r::RunRicursiveChat,
       // The model card names no sampling settings: gufo's defaults apply.
       .sampling_defaults = nullptr,
+      // DFlash2: at most 4 drafted tokens per step (the cost model, DRAFTER-GUFO-DESIGN.md
+      // section 5, puts the optimum at d = 3 to 6), a fixed length.
+      .speculative_defaults = {{.backend = "dflash2",
+                                .max_draft_tokens = 4,
+                                .min_draft_tokens = 1,
+                                .draft_policy = "fixed",
+                                .draft_policies = {"fixed"}}},
   });
 }

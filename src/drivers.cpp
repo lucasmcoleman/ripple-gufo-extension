@@ -30,9 +30,36 @@ void PrintModelLoadTime(Clock::time_point start, bool success = true) {
   out << "[Model Load]: " << SecondsSince(start) << " s" << (success ? "" : " (failed)") << '\n';
 }
 
+/// `--speculative dflash2 --dflash-model F` (the core CLI has checked the pair): the drafter,
+/// or nullptr with a message when none was asked for or it cannot be used. `*failed` is set
+/// when one was asked for and it cannot.
+std::shared_ptr<const SpeculativeSetup> LoadDrafter(const std::string& backend, const std::string& path,
+                                                    std::uint32_t draft_tokens, const core::GgufReader& target,
+                                                    bool* failed) {
+  *failed = false;
+  if (backend.empty()) return nullptr;
+  *failed = true;
+  if (backend != "dflash2") {
+    std::cerr << "Error: ricursive supports --speculative dflash2 only\n";
+    return nullptr;
+  }
+  if (!HaveDrafterEngine()) {
+    std::cerr << "Error: this build has no drafter implementation (the CPU reference is built with tests only)\n";
+    return nullptr;
+  }
+  std::string error;
+  auto setup = LoadSpeculativeSetup(path, target, draft_tokens, &error);
+  if (!setup) {
+    std::cerr << "Error: " << error << '\n';
+    return nullptr;
+  }
+  *failed = false;
+  return setup;
+}
+
 std::shared_ptr<Model> LoadModel(const std::string& path, const ext::ParsedOptions& provider_options,
                                  bool force_cpu, std::uint32_t at_least_context,
-                                 Clock::time_point start) {
+                                 Clock::time_point start, const SpeculativeSetup* drafter = nullptr) {
   ModelOptions options;
   try {
     ApplyProviderOptions(provider_options, options);
@@ -40,6 +67,7 @@ std::shared_ptr<Model> LoadModel(const std::string& path, const ext::ParsedOptio
     std::cerr << "Error: " << e.what() << '\n';
     return nullptr;
   }
+  if (drafter != nullptr) ArmForSpeculation(*drafter, options);
   if (force_cpu) options.backend = CpuBackend();
   // The default cap suffices unless the benchmark needs more positions.
   if (options.max_context == 0 && at_least_context > kDefaultContextCap) {
@@ -107,7 +135,8 @@ void WarnThinking(const ext::TextPromptOptions& opt) {
 
 /// Generates one reply after `prompt`; `reply` receives the raw model text.
 int Generate(const ext::TextPromptOptions& opt, Model& model, Session& session,
-             std::span<const std::int32_t> prompt, bool parse, std::string* reply) {
+             std::span<const std::int32_t> prompt, bool parse, std::string* reply,
+             DraftedSession* drafted = nullptr) {
   if (prompt.empty()) {
     std::cerr << "ricursive prompt produced no tokens\n";
     return 1;
@@ -135,18 +164,39 @@ int Generate(const ext::TextPromptOptions& opt, Model& model, Session& session,
   rt::StreamDecoder decoder(model.tokenizer());
   Display display(parse);
   const auto decode_start = Clock::now();
-  std::size_t generated = 0;
-  while (generated < opt.max_tokens) {
-    const auto token = static_cast<std::int32_t>(sampler.Sample(session.Logits()));
-    if (model.IsStopToken(token)) break;
+  std::size_t generated = 0, drafted_tokens = 0, accepted_tokens = 0;
+  const auto emit = [&](std::int32_t token) {
     sampler.Accept(static_cast<sampling::TokenId>(token));
     ++generated;
     const std::string piece = decoder.Push(static_cast<rt::TokenId>(token));
     if (reply != nullptr) reply->append(model.TokenText(token));
     display.Push(piece);
-    if (generated < opt.max_tokens && !session.Evaluate(token, &error)) {
-      std::cerr << "\nricursive decode failed: " << error << '\n';
+  };
+  if (drafted != nullptr && sampler.config().can_use_unmodified_argmax() && !sampler.config().logprobs) {
+    // Drafted greedy decoding: the same tokens as the loop below (gufo's verifier checks every
+    // drafted token against the target).
+    try {
+      drafted->decoder().Restart();
+      while (generated < opt.max_tokens) {
+        const DecodeResult step = drafted->decoder().Step(opt.max_tokens - generated, sampler, true);
+        for (const auto token : step.tokens) emit(token);
+        drafted_tokens += step.draft_tokens;
+        accepted_tokens += step.accepted_tokens;
+        if (step.stop) break;
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "\nricursive decode failed: " << e.what() << '\n';
       return 1;
+    }
+  } else {
+    while (generated < opt.max_tokens) {
+      const auto token = static_cast<std::int32_t>(sampler.Sample(session.Logits()));
+      if (model.IsStopToken(token)) break;
+      emit(token);
+      if (generated < opt.max_tokens && !session.Evaluate(token, &error)) {
+        std::cerr << "\nricursive decode failed: " << error << '\n';
+        return 1;
+      }
     }
   }
   display.Push(decoder.Flush());
@@ -157,6 +207,9 @@ int Generate(const ext::TextPromptOptions& opt, Model& model, Session& session,
               << static_cast<double>(prompt.size()) / prefill_seconds << " tok/s)\nGenerated "
               << generated << " tokens in " << seconds << " s ("
               << static_cast<double>(generated) / seconds << " tok/s)\n";
+    if (drafted != nullptr) {
+      std::cout << "Drafted " << drafted_tokens << " tokens, accepted " << accepted_tokens << '\n';
+    }
   }
   return 0;
 }
@@ -187,9 +240,13 @@ BenchStats ComputeStats(const std::vector<double>& values) {
 
 }  // namespace
 
-int RunRicursivePrompt(const ext::TextPromptOptions& opt, const core::GgufReader&,
+int RunRicursivePrompt(const ext::TextPromptOptions& opt, const core::GgufReader& reader,
                        Clock::time_point load_start) {
-  auto model = LoadModel(opt.model_path, opt.provider_options, opt.force_cpu, 0, load_start);
+  bool drafter_failed = false;
+  const auto drafter = LoadDrafter(opt.speculative_backend, opt.dflash_model_path, opt.draft_tokens, reader,
+                                   &drafter_failed);
+  if (drafter_failed) return 1;
+  auto model = LoadModel(opt.model_path, opt.provider_options, opt.force_cpu, 0, load_start, drafter.get());
   if (!model) return 1;
   std::string error;
   auto session = model->CreateSession(&error);
@@ -198,6 +255,8 @@ int RunRicursivePrompt(const ext::TextPromptOptions& opt, const core::GgufReader
     return 1;
   }
   try {
+    std::unique_ptr<DraftedSession> drafted;
+    if (drafter) drafted = std::make_unique<DraftedSession>(*session, *drafter);
     WarnThinking(opt);
     std::vector<std::int32_t> prompt;
     if (opt.use_chat_template) {
@@ -208,20 +267,24 @@ int RunRicursivePrompt(const ext::TextPromptOptions& opt, const core::GgufReader
     } else {
       prompt = model->Tokenize(opt.prompt_text);
     }
-    return Generate(opt, *model, *session, prompt, opt.use_chat_template, nullptr);
+    return Generate(opt, *model, *session, prompt, opt.use_chat_template, nullptr, drafted.get());
   } catch (const std::exception& e) {
     std::cerr << "ricursive prompt failed: " << e.what() << '\n';
     return 1;
   }
 }
 
-int RunRicursiveChat(const ext::TextPromptOptions& opt, const core::GgufReader&,
+int RunRicursiveChat(const ext::TextPromptOptions& opt, const core::GgufReader& reader,
                      Clock::time_point load_start) {
   if (!opt.use_chat_template) {
     std::cerr << "ricursive interactive chat requires chat framing; use prompt --raw for raw text\n";
     return 1;
   }
-  auto model = LoadModel(opt.model_path, opt.provider_options, opt.force_cpu, 0, load_start);
+  bool drafter_failed = false;
+  const auto drafter = LoadDrafter(opt.speculative_backend, opt.dflash_model_path, opt.draft_tokens, reader,
+                                   &drafter_failed);
+  if (drafter_failed) return 1;
+  auto model = LoadModel(opt.model_path, opt.provider_options, opt.force_cpu, 0, load_start, drafter.get());
   if (!model) return 1;
   std::string error;
   auto session = model->CreateSession(&error);
@@ -229,6 +292,8 @@ int RunRicursiveChat(const ext::TextPromptOptions& opt, const core::GgufReader&,
     std::cerr << "ricursive session creation failed: " << error << '\n';
     return 1;
   }
+  std::unique_ptr<DraftedSession> drafted;
+  if (drafter) drafted = std::make_unique<DraftedSession>(*session, *drafter);
   WarnThinking(opt);
   std::vector<ext::ChatMessage> history;
   if (!opt.system_prompt.empty()) history.emplace_back(ext::ChatRole::kSystem, opt.system_prompt);
@@ -247,7 +312,7 @@ int RunRicursiveChat(const ext::TextPromptOptions& opt, const core::GgufReader&,
     }
     std::cout << "<<< Assistant: ";
     std::string reply;
-    if (Generate(opt, *model, *session, prompt, true, &reply) != 0) return 1;
+    if (Generate(opt, *model, *session, prompt, true, &reply, drafted.get()) != 0) return 1;
     // The raw text, so the next prompt re-renders to the tokens the model
     // produced (src/text/OUTPUT-FORMAT.md).
     history.emplace_back(ext::ChatRole::kAssistant, std::move(reply));
@@ -273,8 +338,12 @@ int RunRicursiveBench(const ext::TextBenchOptions& options,
     std::cerr << "Error: ricursive benchmark context is out of range\n";
     return 1;
   }
+  bool drafter_failed = false;
+  const auto drafter = LoadDrafter(options.speculative_backend, options.dflash_model_path, options.draft_tokens,
+                                   *reader, &drafter_failed);
+  if (drafter_failed) return 1;
   auto model = LoadModel(options.model_path, options.provider_options, false,
-                         static_cast<std::uint32_t>(required), load_start);
+                         static_cast<std::uint32_t>(required), load_start, drafter.get());
   if (!model) return 1;
   std::vector<std::int32_t> tokens(required);
   {
@@ -340,7 +409,24 @@ int RunRicursiveBench(const ext::TextBenchOptions& options,
         const std::vector<sampling::TokenId> history(tokens.begin(),
                                                      tokens.begin() + static_cast<std::ptrdiff_t>(prefix));
         sampling::SamplerState sampler(options.sampling, history);
+        std::unique_ptr<DraftedSession> drafted;
+        if (drafter) drafted = std::make_unique<DraftedSession>(*session, *drafter);
         const auto start = Clock::now();
+        if (drafted && sampler.config().can_use_unmodified_argmax() && !sampler.config().logprobs) {
+          // Drafted greedy decoding; a stop token does not end a benchmark run.
+          try {
+            for (std::size_t done = 0; done < gen;) {
+              const DecodeResult step = drafted->decoder().Step(gen - done, sampler, false);
+              for (const auto token : step.tokens) sampler.Accept(static_cast<sampling::TokenId>(token));
+              done += step.tokens.size();
+            }
+          } catch (const std::exception& e) {
+            std::cerr << "Error running ricursive decode: " << e.what() << '\n';
+            return 1;
+          }
+          runs.push_back(static_cast<double>(gen) / SecondsSince(start));
+          continue;
+        }
         for (std::size_t i = 0; i < gen; ++i) {
           const auto token = static_cast<std::int32_t>(sampler.Sample(session->Logits()));
           sampler.Accept(static_cast<sampling::TokenId>(token));

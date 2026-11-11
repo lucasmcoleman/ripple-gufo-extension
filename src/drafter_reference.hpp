@@ -28,6 +28,7 @@ struct DrafterFaults {
   bool conv_taps_shifted{false};    ///< convolution tap o reads the row t - o - 1
   bool selector_own_row{false};     ///< predecessor = the candidate itself, not the previous row's choice
   bool tap_layer_plus_one{false};   ///< TapLayers() are one target layer too late
+  bool context_one_row_short{false};  ///< DraftStep ignores the context row just below the anchor
 };
 
 class DrafterReference {
@@ -50,11 +51,18 @@ class DrafterReference {
   /// Zero-based target layers whose outputs are the features, in feature order.
   [[nodiscard]] std::vector<std::uint32_t> TapLayers() const;
 
-  /// Drops every context row.
+  /// Drops every context row; the next row appended is position 0.
   void Reset();
-  /// Positions held: rows 0 .. ContextRows()-1.
+  /// Drops every context row; the next row appended is position `base`, and
+  /// nothing below it is ever read (a restored cache, a bounded drafter window).
+  void ResetTo(std::size_t base);
+  /// Drops the context rows at positions >= `position` (<= ContextRows()); a
+  /// position below ContextBase() empties the context at that base.
+  void TruncateTo(std::size_t position);
+  /// Positions held: rows ContextBase() .. ContextRows()-1.
   [[nodiscard]] std::size_t ContextRows() const noexcept { return rows_; }
-  /// Appends `rows` positions' features, [rows][taps*hidden] float32 (the five
+  [[nodiscard]] std::size_t ContextBase() const noexcept { return base_; }
+  /// Appends `rows` positions' features, at position ContextRows() onward, [rows][taps*hidden] float32 (the five
   /// tapped layer outputs of one position, concatenated in TapLayers() order).
   void AppendContext(std::span<const float> features, std::size_t rows,
                      const StageFn& stage = {});
@@ -64,6 +72,9 @@ class DrafterReference {
     std::vector<float> confidence;         ///< softmax of the chosen candidate's score
     std::vector<std::int32_t> candidates;  ///< [draft][top_k], sorted by token id
     std::vector<float> scores;             ///< [draft][top_k], in candidate order
+    /// The context rows this draft read: positions [context_first, context_end).
+    std::size_t context_first{0};
+    std::size_t context_end{0};
   };
 
   /// Drafts the block [bonus_token, MASK x (block_size - 1)] whose first row sits
@@ -83,8 +94,9 @@ class DrafterReference {
   const DrafterWeights& w_;
   const ModelWeights& target_;
   DrafterFaults faults_;
-  std::size_t rows_{0};
-  std::vector<std::vector<float>> k_, v_;  ///< per layer [row][kv_width]
+  std::size_t base_{0};  ///< position of the first row held
+  std::size_t rows_{0};  ///< one past the last position held
+  std::vector<std::vector<float>> k_, v_;  ///< per layer [row - base_][kv_width]
 };
 
 }  // namespace gufo::models::ricursive

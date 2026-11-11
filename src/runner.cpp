@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iostream>
 #include <gufo/ext/gguf_identity.hpp>
 #include <gufo/ext/host.hpp>
 #include <gufo/ext/host_budget.hpp>
@@ -21,7 +22,11 @@
 
 #include "chat_request.hpp"
 #include "continuation_adapter.hpp"
+#include "drafter_config.hpp"
 #include "output_parser.hpp"
+#if defined(RICURSIVE_WITH_CPU_BACKEND)
+#include "drafter_engine_cpu.hpp"
+#endif
 
 #if defined(RICURSIVE_HIP_CACHE)
 #include <gufo/ext/component_cache_resources.hpp>
@@ -63,10 +68,24 @@ class State final : public ext::TextRunnerState {
   }
   [[nodiscard]] Session& session() const { return *session_; }
 
+#if defined(ENGINE_ENABLE_HIP)
+  /// Drafting for this state's session (see DraftedSession).
+  void EnableDrafting(const SpeculativeSetup& setup) {
+    drafting_ = std::make_unique<DraftedSession>(*session_, setup);
+  }
+  [[nodiscard]] DraftedSession* drafting() const noexcept { return drafting_.get(); }
+  [[nodiscard]] SpeculativeDecoder* decoder() const noexcept {
+    return drafting_ ? &drafting_->decoder() : nullptr;
+  }
+#endif
+
  private:
   Session* session_;
   cache::Adapter* adapter_;
   cache::Slot* slot_;
+#if defined(ENGINE_ENABLE_HIP)
+  std::unique_ptr<DraftedSession> drafting_;
+#endif
 };
 
 State& Get(ext::TextRunnerState& state) {
@@ -82,8 +101,9 @@ const State& Get(const ext::TextRunnerState& state) {
 
 class Runner final : public ext::TextModelRunner {
  public:
-  Runner(std::shared_ptr<Model> model, const std::string& artifact_fingerprint)
-      : model_(std::move(model)) {
+  Runner(std::shared_ptr<Model> model, const std::string& artifact_fingerprint,
+         std::shared_ptr<const SpeculativeSetup> speculative)
+      : model_(std::move(model)), speculative_(std::move(speculative)) {
     std::ostringstream identity;
     if (!artifact_fingerprint.empty()) {
       identity << "schema=gufo-text-continuation-v2\n"
@@ -140,12 +160,19 @@ class Runner final : public ext::TextModelRunner {
   [[nodiscard]] std::unique_ptr<ext::TextRunnerState> BindComponentState(
       cache::Adapter& adapter, cache::Slot& slot) const override {
     auto& ours = dynamic_cast<ContinuationAdapter&>(adapter);
-    return std::make_unique<State>(ours.GetSession(slot), adapter, slot);
+    auto state = std::make_unique<State>(ours.GetSession(slot), adapter, slot);
+#if defined(ENGINE_ENABLE_HIP)
+    if (speculative_) state->EnableDrafting(*speculative_);
+#endif
+    return state;
   }
   void ReconcileComponentState(ext::TextRunnerState& state, std::size_t position) const override {
     if (Get(state).session().Position() != position) {
       throw std::logic_error("ricursive component state position differs");
     }
+    // The session told the drafter's context to forget everything below the restored position
+    // (tap sink); nothing is pending any more.
+    Restart(state);
   }
 
   [[nodiscard]] ext::TextRunnerDescriptor Descriptor() const override {
@@ -158,11 +185,13 @@ class Runner final : public ext::TextModelRunner {
                 .supports_vision = false,
                 .incremental_prefill = true,
                 // Every token is evaluated when it is advanced.
-                .final_token_advance_required = true,
+                // With drafting the last emitted token stays pending (not in the target) when a
+                // request ends; the next request's prompt carries it.
+                .final_token_advance_required = speculative_ == nullptr,
                 // Chunked prefill and single-token decode agree bit for bit
                 // only on a backend that never rounds activations by width.
                 .incremental_text_is_exact = model_->backend().exact,
-                .multi_token_decode = false,
+                .multi_token_decode = speculative_ != nullptr,
                 .batched_multi_token_decode = false,
                 .prefix_reuse = true,
                 .in_pass_checkpoint = false,
@@ -245,6 +274,7 @@ class Runner final : public ext::TextModelRunner {
     if (Get(state).session().Position() != prefix.size()) {
       throw std::logic_error("ricursive reused prefix does not match checkpoint");
     }
+    Restart(state);
   }
 
   // One pass per call: at most Model::PrefillRows() tokens, the same
@@ -255,6 +285,7 @@ class Runner final : public ext::TextModelRunner {
                                              std::size_t max_input_tokens) const override {
     auto& ours = Get(state);
     auto& session = ours.session();
+    Restart(state);
     if (offset != session.Position() || offset >= prompt.size()) {
       throw std::logic_error("ricursive prefill offset does not match state");
     }
@@ -287,6 +318,37 @@ class Runner final : public ext::TextModelRunner {
             .logprobs = std::move(logprobs)};
   }
 
+  [[nodiscard]] ext::TextDecodeStep DecodeStep(ext::TextRunnerState& state, std::size_t max_tokens,
+                                               sampling::SamplerState& sampler) const override {
+#if defined(ENGINE_ENABLE_HIP)
+    SpeculativeDecoder* decoder = Get(state).decoder();
+    // Sampled requests, penalties, grammars, reasoning budgets and log-probabilities draft
+    // nothing: select and advance, as without speculation.
+    if (decoder != nullptr && max_tokens > 0 && sampler.config().can_use_unmodified_argmax() &&
+        !sampler.config().logprobs) {
+      ext::TextDecodeStep step;
+      DecodeResult result;
+      try {
+        result = decoder->Step(max_tokens, sampler, state.stop_at_eos());
+      } catch (...) {
+        Get(state).Invalidate();
+        throw;
+      }
+      for (const auto token : result.tokens) {
+        step.selections.push_back({.stop = false,
+                                   .token = static_cast<TextRunnerToken>(token),
+                                   .piece = model_->TokenText(token)});
+      }
+      step.stop = result.stop;
+      step.draft_rounds = result.draft_tokens > 0 ? 1 : 0;
+      step.draft_tokens = result.draft_tokens;
+      step.draft_accepted_tokens = result.accepted_tokens;
+      return step;
+    }
+#endif
+    return ext::TextModelRunner::DecodeStep(state, max_tokens, sampler);
+  }
+
   void Advance(ext::TextRunnerState& state, TextRunnerToken token) const override {
     auto& ours = Get(state);
     std::string error;
@@ -306,7 +368,17 @@ class Runner final : public ext::TextModelRunner {
   }
 
  private:
+  /// A new request (or a changed state) on this session: no drafted token is pending.
+  static void Restart(ext::TextRunnerState& state) {
+#if defined(ENGINE_ENABLE_HIP)
+    if (auto* decoder = Get(state).decoder()) decoder->Restart();
+#else
+    (void)state;
+#endif
+  }
+
   std::shared_ptr<Model> model_;
+  std::shared_ptr<const SpeculativeSetup> speculative_;
   cache::Identity identity_;
   std::unique_ptr<ext::DeviceProbe> probe_;
 };
@@ -317,10 +389,105 @@ void SetError(std::string* error, std::string message) {
 
 }  // namespace
 
+std::shared_ptr<const SpeculativeSetup> LoadSpeculativeSetup(const std::string& draft_model_path,
+                                                             const core::GgufReader& target_reader,
+                                                             std::uint32_t max_draft_tokens, std::string* error) {
+  try {
+    std::string detail;
+    const auto target = ParseConfig(target_reader, &detail);
+    if (!target) {
+      SetError(error, detail);
+      return nullptr;
+    }
+    std::string open_error;
+    std::shared_ptr<const core::GgufReader> reader = core::GgufReader::OpenFile(draft_model_path, &open_error);
+    if (!reader) {
+      SetError(error, "cannot open the drafter " + draft_model_path + ": " + open_error);
+      return nullptr;
+    }
+    const auto config = ParseDrafterConfig(*reader, *target, &detail);
+    if (!config) {
+      SetError(error, "drafter: " + detail);
+      return nullptr;
+    }
+    auto weights = ResolveDrafterWeights(*reader, *config, *target, &detail);
+    if (!weights) {
+      SetError(error, "drafter: " + detail);
+      return nullptr;
+    }
+    auto setup = std::make_shared<SpeculativeSetup>();
+    setup->reader = std::move(reader);
+    setup->weights = std::move(*weights);
+    setup->max_draft_tokens = std::clamp<std::uint32_t>(max_draft_tokens, 1, kMaxVerifyRows - 1);
+    return setup;
+  } catch (const std::exception& e) {
+    SetError(error, std::string("loading the drafter failed: ") + e.what());
+    return nullptr;
+  }
+}
+
+void ArmForSpeculation(const SpeculativeSetup& setup, ModelOptions& options) {
+  options.verify_rows = kMaxVerifyRows;
+  options.capture_layers = setup.weights.config.tap_layers;
+}
+
+bool HaveDrafterEngine() noexcept {
+#if defined(RICURSIVE_WITH_CPU_BACKEND) && defined(ENGINE_ENABLE_HIP)
+  return true;
+#else
+  return false;
+#endif
+}
+
+std::unique_ptr<DrafterEngine> MakeDrafterEngine(const SpeculativeSetup& setup, const Model& model) {
+#if defined(RICURSIVE_WITH_CPU_BACKEND)
+  return std::make_unique<CpuDrafterEngine>(setup.weights, model.weights(), setup.engine_faults);
+#else
+  (void)setup;
+  (void)model;
+  return nullptr;
+#endif
+}
+
+std::shared_ptr<ext::TextModelRunner> CreateRunnerForModel(std::shared_ptr<Model> model,
+                                                           const std::string& artifact_fingerprint,
+                                                           std::shared_ptr<const SpeculativeSetup> speculative) {
+  if (speculative) {
+    if (!HaveDrafterEngine()) throw std::runtime_error("this build has no drafter implementation");
+    if (model->MaxVerifyRows() < 2 ||
+        model->executor_config().capture_layers != speculative->weights.config.tap_layers) {
+      throw std::invalid_argument("the model is not armed for speculation (ArmForSpeculation)");
+    }
+  }
+  return std::make_shared<Runner>(std::move(model), artifact_fingerprint, std::move(speculative));
+}
+
+#if defined(ENGINE_ENABLE_HIP)
+DraftedSession* DraftingOf(ext::TextRunnerState& state) { return Get(state).drafting(); }
+
+DraftedSession::DraftedSession(Session& session, const SpeculativeSetup& setup) : session_(&session) {
+  auto engine = MakeDrafterEngine(setup, session.model());
+  if (!engine) throw std::runtime_error("this build has no drafter implementation");
+  if (engine->TapLayers() != session.model().executor_config().capture_layers) {
+    throw std::logic_error("the model does not capture the drafter's tap layers");
+  }
+  engine_ = engine.get();
+  engine->ResetTo(session.Position());  // rows the session already holds were never delivered
+  ingest_ = std::make_unique<DrafterIngest>(*engine);
+  auto backend = std::make_unique<DFlash2DraftBackend>(std::move(engine), setup.faults);
+  backend_ = backend.get();
+  decoder_ = std::make_unique<SpeculativeDecoder>(session, std::move(backend), setup.max_draft_tokens);
+  session.SetTapSink(ingest_.get());
+}
+
+DraftedSession::~DraftedSession() { session_->SetTapSink(nullptr); }
+#endif
+
 std::shared_ptr<ext::TextModelRunner> CreateRicursiveTextRunner(const ext::TextRunnerOptions& options,
                                                                 std::string* error) {
-  if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled) {
-    SetError(error, "ricursive does not support speculative decoding");
+  const bool drafting = options.speculative.backend == ext::TextSpeculativeBackend::kDFlash;
+  if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled && !drafting) {
+    SetError(error, "ricursive supports --speculative dflash2 only");
     return nullptr;
   }
   ModelOptions model_options;
@@ -331,6 +498,34 @@ std::shared_ptr<ext::TextModelRunner> CreateRicursiveTextRunner(const ext::TextR
   } catch (const std::invalid_argument& e) {
     SetError(error, e.what());
     return nullptr;
+  }
+  std::shared_ptr<const SpeculativeSetup> speculative;
+  if (drafting) {
+    if (!HaveDrafterEngine()) {
+      SetError(error,
+               "this build has no drafter implementation (the CPU reference is built with tests only; "
+               "the GPU drafter is not part of this build)");
+      return nullptr;
+    }
+    if (options.speculative.draft_model_path.empty()) {
+      SetError(error, "--speculative dflash2 needs --dflash-model");
+      return nullptr;
+    }
+    if (!model_options.reader) {
+      std::string open_error;
+      std::shared_ptr<const core::GgufReader> opened = core::GgufReader::OpenFile(options.model_path, &open_error);
+      if (!opened) {
+        SetError(error, "cannot open " + options.model_path + ": " + open_error);
+        return nullptr;
+      }
+      model_options.reader = std::move(opened);
+    }
+    speculative = LoadSpeculativeSetup(options.speculative.draft_model_path, *model_options.reader,
+                                       options.speculative.max_draft_tokens, error);
+    if (!speculative) return nullptr;
+    ArmForSpeculation(*speculative, model_options);
+    std::cerr << "ricursive: --speculative dflash2 runs the CPU reference drafter (about a second per draft step, tests and "
+                 "tiny models): the output is exact, decoding is slower than without speculation until the GPU drafter exists\n";
   }
   std::string load_error;
   auto model = Model::Load(options.model_path, model_options, &load_error);
@@ -347,7 +542,7 @@ std::shared_ptr<ext::TextModelRunner> CreateRicursiveTextRunner(const ext::TextR
         return nullptr;
       }
     }
-    return std::make_shared<Runner>(std::move(model), artifact);
+    return CreateRunnerForModel(std::move(model), artifact, std::move(speculative));
   } catch (const std::exception& e) {
     SetError(error, e.what());
     return nullptr;

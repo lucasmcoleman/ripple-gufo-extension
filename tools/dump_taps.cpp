@@ -75,7 +75,8 @@ void Usage() {
          "       ricursive_dump_taps MODEL.gguf --jobs JOBS.txt --generate G [options]\n"
          "  JOBS.txt lines: TOKENS.i32 PROMPT_TOKENS OUTDIR (jobs with OUTDIR/meta.json are skipped)\n"
          "  options: [--backend cpu|host|gpu] [--layers a,b,c,d,e] [--rows R] [--verify-rows V] "
-         "[--context-cap N] [--stop ID,ID|none]\n"
+         "[--context-cap N] [--stop ID,ID|none] [--sweep-widths]\n"
+         "  --sweep-widths: also check every pass width 2..V against the 1-row run (prints WIDTH w lines)\n"
          "  --stop defaults to 100265,100257 (the engine's stop tokens): generation ends after one of them, the id kept;\n"
          "  --generate is the most tokens generated.\n"
          "  --backend defaults to gpu; --rows defaults to 2048 (prompt rows per pass, as in serving); "
@@ -143,6 +144,7 @@ struct Setup {
   std::uint32_t generate{0}, hidden{0}, vocab{0};
   std::vector<std::uint32_t> layers;
   std::vector<std::int32_t> stop;  ///< generation ends after one of these ids (the id is kept)
+  bool sweep_widths{false};        ///< also check every pass width 2..verify_rows against the 1-row run
   ExecutorConfig ec;
 };
 
@@ -253,6 +255,35 @@ void RunJob(Executor& executor, const Setup& s, Job& job, std::size_t index, std
               equal, compared, verify_rows, argmax_equal, compared,
               prefill_hash == prefill_hash_b ? "equal" : "DIFFERENT");
 
+  // --sweep-widths: the same generated tokens evaluated in passes of every width 2..verify_rows (capture off, as a
+  // serving verification runs), from the same prompt state (rewound, not recomputed), each row compared with the
+  // 1-row run's. This is the exactness a drafted step rests on: a k-row verification equals k 1-row steps.
+  if (s.sweep_widths) {
+    std::size_t bad_widths = 0;
+    for (std::uint32_t w = 2; w <= verify_rows; ++w) {
+      if (!executor.Rewind(P)) {
+        std::printf("  WIDTH %u: cannot rewind to the prompt end (the ring no longer holds its window)\n", w);
+        ++bad_widths;
+        continue;
+      }
+      std::size_t eq = 0, cmp = 0;
+      for (std::uint32_t at = 0; at < G; at += w) {
+        const std::uint32_t n = std::min(w, G - at);
+        executor.Forward(std::span<const std::int32_t>(ids).subspan(P + at, n), P + at, LogitRows::kAll,
+                         std::span<float>(rows_logits).first(std::size_t{n} * vocab));
+        for (std::uint32_t t = 0; t < n; ++t) {
+          const std::uint32_t j = at + t;  // logits at position P+j produced generated token j+1 in (a)
+          if (j + 1 >= G) continue;
+          ++cmp;
+          eq += RowHash(std::span<const float>(rows_logits.data() + std::size_t{t} * vocab, vocab)) == gen_hash[j + 1] ? 1 : 0;
+        }
+      }
+      std::printf("  WIDTH %u: %zu of %zu logits rows hash-equal to 1-row passes\n", w, eq, cmp);
+      if (eq != cmp) ++bad_widths;
+    }
+    std::printf("  WIDTHS: %s\n", bad_widths == 0 ? "all pass widths 2.. equal 1-row passes" : "SOME WIDTH DIFFERS FROM 1-ROW PASSES");
+  }
+
   // Output.
   std::filesystem::create_directories(job.out_dir);
   const std::filesystem::path dir(job.out_dir);
@@ -342,7 +373,7 @@ int main(int argc, char** argv) {
   std::uint32_t prompt_tokens = 0, generate = 0, rows = 2048, verify_rows = 16, context_cap = 0;
   std::vector<std::uint32_t> layers = {1, 20, 39, 58, 77};
   std::vector<std::int32_t> stop = {100265, 100257};  // <|im_end|>, <|endoftext|>: the engine's stop tokens
-  bool have_prompt = false, have_generate = false;
+  bool have_prompt = false, have_generate = false, sweep_widths = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     const bool more = i + 1 < argc;
@@ -366,6 +397,8 @@ int main(int argc, char** argv) {
       if (!ParseUnsigned(argv[++i], &rows)) return Usage(), 2;
     } else if (a == "--verify-rows" && more) {
       if (!ParseUnsigned(argv[++i], &verify_rows)) return Usage(), 2;
+    } else if (a == "--sweep-widths") {
+      sweep_widths = true;
     } else if (a == "--stop" && more) {
       std::vector<std::uint32_t> v;
       const std::string list = argv[++i];
@@ -458,6 +491,7 @@ int main(int argc, char** argv) {
     s.model_path = model_path;
     s.backend = backend_arg;
     s.generate = generate;
+    s.sweep_widths = sweep_widths;
     s.vocab = weights->config.vocab_size;
     s.hidden = weights->config.embedding_length;
     s.layers = layers;

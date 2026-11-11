@@ -16,7 +16,9 @@
 #   executor_contract executor_test       (contract suite on the GPU backend)
 #   engine_tests      executor_contract   (engine_test, continuation_test and draft_session_test
 #                                          (docs/DRAFTER-S3.md: Session::Verify / AcceptVerified / taps, 6
-#                                          invocations: verify, rest and rewind0 of tinyA and tinyB) with the GPU backend,
+#                                          invocations: verify, rest and rewind0 of tinyA and tinyB; and 12 of ricursive_speculative_test,
+#                                          docs/DRAFTER-S4.md: mock, real and runner of both fixtures in gpu-exact and
+#                                          production mode) with the GPU backend,
 #                                          RICURSIVE_TEST_BACKEND=gpu-exact: F32 caches, no activation
 #                                          rounding, so they stay comparable with the scalar Reference;
 #                                          their twins still run on the CPU executor. output_parser,
@@ -113,6 +115,16 @@ invocations() {
       for g in verify rest rewind0; do
         for f in tinyA tinyB; do
           echo "draft-$g-$f|ricursive_draft_session_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu-exact"
+        done
+      done
+      # docs/DRAFTER-S4.md: drafted decoding through gufo's SpeculativeVerifier (mock drafts, the tiny
+      # drafter, the runner). Twice: gpu-exact (F32 caches, no activation rounding: comparable with the
+      # CPU runs) and "gpu" = the production route (F16 caches; k-row verification against the single-row
+      # kernels and the GEMV head of one-row decoding; both sides get the same prompt passes).
+      for g in mock real runner; do
+        for f in tinyA tinyB; do
+          echo "spec-$g-$f|ricursive_speculative_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu-exact"
+          echo "spec-prod-$g-$f|ricursive_speculative_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu"
         done
       done ;;
     engine_logits)

@@ -272,11 +272,21 @@ void Session::Fail() noexcept {
   saved_logits_.clear();
   verify_logits_.clear();
   ClearTaps();
+  if (sink_ != nullptr) sink_->Replaced(0);
 }
 
 void Session::SettleVerification() noexcept {
   verify_open_ = false;
   saved_logits_.clear();
+  FlushTaps();
+}
+
+void Session::FlushTaps() noexcept {
+  if (sink_ == nullptr || verify_open_ || taps_rows_ == 0) return;
+  sink_->Rows(taps_first_, taps_rows_, taps_);
+  taps_first_ += taps_rows_;
+  taps_rows_ = 0;
+  taps_.clear();
 }
 
 void Session::ClearTaps() noexcept {
@@ -344,6 +354,7 @@ void Session::AdoptRestored(std::vector<std::int32_t> tokens, std::vector<float>
   if (tokens.size() != executor_->Position()) {
     throw std::logic_error("restored tokens do not match the executor position");
   }
+  if (sink_ != nullptr) sink_->Replaced(static_cast<std::uint32_t>(tokens.size()));
   tokens_ = std::move(tokens);
   logits_ = std::move(logits);
   logits_valid_ = logits_.size() == model_->VocabSize();
@@ -381,6 +392,7 @@ void Session::ForwardChunks(std::span<const std::int32_t> tokens) {
     logits_ = std::move(logits);
     logits_valid_ = true;
     AppendTaps(first, n, capture);
+    FlushTaps();
     done += n;
   }
 }
@@ -418,6 +430,7 @@ void Session::SyncImpl(std::span<const std::int32_t> target) {
         tokens_.resize(common);
         logits_valid_ = false;
         TrimTaps(static_cast<std::uint32_t>(common));
+        if (sink_ != nullptr) sink_->Rewound(static_cast<std::uint32_t>(common));
       }
     }
     if (!rewound) {
@@ -491,6 +504,7 @@ bool Session::Verify(std::span<const std::int32_t> tokens, std::string* error) {
     const WritePlan plan = executor_->PlanForward(rows);
     if (guard_) guard_(plan);
     const std::lock_guard lock(mutex_);
+    SettleVerification();  // a verification still open is kept in full
     const std::size_t vocab = info.vocab;
     std::vector<float> logits(std::size_t{rows} * vocab);
     std::vector<float> capture(info.capture_layers.size() * std::size_t{info.hidden} * rows);

@@ -161,6 +161,26 @@ struct TapRows {
   std::vector<float> data;
 };
 
+/// Consumer of the captured rows, instead of the session's pending buffer (see
+/// Session::SetTapSink). It hears of exactly the rows the session keeps, in
+/// position order, one pass at a time, so a long prompt never accumulates more
+/// than one pass of rows. Called with the session's mutex held: it must not call
+/// the session. It must not throw.
+class TapSink {
+ public:
+  virtual ~TapSink() = default;
+  /// Rows of the positions [first_position, first_position + rows), [row][tap][hidden].
+  /// Rows of a verification arrive when it is settled, without the rejected ones.
+  virtual void Rows(std::uint32_t first_position, std::uint32_t rows,
+                    std::span<const float> data) noexcept = 0;
+  /// A rewind: rows at positions >= `position` that were delivered are no longer the session's.
+  virtual void Rewound(std::uint32_t position) noexcept = 0;
+  /// The session's content was replaced (reset, failed pass, full recompute, restored
+  /// checkpoint): the consumer holds no row that is the session's below `position`
+  /// (0 after a reset or a failure, the restored position after a restore).
+  virtual void Replaced(std::uint32_t position) noexcept = 0;
+};
+
 class Session {
  public:
   /// Called before every Forward with what it will overwrite (the component
@@ -240,6 +260,10 @@ class Session {
   /// Memory: hidden * taps * 4 bytes per untaken position (100 KiB with five
   /// taps on the real model), so take them after every Sync on long prompts.
   [[nodiscard]] TapRows TakeTaps();
+  /// With a sink attached the captured rows go to it (after each pass, or when a
+  /// verification settles) and TakeTaps() stays empty. nullptr detaches. The sink
+  /// must outlive the session or be detached first.
+  void SetTapSink(TapSink* sink) noexcept { sink_ = sink; }
 
   /// Deliberate defects for tests only; every one must make a drafting test fail.
   struct Faults {
@@ -269,6 +293,8 @@ class Session {
   void AppendTaps(std::uint32_t first_position, std::uint32_t rows, std::span<const float> capture);
   void TrimTaps(std::uint32_t position) noexcept;
   void ClearTaps() noexcept;
+  /// Hands the pending rows to the sink (none attached: they stay pending).
+  void FlushTaps() noexcept;
 
   std::shared_ptr<Model> model_;
   std::unique_ptr<Executor> executor_;
@@ -290,6 +316,7 @@ class Session {
   std::uint32_t taps_first_{0};
   std::uint32_t taps_rows_{0};
   std::vector<float> taps_;
+  TapSink* sink_{nullptr};
   std::mutex mutex_;
 };
 

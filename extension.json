@@ -19,8 +19,16 @@
       "model_ids": [
         "ricursive-skeleton"
       ],
+      "speculative": [
+        "dflash2"
+      ],
       "target": "gufo_ricursive",
-      "entry": "ricursive_provider_register"
+      "entry": "ricursive_provider_register",
+      "serving": {
+        "draft_options": {
+          "dflash2": "--dflash-model"
+        }
+      }
     }
   ],
   "options": [
@@ -30,6 +38,13 @@
       "commands": ["serve", "bench", "prompt", "chat"],
       "providers": ["ricursive"],
       "help": "ricursive context cap in tokens (default 32768; the model's nominal 2,097,152 is never used). Full-attention layers cost 64 KiB per token at F16"
+    },
+    {
+      "name": "--dflash-model",
+      "type": "path",
+      "commands": ["serve", "bench", "prompt"],
+      "providers": ["ricursive"],
+      "help": "DFlash2 draft model path for speculative decoding (ricursive: CPU reference drafter, tests and tiny models only until the GPU drafter exists)"
     },
     {
       "name": "--allow-chat-template-mismatch",
@@ -257,6 +272,12 @@
       "role": "test"
     },
     "ricursive_capture_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_speculative_test": {
       "requires": [
         "testing"
       ],

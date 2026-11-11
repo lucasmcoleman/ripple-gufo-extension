@@ -5,11 +5,13 @@ gufo_extension_target(
   NAME gufo_ricursive
   SOURCES
     src/config.cpp
+    src/drafter_backend.cpp
     src/drafter_config.cpp
     src/drafter_weights.cpp
     src/executor_iface.cpp
     src/extension.cpp
     src/probe.cpp
+    src/speculative_target.cpp
     src/text/chat_template.cpp
     src/text/json_value.cpp
     src/text/tokenizer.cpp
@@ -65,6 +67,7 @@ gufo_extension_target(
   NAME gufo_ricursive_reference
   SOURCES
     src/cpu_executor.cpp
+    src/drafter_engine_cpu.cpp
     src/drafter_reference.cpp
     src/reference.cpp
   LINK_LIBRARIES
@@ -252,6 +255,14 @@ _ricursive_test(draft_session TIMEOUT 3000
   SOURCES tests/draft_session_test.cpp tests/draft_hostops.cpp
   LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
     gufo_ricursive_reference gufo_ricursive gufo_ext_cache)
+
+# Drafted decoding through gufo's SpeculativeVerifier (docs/DRAFTER-S4.md): CPU executor and
+# host ops, tiny fixtures and the tiny drafters of ${RICURSIVE_STAGE}/perf/stage4.
+_ricursive_test(speculative TIMEOUT 3000
+  SOURCES tests/speculative_test.cpp tests/draft_hostops.cpp
+  LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
+    gufo_ricursive_reference gufo_ricursive gufo_ext_cache
+  ARGS all "${RICURSIVE_STAGE}/perf/stage4")
 
 _ricursive_test(profile
   SOURCES tests/profile_test.cpp LINK_LIBRARIES gufo_ricursive_exec gufo_ricursive)

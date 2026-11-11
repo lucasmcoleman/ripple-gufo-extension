@@ -22,15 +22,18 @@ struct DraftBackend {
   std::string name;
   bool hostops{false};
   bool gpu{false};
+  bool exact{true};  ///< false: the production GPU route (F16 caches, activation rounding above 16 rows)
 };
 
 /// RICURSIVE_TEST_BACKEND unset or "cpu": the CPU executor and the host ops;
-/// "gpu-exact": the GPU executor only.
+/// "gpu-exact": the GPU executor only; "gpu": the GPU executor as production runs it (tests that
+/// compare against plain decoding there must give both sides the same prompt passes).
 inline std::vector<DraftBackend> DraftBackends() {
   const char* env = std::getenv("RICURSIVE_TEST_BACKEND");
   const std::string name = env != nullptr ? env : "cpu";
-  if (name == "gpu-exact") return {{"gpu-exact", false, true}};
-  Require(name == "cpu", "RICURSIVE_TEST_BACKEND must be cpu or gpu-exact, not " + name);
+  if (name == "gpu-exact") return {{"gpu-exact", false, true, true}};
+  if (name == "gpu") return {{"gpu", false, true, false}};
+  Require(name == "cpu", "RICURSIVE_TEST_BACKEND must be cpu, gpu-exact or gpu, not " + name);
   return {{"cpu", false, false}, {"hostops", true, false}};
 }
 
@@ -47,8 +50,10 @@ inline std::shared_ptr<EngineModel> LoadDraftModel(
   options.backend = CpuBackend();
   if (be.gpu) {
     options.backend = GpuBackend();
-    options.backend->kv_type = KvType::kF32;
-    options.backend->exact = true;
+    if (be.exact) {
+      options.backend->kv_type = KvType::kF32;
+      options.backend->exact = true;
+    }
   }
   if (be.hostops) {
     options.executor_override = [](const ModelWeights& w, const ExecutorConfig& c,
