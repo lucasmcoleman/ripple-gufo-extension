@@ -786,6 +786,12 @@ void BuildFailTests(const TinyFixture& f, const DraftBackend& be, const std::str
     const auto plain_model = PlainModel(f, be);
     Serve spec(CreateRunnerForModel(spec_model, "", setup), spec_model), plain(CreateRunnerForModel(plain_model, "", nullptr), plain_model);
     const std::string what = be.name + "/" + f.name + " C build, cold starts (" + (kind == Kind::kEngine ? "the engine factory" : "the shared upload") + " always throws)";
+    std::ostringstream captured;
+    std::streambuf* const old_buf = std::cerr.rdbuf(captured.rdbuf());
+    struct Restore {
+      std::streambuf* b;
+      ~Restore() { std::cerr.rdbuf(b); }
+    } restore_cerr{old_buf};
     for (int turn = 0; turn < 5; ++turn) {
       const Tokens cold = ToTokens(SyntheticTokens(300 + 17 * turn + f.window, 21 + turn));
       Result rs, rp;
@@ -799,6 +805,11 @@ void BuildFailTests(const TinyFixture& f, const DraftBackend& be, const std::str
       Require(rs.published == rp.published && rs.drafted == 0, what + ": request " + std::to_string(turn + 1) + "'s tokens differ from plain's");
       RequireSameState(plain, spec, what + ", request " + std::to_string(turn + 1));
     }
+    std::cerr.rdbuf(old_buf);
+    const std::string log = captured.str();
+    std::size_t given_up_lines = 0;
+    for (std::size_t at = log.find("no further build is attempted"); at != std::string::npos; at = log.find("no further build is attempted", at + 1)) ++given_up_lines;
+    Require(given_up_lines == 1, what + ": " + std::to_string(given_up_lines) + " lines say no further build is attempted, expected exactly one");
     const std::size_t attempts = kind == Kind::kEngine ? counts->engines : counts->uploads;
     Require(attempts == DrafterHealth::kLimit, what + ": " + std::to_string(attempts) + " builds were attempted, not " + std::to_string(DrafterHealth::kLimit));
     const DrafterHealth* health = DraftingHealthOf(*spec.state);
