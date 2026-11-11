@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <gufo/ext/draft_backend.hpp>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -76,7 +77,8 @@ class DrafterEngine {
 /// What went wrong inside one session's drafter, shared by its ingest and its backend (docs/DRAFTER-S4.md,
 /// "Follow-ups", item C). A drafter that throws costs speed, never the request: the failed draft becomes an empty
 /// proposal, the context is reset to the current position and the failure is counted here. After kLimit
-/// consecutive failures drafting is switched off for the session, with one warning line.
+/// consecutive failures drafting is switched off for the session, with one warning line; a cold start or an invalidation of the
+/// session (`TapSink::Replaced(0)`) clears the record, so a new conversation tries again (a restore above position 0 keeps it).
 class DrafterHealth {
  public:
   static constexpr std::size_t kLimit = 3;
@@ -87,15 +89,27 @@ class DrafterHealth {
   void DraftSucceeded() noexcept;
   /// A drafter that was built: ends a run of failed builds.
   void BuildSucceeded() noexcept { consecutive_ = 0; }
+  /// The session's content was replaced from position 0 (`TapSink::Replaced(0)`): forgets every failure and switches
+  /// drafting on again (a new conversation tries the drafter again). A restore of a checkpoint arrives as `Replaced(0)` (the
+  /// reset that begins it) followed by `Replaced(n)`, n > 0: `Restored()` then puts back what `Clear()` took, a restore to a
+  /// position above 0 continues the conversation and keeps the record.
+  void Clear() noexcept;
+  void Restored() noexcept;
   [[nodiscard]] std::size_t failures() const noexcept { return failures_; }
   [[nodiscard]] std::size_t consecutive() const noexcept { return consecutive_; }
   [[nodiscard]] bool disabled() const noexcept { return disabled_; }
   [[nodiscard]] const std::string& last_error() const noexcept { return last_error_; }
 
  private:
+  struct State {
+    std::size_t failures{0}, consecutive{0};
+    bool disabled{false}, failed_since_proposal{false};
+    std::string last_error;
+  };
   std::size_t failures_{0}, consecutive_{0};
   bool disabled_{false}, failed_since_proposal_{false};
   std::string last_error_;
+  std::optional<State> before_clear_;  ///< what the last Clear() took
 };
 
 /// Feeds the rows a Session keeps into a DrafterEngine. A row at a position the engine

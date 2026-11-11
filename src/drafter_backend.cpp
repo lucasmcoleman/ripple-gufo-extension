@@ -36,6 +36,30 @@ void DrafterHealth::Failed(std::string_view where, std::string_view what, bool i
   }
 }
 
+void DrafterHealth::Clear() noexcept {
+  try {
+    before_clear_ = State{failures_, consecutive_, disabled_, failed_since_proposal_, last_error_};
+  } catch (...) {
+    before_clear_.reset();
+  }
+  failures_ = consecutive_ = 0;
+  disabled_ = failed_since_proposal_ = false;
+  last_error_.clear();
+}
+
+void DrafterHealth::Restored() noexcept {
+  if (!before_clear_) return;
+  try {
+    last_error_ = before_clear_->last_error;
+  } catch (...) {
+  }
+  failures_ = before_clear_->failures;
+  consecutive_ = before_clear_->consecutive;
+  disabled_ = before_clear_->disabled;
+  failed_since_proposal_ = before_clear_->failed_since_proposal;
+  before_clear_.reset();
+}
+
 void DrafterHealth::DraftSucceeded() noexcept {
   if (!failed_since_proposal_) consecutive_ = 0;
   failed_since_proposal_ = false;
@@ -70,6 +94,10 @@ void DrafterIngest::Rewound(std::uint32_t position) noexcept {
 }
 
 void DrafterIngest::Replaced(std::uint32_t position) noexcept {
+  if (health_ != nullptr) {
+    if (position == 0) health_->Clear();  // a new conversation: try the drafter again
+    else health_->Restored();             // a restore began with Replaced(0): it continues the conversation
+  }
   if (health_ != nullptr && health_->disabled()) return;
   try {
     engine_->ResetTo(position);

@@ -533,12 +533,14 @@ void FailTests(const TinyFixture& f, const DraftBackend& be, const std::string& 
     std::size_t failures;  ///< what the drafter's health must have counted after the first request
     bool disabled;
     std::size_t ingest{0};  ///< and the ingest's own counter (0: not checked)
+    std::size_t cold_failures{0};  ///< item 4: after a cold start on the same session (a new conversation): what the record counts after that request
+    bool cold_disabled{false};
   };
   const std::vector<Case> cases = {
       {"Draft throws at calls 1 and 3", [](FaultPlan& p) { p.draft = {1, 3}; }, 2, false},
-      {"Draft throws on every call", [](FaultPlan& p) { p.draft_from = 0; }, 3, true},
-      {"Draft throws from call 2 on", [](FaultPlan& p) { p.draft_from = 2; }, 3, true},
-      {"Append throws at calls 2, 3, 4 (the ingest path)", [](FaultPlan& p) { p.append = {2, 3, 4}; }, 3, true, 3},
+      {"Draft throws on every call", [](FaultPlan& p) { p.draft_from = 0; }, 3, true, 0, 3, true},
+      {"Draft throws from call 2 on", [](FaultPlan& p) { p.draft_from = 2; }, 3, true, 0, 3, true},
+      {"Append throws at calls 2, 3, 4 (the ingest path)", [](FaultPlan& p) { p.append = {2, 3, 4}; }, 3, true, 3, 0, false},
       {"Append throws once and the two following ResetTo calls too", [](FaultPlan& p) {
          p.append = {3};
          p.resets_after_append = 2;
@@ -575,6 +577,29 @@ void FailTests(const TinyFixture& f, const DraftBackend& be, const std::string& 
     const DraftedSession* ds2 = DraftingOf(*spec.state);
     Require(ds2 == ds, what + ": the second request must keep the session's drafting");
     if (c.disabled) Require(ds2->health().failures() == before, what + ": a drafter switched off must not be tried again");
+    if (c.disabled) {
+      // Item 4 (stage 4c): "switched off" lives as long as the conversation. A restore to a position above 0 keeps it ...
+      const Checkpoint ck = Capture(*spec.rig);
+      Hooks hr;
+      hr.after_acquire = [&](Serve& s) { Require(Restore(*s.rig, ck), "restore refused"); };
+      const Tokens next3 = Extend(np.checkpoint_tokens, 7, 6);
+      const std::size_t drafts_before = plan->drafts, appends_before = plan->appends;
+      const Result rr = spec.Run(next3, limit, Ending::kLimit, 0, hr), pr = plain.Run(next3, limit);
+      Require(rr.published == pr.published, what + ": the request after a restore differs from plain's");
+      Require(DraftingHealthOf(*spec.state)->disabled() && DraftingHealthOf(*spec.state)->failures() == before && plan->drafts == drafts_before && plan->appends == appends_before,
+              what + ": a restore to a position above 0 must keep drafting off (and not try the engine)");
+      // ... a cold start (a new conversation on the slot) clears the record: drafting is tried again, with a fresh count.
+      const Tokens cold = ToTokens(SyntheticTokens(901 + f.window, 21));
+      const Result rc = spec.Run(cold, limit), pc = plain.Run(cold, limit);
+      Require(rc.cached == 0 && rc.published == pc.published, what + ": the cold start's tokens differ from plain's");
+      RequireSameState(plain, spec, what + ", after the cold start");
+      const DrafterHealth* h = DraftingHealthOf(*spec.state);
+      Require(plan->drafts + plan->appends > drafts_before + appends_before, what + ": after a cold start the drafter must be tried again");
+      Require(h->failures() == c.cold_failures && h->disabled() == c.cold_disabled,
+              what + ": after a cold start the record counts " + std::to_string(h->failures()) + " failures" + (h->disabled() ? ", switched off" : "") + " (expected " +
+                  std::to_string(c.cold_failures) + (c.cold_disabled ? ", switched off" : ", on") + ")");
+      if (!c.cold_disabled) Require(rc.drafted > 0, what + ": after a cold start drafting must work again");
+    }
     ++checked;
   }
   std::printf("  %s/%s: C. %zu failure plans (Draft, Append, ResetTo): every request completes with plain's tokens and plain's end state\n", be.name.c_str(), f.name.c_str(),
@@ -645,6 +670,17 @@ void BuildFailTests(const TinyFixture& f, const DraftBackend& be, const std::str
       Require(health->failures() == DrafterHealth::kLimit && health->disabled(),
               what + ": the health record counted " + std::to_string(health->failures()) + " failures" + (health->disabled() ? "" : ", still on"));
       Require(DraftingOf(*spec.state) == nullptr && drafted_after_first == 0, what + ": drafting must stay off");
+      // Item 4: a cold start (a new conversation) clears the record. The request that cold-starts is bound before it knows (the bind ran first), so the
+      // build is attempted again at the next bind, with a fresh count.
+      const Tokens cold = ToTokens(SyntheticTokens(901 + f.window, 21));
+      const Result rc = spec.Run(cold, limit), pc = plain.Run(cold, limit);
+      Require(rc.cached == 0 && rc.published == pc.published, what + ": the cold start's tokens differ from plain's");
+      Require(health->failures() == 0 && !health->disabled(), what + ": a cold start must clear the record (" + std::to_string(health->failures()) + " failures)");
+      const Result rn = spec.Run(Extend(pc.checkpoint_tokens, 7, 5), limit), pn = plain.Run(Extend(pc.checkpoint_tokens, 7, 5), limit);
+      Require(rn.published == pn.published, what + ": the request after the cold start differs from plain's");
+      const std::size_t attempts_now = kind == Kind::kEngine ? counts->engines : counts->uploads;
+      Require(attempts_now == attempts + 1 && health->failures() == 1 && !health->disabled(),
+              what + ": after a cold start one more build must be attempted and counted afresh (" + std::to_string(attempts_now) + " attempts, " + std::to_string(health->failures()) + " failures)");
     } else {
       Require(health->failures() == 1 && !health->disabled() && health->consecutive() == 0,
               what + ": the health record must show one failure, recovered (" + std::to_string(health->failures()) + " failures)");

@@ -537,8 +537,21 @@ DraftedSession::~DraftedSession() { session_->SetTapSink(nullptr); }
 namespace {
 /// What a session carries for drafting (its attachment): the health record, which outlives a drafter that could not be
 /// built, and the drafting itself once one was.
-struct SessionDrafting {
-  const SpeculativeSetup* setup{nullptr};
+struct SessionDrafting final : TapSink {
+  explicit SessionDrafting(Session& session, const SpeculativeSetup& setup) : session_(&session), setup(&setup) { session.SetTapSink(this); }
+  ~SessionDrafting() override {
+    if (!drafted) session_->SetTapSink(nullptr);  // (a drafted session's destructor detaches its own sink)
+  }
+  // Until a drafter is built this is the session's sink: it hears only of a cold start, which clears the health record (a new
+  // conversation tries to build the drafter again). Once built, the drafter's ingest is the sink and does the same.
+  void Rows(std::uint32_t, std::uint32_t, std::span<const float>) noexcept override {}
+  void Rewound(std::uint32_t) noexcept override {}
+  void Replaced(std::uint32_t position) noexcept override {
+    if (position == 0) health->Clear();
+    else health->Restored();
+  }
+  Session* session_;
+  const SpeculativeSetup* setup;
   std::shared_ptr<DrafterHealth> health = std::make_shared<DrafterHealth>();
   std::shared_ptr<DraftedSession> drafted;
 };
@@ -574,8 +587,7 @@ std::shared_ptr<DraftedSession> DraftedSession::For(Session& session, const Spec
       held.reset();
     }
     if (!held) {
-      held = std::make_shared<SessionDrafting>();
-      held->setup = &setup;
+      held = std::make_shared<SessionDrafting>(session, setup);
       session.SetAttachment(held);
     }
     if (held->drafted) {
