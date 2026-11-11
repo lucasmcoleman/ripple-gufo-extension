@@ -27,6 +27,12 @@ namespace gufo::models::ricursive {
     std::shared_ptr<const core::GgufReader> target_reader, const DrafterOptions& options, std::string* error,
     const DrafterExecFaults& faults = {});
 
+/// A strong reference to the shared device copy of the drafter's weights (uploaded here if it is not alive).
+/// The engines are otherwise its only owners, so it would be freed when the last engine goes and uploaded again
+/// for the next one; the runner's setup holds this for as long as it lives (docs/DRAFTER-S4.md, "Follow-ups").
+[[nodiscard]] std::shared_ptr<void> PinGpuDrafter(const DrafterWeights& drafter,
+                                                  std::shared_ptr<const core::GgufReader> reader, std::string* error);
+
 /// Device bytes the drafter's weights hold once uploaded (0 until the first engine is made).
 [[nodiscard]] std::size_t GpuDrafterWeightBytes(const DrafterWeights& drafter);
 

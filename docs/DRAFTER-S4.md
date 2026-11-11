@@ -159,3 +159,29 @@ Production mode skips 4a, 4c and the runner's second request (a resynced session
 
 `ctest -R '^ricursive\.' -L cpu` in `build-test`: **25 of 25 pass** (24 before, plus `ricursive.speculative`), 20 min 48 s wall (`perf/stage4-ctest-cpu.log`); `draft_session` 812 s (it gained the
 `rewind0` group), `speculative` 221 s, `plain_fingerprint` 3 s with its golden hashes untouched. The existing tests were not edited except for the added checks of Part 0.
+
+## Follow-ups (stage 4b, branch `drafter-s4b`, job 1692)
+
+From the independent review of 4765c3b. Items A to D, one commit each. Test logs: `/server/staging/ripple-gufo/perf/stage4b-*.log`.
+The new checks are `tests/speculative_followup_test.cpp` (ctest `ricursive.speculative_followup`, and `_ops` with the drafter executor), helpers copied
+from `tests/speculative_test.cpp` into `tests/spec_util.hpp` (that file is untouched except where a statement below says so).
+
+### Item A: the drafter's context survives from one request to the next (and its device state is made once)
+
+**Superseded:** "Drafter context bookkeeping" above and the runner row of the table in "What was added" assumed one `DraftedSession` per runner state. gufo binds a
+NEW state on every cache acquire (`component_text_cache.cpp`, `Lease::Impl`), so under `gufo serve` every request built a fresh drafter engine whose
+context started at the session's position: output exact, acceptance lost on every turn after the first.
+- `DraftedSession::For(session, setup)`: the drafting belongs to the session (`Session::SetAttachment`, destroyed with the session). A state finds the one attached
+  for its setup and keeps it; a context that does not end at the session's position restarts there (it cannot, short of a missed event: the tap sink hears every
+  reset, rewind, restore and recompute). A restore still resets it to the restored position through the sink. `Restart()` clears the pending token.
+- Failing first (`perf/stage4b-A-unfixed.log`): `A: after the second turn's prefill the drafter holds rows [50, 57) but the session is at 57 (expected from 0)`.
+  Fixed (`stage4b-A-fixed.log`): two requests the way serve issues them, second prompt extending the first; the drafter holds `[0, position)`, 22 proposals equal
+  `DrafterReference` fed with all rows, output equals plain; an interleaved second slot is untouched; a restore into the other slot leaves `[n, n)`.
+- Stage 2 addition (coordinator's review): the GPU drafter's device weights were kept alive only by weak pointers (`hip/drafter_gpu.cpp`, `Slot`), the engines being the only
+  owners, so with no lease open the next request uploaded them again. `SpeculativeSetup::shared` (made once by `PinSharedDrafter`, called from the `DraftedSession` constructor)
+  holds a strong reference for as long as the setup, i.e. the runner, lives. The per-session engine (context rings, buffers) now lives with the session: one allocation per session.
+  Check: three requests on one live slot construct exactly one engine and one shared drafter (counting factories, `SpeculativeSetup::shared_factory` replaces the
+  device upload in tests). **GPU path lines changed (not compiled here: `hip/drafter_gpu.cpp` is part of `gufo_ricursive_gpuexec`, a device build):** new `PinGpuDrafter` in
+  `hip/drafter_gpu.{hpp,cpp}` (returns `Acquire(...)`, the existing function, as a strong `shared_ptr`), and its only caller, `PinSharedDrafter` in `src/runner.cpp`
+  (`#if RICURSIVE_HAVE_GPU_EXECUTOR`, device models with no `engine_factory`). Nothing else in `hip/` changed. The night run must check that the second request does not upload
+  again (command in STAGE4-GPU.md).

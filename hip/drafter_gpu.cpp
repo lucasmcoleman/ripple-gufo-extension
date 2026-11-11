@@ -110,6 +110,16 @@ std::unique_ptr<DrafterEngine> MakeGpuDrafterEngineWithHead(const DrafterWeights
   return nullptr;
 }
 
+std::shared_ptr<void> PinGpuDrafter(const DrafterWeights& drafter, std::shared_ptr<const core::GgufReader> reader,
+                                    std::string* error) {
+  try {
+    return Acquire(drafter, reader, error);
+  } catch (const std::exception& e) {
+    if (error != nullptr) *error = std::string("GPU drafter: ") + e.what();
+  }
+  return nullptr;
+}
+
 std::size_t GpuDrafterWeightBytes(const DrafterWeights& drafter) {
   const std::lock_guard lock(g_mutex);
   const auto it = Slots().find(&drafter);

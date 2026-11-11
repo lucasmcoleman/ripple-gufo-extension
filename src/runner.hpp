@@ -44,6 +44,11 @@ struct SpeculativeSetup {
   DrafterOptions drafter_options;
   /// Tests only: builds the session's drafter engine instead of MakeDrafterEngine's choice.
   std::function<std::unique_ptr<DrafterEngine>(const SpeculativeSetup&, const Model&)> engine_factory;
+  /// What the drafter shares between its engines (the GPU drafter's device weights): made by the first session
+  /// that needs it and held here, so it lives as long as the setup (the runner) and is made once per model load.
+  /// Tests: `shared_factory` replaces the device upload.
+  mutable std::shared_ptr<void> shared;
+  std::function<std::shared_ptr<void>(const SpeculativeSetup&, const Model&)> shared_factory;
 };
 
 /// Opens and validates the drafter GGUF against the target. Null and *error on failure.
@@ -63,6 +68,8 @@ void ArmForSpeculation(const SpeculativeSetup& setup, ModelOptions& options);
 /// A GPU engine that cannot be built throws std::runtime_error naming the cause.
 [[nodiscard]] std::unique_ptr<DrafterEngine> MakeDrafterEngine(const SpeculativeSetup& setup,
                                                               const Model& model);
+/// Makes (once per setup) and holds what the drafter's engines share; see SpeculativeSetup::shared.
+void PinSharedDrafter(const SpeculativeSetup& setup, const Model& model);
 /// MakeDrafterEngine without the factory: the GPU drafter for a model that runs on the device, else the CPU reference.
 [[nodiscard]] std::unique_ptr<DrafterEngine> MakeDefaultDrafterEngine(const SpeculativeSetup& setup,
                                                                      const Model& model);
@@ -81,6 +88,12 @@ class DraftedSession {
  public:
   /// Throws when the build has no drafter or the model does not capture the drafter's layers.
   DraftedSession(Session& session, const SpeculativeSetup& setup);
+  /// The session's own drafting: the one attached to it (Session::SetAttachment) when there is one for this
+  /// setup, else a new one, attached. gufo binds a new runner state over a cached slot on every acquire; the
+  /// drafter's context belongs to the slot's session, so a conversation that continues on its live slot keeps
+  /// it. The context is the session's when it ends at the session's position; a restore or a reset told it
+  /// through the tap sink.
+  [[nodiscard]] static std::shared_ptr<DraftedSession> For(Session& session, const SpeculativeSetup& setup);
   ~DraftedSession();
   DraftedSession(const DraftedSession&) = delete;
   DraftedSession& operator=(const DraftedSession&) = delete;
@@ -91,6 +104,7 @@ class DraftedSession {
 
  private:
   Session* session_;
+  const SpeculativeSetup* setup_;
   DrafterEngine* engine_;
   DFlash2DraftBackend* backend_;
   std::unique_ptr<DrafterIngest> ingest_;

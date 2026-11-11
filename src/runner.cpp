@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 #include <gufo/ext/gguf_identity.hpp>
 #include <gufo/ext/host.hpp>
 #include <gufo/ext/host_budget.hpp>
@@ -77,9 +78,7 @@ class State final : public ext::TextRunnerState {
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Drafting for this state's session (see DraftedSession).
-  void EnableDrafting(const SpeculativeSetup& setup) {
-    drafting_ = std::make_unique<DraftedSession>(*session_, setup);
-  }
+  void EnableDrafting(const SpeculativeSetup& setup) { drafting_ = DraftedSession::For(*session_, setup); }
   [[nodiscard]] DraftedSession* drafting() const noexcept { return drafting_.get(); }
   [[nodiscard]] SpeculativeDecoder* decoder() const noexcept {
     return drafting_ ? &drafting_->decoder() : nullptr;
@@ -91,7 +90,7 @@ class State final : public ext::TextRunnerState {
   cache::Adapter* adapter_;
   cache::Slot* slot_;
 #if defined(ENGINE_ENABLE_HIP)
-  std::unique_ptr<DraftedSession> drafting_;
+  std::shared_ptr<DraftedSession> drafting_;  ///< the session's own (it outlives this state)
 #endif
 };
 
@@ -451,6 +450,23 @@ bool HaveDrafterEngine() noexcept {
 #endif
 }
 
+void PinSharedDrafter(const SpeculativeSetup& setup, const Model& model) {
+  static std::mutex mutex;
+  const std::lock_guard lock(mutex);
+  if (setup.shared) return;
+  if (setup.shared_factory) {
+    setup.shared = setup.shared_factory(setup, model);
+    return;
+  }
+#if defined(RICURSIVE_HAVE_GPU_EXECUTOR)
+  if (model.backend().uses_device && !setup.engine_factory) {
+    std::string error;
+    setup.shared = PinGpuDrafter(setup.weights, setup.reader, &error);
+    if (!setup.shared) throw std::runtime_error("the GPU drafter could not be uploaded: " + error);
+  }
+#endif
+}
+
 std::unique_ptr<DrafterEngine> MakeDrafterEngine(const SpeculativeSetup& setup, const Model& model) {
   if (setup.engine_factory) return setup.engine_factory(setup, model);
   return MakeDefaultDrafterEngine(setup, model);
@@ -491,7 +507,8 @@ std::shared_ptr<ext::TextModelRunner> CreateRunnerForModel(std::shared_ptr<Model
 #if defined(ENGINE_ENABLE_HIP)
 DraftedSession* DraftingOf(ext::TextRunnerState& state) { return Get(state).drafting(); }
 
-DraftedSession::DraftedSession(Session& session, const SpeculativeSetup& setup) : session_(&session) {
+DraftedSession::DraftedSession(Session& session, const SpeculativeSetup& setup) : session_(&session), setup_(&setup) {
+  PinSharedDrafter(setup, session.model());
   auto engine = MakeDrafterEngine(setup, session.model());
   if (!engine) throw std::runtime_error("this build has no drafter implementation");
   if (engine->TapLayers() != session.model().executor_config().capture_layers) {
@@ -507,6 +524,22 @@ DraftedSession::DraftedSession(Session& session, const SpeculativeSetup& setup) 
 }
 
 DraftedSession::~DraftedSession() { session_->SetTapSink(nullptr); }
+
+std::shared_ptr<DraftedSession> DraftedSession::For(Session& session, const SpeculativeSetup& setup) {
+  if (auto held = std::static_pointer_cast<DraftedSession>(session.attachment())) {
+    if (held->setup_ == &setup) {
+      // The sink told the engine of every change since the last request; a context that does not end at the
+      // session's position (it cannot, short of a missed event) restarts there.
+      if (held->engine_->End() != session.Position()) held->engine_->ResetTo(session.Position());
+      held->decoder_->Restart();
+      return held;
+    }
+    session.SetAttachment(nullptr);  // another setup: detach the old sink before the new one attaches
+  }
+  auto made = std::make_shared<DraftedSession>(session, setup);
+  session.SetAttachment(made);
+  return made;
+}
 #endif
 
 std::shared_ptr<ext::TextModelRunner> CreateRicursiveTextRunner(const ext::TextRunnerOptions& options,

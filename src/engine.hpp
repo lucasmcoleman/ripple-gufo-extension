@@ -284,6 +284,13 @@ class Session {
   /// guard waits for those readers).
   [[nodiscard]] std::mutex& mutex() noexcept { return mutex_; }
 
+  /// An object that lives and dies with this session: the runner keeps its drafting machinery (the drafter's
+  /// context and the tap sink feeding it) here, because it belongs to the thing that owns the cached rows, not to
+  /// the state a request binds over it (docs/DRAFTER-S4.md, "Follow-ups", item A). Destroyed with the session,
+  /// before the rest of it.
+  [[nodiscard]] const std::shared_ptr<void>& attachment() const noexcept { return attachment_; }
+  void SetAttachment(std::shared_ptr<void> attachment) noexcept { attachment_ = std::move(attachment); }
+
  private:
   void SyncImpl(std::span<const std::int32_t> target);
   void ForwardChunks(std::span<const std::int32_t> tokens);
@@ -318,6 +325,7 @@ class Session {
   std::vector<float> taps_;
   TapSink* sink_{nullptr};
   std::mutex mutex_;
+  std::shared_ptr<void> attachment_;  ///< last: destroyed first
 };
 
 }  // namespace gufo::models::ricursive

@@ -275,6 +275,21 @@ if(TARGET ricursive_speculative_test)
     ENVIRONMENT "OMP_NUM_THREADS=4;RICURSIVE_TEST_DRAFTER=ops")
 endif()
 
+# Follow-ups of stage 4 (docs/DRAFTER-S4.md, "Follow-ups"): the drafter's context across requests on a live slot,
+# the state a request leaves, a drafter that fails. Once with the CPU reference drafter, once with the drafter executor.
+_ricursive_test(speculative_followup TIMEOUT 3000
+  SOURCES tests/speculative_followup_test.cpp tests/draft_hostops.cpp
+  LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
+    gufo_ricursive_reference gufo_ricursive gufo_ext_cache
+  ARGS all "${RICURSIVE_STAGE}/perf/stage4")
+if(TARGET ricursive_speculative_followup_test)
+  add_test(NAME ricursive.speculative_followup_ops
+    COMMAND ricursive_speculative_followup_test all "${RICURSIVE_STAGE}/perf/stage4")
+  set_tests_properties(ricursive.speculative_followup_ops PROPERTIES
+    LABELS "ricursive;cpu" SKIP_RETURN_CODE 77 TIMEOUT 3000
+    ENVIRONMENT "OMP_NUM_THREADS=4;RICURSIVE_TEST_DRAFTER=ops")
+endif()
+
 _ricursive_test(profile
   SOURCES tests/profile_test.cpp LINK_LIBRARIES gufo_ricursive_exec gufo_ricursive)
 
