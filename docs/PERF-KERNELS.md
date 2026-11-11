@@ -149,5 +149,5 @@ Not tried (would change bits or needs a rewrite): matrix-unit (WMMA) scoring, sh
 stage at 2048 rows is about 5 % of the FP32 peak; a rewrite is the next step if more prompt speed is wanted. The
 sw.attention stage in the real-model runs moved 1739 -> 1918 ms per pass with unchanged code (run-to-run variation).
 
-GPU time at the end of round 3: see `perf/gpu-use.log` (about 21 minutes of wrapped runs, plus the gate script's own lock time); no
+GPU time at the end of round 3: see `perf/gpu-use.log` (46 wrapped runs, 20.2 minutes, plus the gate script's own lock time); no
 refusals in round 3.
