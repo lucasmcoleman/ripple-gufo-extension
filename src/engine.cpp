@@ -162,7 +162,14 @@ std::shared_ptr<Model> Model::Load(const std::string& path, const ModelOptions& 
     ExecutorConfig ec;
     ec.max_context = cap;
     ec.max_rows = std::min(options.prefill_rows, cap);
-    ec.max_logit_rows = 1;
+    if (options.verify_rows > kMaxVerifyRows) {
+      SetError(error, "verify rows " + std::to_string(options.verify_rows) + " exceed the maximum of " +
+                          std::to_string(kMaxVerifyRows));
+      return nullptr;
+    }
+    // Drafting off (0): one logits row, the engine as it was before.
+    ec.max_logit_rows = std::max<std::uint32_t>(1, std::min(options.verify_rows, ec.max_rows));
+    ec.capture_layers = options.capture_layers;
     ec.kv_type = model->backend_.kv_type;
     ec.exact = model->backend_.exact;
     model->window_chunk_rows_ = options.window_chunk_rows;
@@ -261,6 +268,21 @@ Session::Session(std::shared_ptr<Model> model, std::unique_ptr<Executor> executo
 void Session::Fail() noexcept {
   tokens_.clear();
   logits_valid_ = false;
+  verify_open_ = false;
+  saved_logits_.clear();
+  verify_logits_.clear();
+  ClearTaps();
+}
+
+void Session::SettleVerification() noexcept {
+  verify_open_ = false;
+  saved_logits_.clear();
+}
+
+void Session::ClearTaps() noexcept {
+  taps_first_ = 0;
+  taps_rows_ = 0;
+  taps_.clear();
 }
 
 void Session::Reset() noexcept {
@@ -269,8 +291,56 @@ void Session::Reset() noexcept {
   Fail();
 }
 
+// The executor wrote [tap][row][hidden]; keep [row][tap][hidden].
+void Session::AppendTaps(std::uint32_t first_position, std::uint32_t rows, std::span<const float> capture) {
+  if (capture.empty()) return;
+  const std::size_t hidden = executor_->Info().hidden;
+  const std::size_t taps = executor_->Info().capture_layers.size();
+  if (taps_rows_ == 0 || taps_first_ + taps_rows_ != first_position) {
+    taps_.clear();
+    taps_rows_ = 0;
+    taps_first_ = first_position;
+  }
+  const std::size_t base = taps_.size();
+  taps_.resize(base + std::size_t{rows} * taps * hidden);
+  for (std::size_t k = 0; k < taps; ++k) {
+    for (std::size_t t = 0; t < rows; ++t) {
+      std::copy_n(capture.data() + (k * rows + t) * hidden, hidden,
+                  taps_.data() + base + (t * taps + k) * hidden);
+    }
+  }
+  taps_rows_ += rows;
+}
+
+void Session::TrimTaps(std::uint32_t position) noexcept {
+  if (taps_rows_ == 0) return;
+  if (position <= taps_first_) {
+    ClearTaps();
+    return;
+  }
+  if (position >= taps_first_ + taps_rows_) return;
+  taps_rows_ = position - taps_first_;
+  taps_.resize(std::size_t{taps_rows_} * executor_->Info().capture_layers.size() * executor_->Info().hidden);
+}
+
+TapRows Session::TakeTaps() {
+  const std::lock_guard lock(mutex_);
+  if (verify_open_) throw std::logic_error("settle the open verification before taking taps");
+  TapRows out;
+  out.first_position = taps_first_;
+  out.rows = taps_rows_;
+  out.data = std::move(taps_);
+  taps_.clear();
+  taps_first_ += taps_rows_;
+  taps_rows_ = 0;
+  return out;
+}
+
 void Session::AdoptRestored(std::vector<std::int32_t> tokens, std::vector<float> logits) {
   const std::lock_guard lock(mutex_);
+  SettleVerification();
+  verify_logits_.clear();
+  ClearTaps();
   if (tokens.size() != executor_->Position()) {
     throw std::logic_error("restored tokens do not match the executor position");
   }
@@ -284,6 +354,8 @@ void Session::AdoptRestored(std::vector<std::int32_t> tokens, std::vector<float>
 void Session::ForwardChunks(std::span<const std::int32_t> tokens) {
   const std::uint32_t max_rows = executor_->Info().max_rows;
   const std::uint32_t vocab = executor_->Info().vocab;
+  const std::size_t tap_floats =
+      executor_->Info().capture_layers.size() * std::size_t{executor_->Info().hidden};
   std::size_t done = 0;
   while (done < tokens.size()) {
     const auto n = static_cast<std::uint32_t>(std::min<std::size_t>(max_rows, tokens.size() - done));
@@ -295,8 +367,10 @@ void Session::ForwardChunks(std::span<const std::int32_t> tokens) {
     if (guard_) guard_(plan);
     const std::lock_guard lock(mutex_);
     std::vector<float> logits(vocab);
+    std::vector<float> capture(tap_floats * n);
+    const std::uint32_t first = executor_->Position();
     try {
-      executor_->Forward(chunk, executor_->Position(), LogitRows::kLast, logits, tap_);
+      executor_->Forward(chunk, first, LogitRows::kLast, logits, tap_, capture);
     } catch (...) {
       // kFailed: rows are undefined, so nothing about the session is kept.
       // kReady: the call was refused and the session is as it was.
@@ -306,6 +380,7 @@ void Session::ForwardChunks(std::span<const std::int32_t> tokens) {
     tokens_.insert(tokens_.end(), chunk.begin(), chunk.end());
     logits_ = std::move(logits);
     logits_valid_ = true;
+    AppendTaps(first, n, capture);
     done += n;
   }
 }
@@ -317,6 +392,11 @@ void Session::SyncImpl(std::span<const std::int32_t> target) {
     throw std::invalid_argument("prompt of " + std::to_string(target.size()) +
                                 " tokens exceeds the context cap of " + std::to_string(cap) +
                                 " tokens");
+  }
+  {
+    const std::lock_guard lock(mutex_);
+    SettleVerification();
+    verify_logits_.clear();
   }
   if (executor_->State() != ExecState::kReady) {
     const std::lock_guard lock(mutex_);
@@ -337,6 +417,7 @@ void Session::SyncImpl(std::span<const std::int32_t> target) {
       if (rewound) {
         tokens_.resize(common);
         logits_valid_ = false;
+        TrimTaps(static_cast<std::uint32_t>(common));
       }
     }
     if (!rewound) {
@@ -371,8 +452,103 @@ bool Session::Evaluate(std::int32_t token, std::string* error) {
     if (executor_->State() != ExecState::kReady || executor_->Position() != tokens_.size()) {
       throw std::logic_error("session holds no valid state to continue");
     }
+    {
+      const std::lock_guard lock(mutex_);
+      SettleVerification();
+      verify_logits_.clear();
+    }
     const std::int32_t one[] = {token};
     ForwardChunks(one);
+    return true;
+  } catch (const std::exception& e) {
+    SetError(error, e.what());
+    return false;
+  }
+}
+
+bool Session::Verify(std::span<const std::int32_t> tokens, std::string* error) {
+  try {
+    const ExecutorInfo& info = executor_->Info();
+    const auto rows = static_cast<std::uint32_t>(tokens.size());
+    if (rows == 0 || rows > info.max_logit_rows || rows > info.max_rows) {
+      throw std::invalid_argument("a verification covers 1 to " +
+                                  std::to_string(std::min(info.max_logit_rows, info.max_rows)) +
+                                  " tokens, not " + std::to_string(rows));
+    }
+    // Exactness: only passes the executor computes row for row like one-row
+    // passes may stand in for one-row decoding.
+    if (rows > info.batch_invariant_rows) {
+      throw std::invalid_argument("a verification of " + std::to_string(rows) +
+                                  " rows is wider than the executor's batch-invariant width of " +
+                                  std::to_string(info.batch_invariant_rows));
+    }
+    if (tokens_.size() + rows > info.max_context) {
+      throw std::invalid_argument("context cap of " + std::to_string(info.max_context) + " tokens reached");
+    }
+    if (executor_->State() != ExecState::kReady || executor_->Position() != tokens_.size() || !logits_valid_) {
+      throw std::logic_error("session holds no valid state to verify from");
+    }
+    const WritePlan plan = executor_->PlanForward(rows);
+    if (guard_) guard_(plan);
+    const std::lock_guard lock(mutex_);
+    const std::size_t vocab = info.vocab;
+    std::vector<float> logits(std::size_t{rows} * vocab);
+    std::vector<float> capture(info.capture_layers.size() * std::size_t{info.hidden} * rows);
+    const std::uint32_t first = executor_->Position();
+    try {
+      executor_->Forward(tokens, first, LogitRows::kAll, logits, tap_, capture);
+    } catch (...) {
+      if (executor_->State() != ExecState::kReady) Fail();
+      throw;
+    }
+    saved_logits_ = std::move(logits_);
+    tokens_.insert(tokens_.end(), tokens.begin(), tokens.end());
+    logits_.assign(logits.end() - static_cast<std::ptrdiff_t>(vocab), logits.end());
+    logits_valid_ = true;
+    verify_logits_ = std::move(logits);
+    verify_base_ = first;
+    verify_count_ = rows;
+    verify_open_ = true;
+    AppendTaps(first, rows, capture);
+    return true;
+  } catch (const std::exception& e) {
+    SetError(error, e.what());
+    return false;
+  }
+}
+
+bool Session::AcceptVerified(std::uint32_t accepted, std::string* error) {
+  try {
+    const std::lock_guard lock(mutex_);
+    if (!verify_open_) throw std::logic_error("no open verification");
+    if (accepted > verify_count_) {
+      throw std::invalid_argument("accepted " + std::to_string(accepted) + " of " +
+                                  std::to_string(verify_count_) + " verified tokens");
+    }
+    // Where plain decoding would be after `accepted` of the verified tokens.
+    const std::uint32_t target = faults_.rewind_from_end
+                                     ? static_cast<std::uint32_t>(tokens_.size()) - accepted
+                                     : verify_base_ + accepted;
+    if (!executor_->Rewind(target)) {
+      // Cannot happen with a ring of window + max_rows - 1 rows; if it does,
+      // the rows below are gone and only a recompute is correct.
+      executor_->Reset();
+      Fail();
+      throw std::logic_error("the executor could not rewind to position " + std::to_string(target));
+    }
+    const std::size_t vocab = executor_->Info().vocab;
+    tokens_.resize(target);
+    if (faults_.stale_frontier) {
+      // logits_ stays the last verified row's
+    } else if (accepted > 0) {
+      logits_.assign(verify_logits_.begin() + static_cast<std::ptrdiff_t>((accepted - 1) * vocab),
+                     verify_logits_.begin() + static_cast<std::ptrdiff_t>(accepted * vocab));
+    } else {
+      logits_ = std::move(saved_logits_);
+    }
+    logits_valid_ = true;
+    if (!faults_.keep_rejected_taps) TrimTaps(target);
+    SettleVerification();
     return true;
   } catch (const std::exception& e) {
     SetError(error, e.what());

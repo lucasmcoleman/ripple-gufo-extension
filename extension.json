@@ -223,6 +223,13 @@
       ],
       "role": "test"
     },
+    "ricursive_capture_cost": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
+    },
     "ricursive_decode_bench": {
       "requires": [
         "hip",
@@ -233,6 +240,12 @@
     "ricursive_dump_taps": {
       "requires": [
         "hip",
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_draft_session_test": {
+      "requires": [
         "testing"
       ],
       "role": "test"

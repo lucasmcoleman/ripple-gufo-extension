@@ -15,13 +15,24 @@
 namespace ricursive_test {
 
 /// "cpu": CpuExecutor. "hostops": HostOpsExecutor (F32 caches, exact, like the
-/// CPU backend's BackendChoice, so both are comparable bit for bit).
+/// CPU backend's BackendChoice, so both are comparable bit for bit). "gpu-exact":
+/// the GPU executor with F32 caches and no activation rounding (the engine tests'
+/// RICURSIVE_TEST_BACKEND=gpu-exact; only through the GPU lock, tests/run-gpu-gates.sh).
 struct DraftBackend {
   std::string name;
   bool hostops{false};
+  bool gpu{false};
 };
 
-inline std::vector<DraftBackend> DraftBackends() { return {{"cpu", false}, {"hostops", true}}; }
+/// RICURSIVE_TEST_BACKEND unset or "cpu": the CPU executor and the host ops;
+/// "gpu-exact": the GPU executor only.
+inline std::vector<DraftBackend> DraftBackends() {
+  const char* env = std::getenv("RICURSIVE_TEST_BACKEND");
+  const std::string name = env != nullptr ? env : "cpu";
+  if (name == "gpu-exact") return {{"gpu-exact", false, true}};
+  Require(name == "cpu", "RICURSIVE_TEST_BACKEND must be cpu or gpu-exact, not " + name);
+  return {{"cpu", false, false}, {"hostops", true, false}};
+}
 
 /// `configure` may change the ModelOptions after the defaults below (prefill
 /// rows, context, window chunk; template check off).
@@ -34,6 +45,11 @@ inline std::shared_ptr<EngineModel> LoadDraftModel(
   options.window_chunk_rows = chunk;
   options.allow_template_mismatch = true;
   options.backend = CpuBackend();
+  if (be.gpu) {
+    options.backend = GpuBackend();
+    options.backend->kv_type = KvType::kF32;
+    options.backend->exact = true;
+  }
   if (be.hostops) {
     options.executor_override = [](const ModelWeights& w, const ExecutorConfig& c,
                                    std::string*) -> std::unique_ptr<Executor> {

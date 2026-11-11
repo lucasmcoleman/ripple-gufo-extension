@@ -248,6 +248,10 @@ _ricursive_test(plain_fingerprint TIMEOUT 1800
   SOURCES tests/plain_fingerprint_test.cpp tests/draft_hostops.cpp
   LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
     gufo_ricursive_reference gufo_ricursive gufo_ext_cache)
+_ricursive_test(draft_session TIMEOUT 3000
+  SOURCES tests/draft_session_test.cpp tests/draft_hostops.cpp
+  LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
+    gufo_ricursive_reference gufo_ricursive gufo_ext_cache)
 
 _ricursive_test(profile
   SOURCES tests/profile_test.cpp LINK_LIBRARIES gufo_ricursive_exec gufo_ricursive)
@@ -496,6 +500,19 @@ gufo_extension_target(
 )
 if(TARGET ricursive_dump_taps)
   set_target_properties(ricursive_dump_taps PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+# Tool, built on request (docs/DRAFTER-S3.md): ricursive_capture_cost MODEL.gguf --rows N
+#   --reps R [--layers a,b,c,d,e] [--backend cpu|host|gpu]: wall time of one Forward of N
+#   rows with hidden-state capture off and on (the design's 1% cost test). Run on the GPU
+#   only through the wrapper (perf/STAGE3-GPU.md).
+gufo_extension_target(
+  NAME ricursive_capture_cost
+  SOURCES tools/capture_cost.cpp tools/decode_bench_host.cpp
+  LINK_LIBRARIES gufo_ricursive gufo_ricursive_hostops gufo_ricursive_exec
+    gufo_ricursive_gpuexec gufo_ext_runtime gufo_ext_core gufo_ext_hip
+)
+if(TARGET ricursive_capture_cost)
+  set_target_properties(ricursive_capture_cost PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 # Tool, built on request: synthetic-tensor timing of the attention and projection kernels
 # (docs/PERF-KERNELS.md). Run only through the GPU wrapper.
