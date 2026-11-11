@@ -294,5 +294,10 @@ Item B made a request that ends by its limit leave plain's state; two other endi
 
 ## Stage 4c-fix (branch `drafter-s4d`, from `drafter-s4c` 7eec1dd; fixes from the independent review of stage 4c)
 
+### Item 2: failed builds stay capped across cold starts
+**Supersedes** the stage 4c item 4 paragraph "Order matters for one case" and the test expectation "after a cold start one more build must be attempted and counted afresh". gufo binds the runner state before it knows a request is a cold start, so a failed build counted 1 and the cold start's `Replaced(0)` then cleared the record: with a drafter that can never be built every cold-start request re-uploaded the weights and warned again, and the 3-in-a-row limit never fired.
+- `DrafterHealth::BuildFailed` counts consecutive failed BUILDS in a counter that `Clear()` and `Restored()` do not touch (it is not part of the saved state); only `BuildSucceeded()` resets it. After `kLimit` (3) failed builds `build_given_up()` is true: `DraftedSession::For` makes no further build attempt for the session and prints one warning line (the third failure's). Failures of a built drafter (draft, ingest) keep stage 4c item 4's rule: a cold start clears them and the drafter is tried again.
+- Check, group `fail`, `BuildFailTests`: five requests that each start cold (an unrelated prompt: the bind runs first, then the session is invalidated) with an engine factory that always throws, and with a shared upload that always throws: exactly 3 build attempts, every request completes with plain's tokens and end state. The existing check after a cold start now expects no further attempt (the record still clears: 0 failures, on; the build stays given up).
+
 ### Item 7: the command-line drivers are not covered
 Stage 4c made **serving** survive a drafter that cannot be built. The command-line drivers (`drivers.cpp`, about line 259) still build the drafted session directly, so a drafter that cannot be built still fails `ricursive prompt` / `ricursive chat` with `--speculative`. The drivers were not changed.
