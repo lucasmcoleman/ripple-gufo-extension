@@ -32,7 +32,7 @@
 //                     <= 1.3e-5 worst case on a score, an online softmax rescaled once per 128-key tile: 128 tiles at
 //                     16,384 keys, each 6e-8). Queries are scaled so the scores have standard deviation 2 (softmax weights
 //                     concentrate on a few dozen keys; a wrong key changes the output by far more than the tolerance).
-//   DynamicConv       rel to the sum of the absolute terms <= 1e-6 (four fp32 additions and a product each).
+//   DynamicConv       rel to the sum of the absolute terms (|base| + |dyn|) * |x| <= 1e-6 (four fp32 additions and a product each).
 //   ProjectQ8         (item 2) cpu mode: the host operations against a double-precision product of the dequantized weights,
 //                     relative RMSE per row <= 1e-6 (the host does not round activations). GPU modes: the W8A8 route
 //                     against the host's exact activations, relative RMSE per row <= 1.2e-2: Q8_1 rounds each 32-element
@@ -778,10 +778,10 @@ void RunConvSilu(Side& a, Side& b, Rng& rng, Report& report, const Tolerances& t
       for (std::uint32_t t = 0; t < kBlock; ++t) {
         for (std::uint32_t ch = 0; ch < kE; ++ch) {
           double bound = 0.0;
-          for (std::uint32_t tap = 0; tap < kConvK && tap <= t; ++tap)
-            bound += std::fabs((static_cast<double>(c.base[std::size_t{side * kConvK + tap} * kE + ch]) +
-                                c.dyn[std::size_t{t} * per_token + std::size_t{side * kConvK + tap} * groups + ch / kConvGroup]) *
-                               c.input[std::size_t{t - tap} * kE + ch]);
+          for (std::uint32_t tap = 0; tap < kConvK && tap <= t; ++tap)  // |base| + |dyn|: the float sum base + dyn rounds relative to them
+            bound += (std::fabs(static_cast<double>(c.base[std::size_t{side * kConvK + tap} * kE + ch])) +
+                      std::fabs(static_cast<double>(c.dyn[std::size_t{t} * per_token + std::size_t{side * kConvK + tap} * groups + ch / kConvGroup]))) *
+                     std::fabs(static_cast<double>(c.input[std::size_t{t - tap} * kE + ch]));
           const std::size_t at = std::size_t{t} * kE + ch;
           if (accumulate) bound += std::fabs(c.output_init[at]);
           const double diff = std::fabs(static_cast<double>(oa[at]) - ob[at]);
@@ -854,7 +854,6 @@ SelectCase RandomSelect(Rng& rng, const std::string& what, core::GgmlType pred, 
 /// Top-k membership around exact ties: in every row six tokens spread over different partial lists (and different
 /// thread slots) get one logit value between the 28th and 29th largest, so the cut at 32 falls inside the tie.
 void InjectLogitTies(SelectCase& c) {
-  c.exact_ties = true;
   for (std::uint32_t r = 0; r < c.rows; ++r) {
     float* lg = &c.logits[std::size_t{r} * kVocab];
     std::vector<std::int32_t> idx(kVocab);
@@ -865,8 +864,8 @@ void InjectLogitTies(SelectCase& c) {
     std::vector<bool> top(kVocab, false);
     for (int i = 0; i < 40; ++i) top[idx[i]] = true;
     const std::uint32_t spots[6] = {3 + r, 2049 + 7 * r, 20000 + r, 40000 + 13 * r, 99999 - r, 100351 - 2 * r};
-    for (const std::uint32_t s : spots) {
-      Require(!top[s], "tie spot already in the top 40");
+    for (std::uint32_t s : spots) {
+      while (top[s]) ++s;  // never a token of the top 40 (the ranks above and below the tie stay what they are)
       lg[s] = y;
     }
   }
@@ -937,7 +936,7 @@ void CompareSelect(const SelectCase& c, const SelectOut& a, const SelectOut& b, 
       if (a.ids[r * kTopK + k] != b.ids[r * kTopK + k]) continue;  // reported by the ids check
       const double tol = bound(r, prev, b.ids[r * kTopK + k]);
       const double diff = std::fabs(static_cast<double>(a.scores[r * kTopK + k]) - b.scores[r * kTopK + k]);
-      const double rel = diff / tol;
+      const double rel = diff / std::max(tol, 1e-30);
       if (!(rel <= st.worst_score)) st.worst_score = rel;
     }
   }
