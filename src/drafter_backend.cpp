@@ -58,7 +58,7 @@ speculative::DraftProposal DFlash2DraftBackend::Propose(std::span<const sampling
       faults_.anchor_position_off_by_one && current_pos > 0 ? current_pos - 1 : current_pos;
   last_anchor_position_ = current_pos;
   last_anchor_token_ = prompt_tokens.back();
-  last_block_ = engine_->Draft(static_cast<std::int32_t>(prompt_tokens[anchor_index]), anchor_position);
+  last_block_ = engine_->Draft(static_cast<std::int32_t>(prompt_tokens[anchor_index]), anchor_position, max_tokens);
   ++proposals_;
   const std::size_t count = std::min<std::size_t>(max_tokens, last_block_.tokens.size());
   for (std::size_t i = 0; i < count; ++i) {

@@ -11,6 +11,7 @@
 #include <string>
 
 #include "hip/device_model.hpp"
+#include "hip/drafter_kernels.hpp"
 #include "hip/executor.hpp"
 #include "hip/kernels.hpp"
 #include "hip/project.hpp"
@@ -145,6 +146,62 @@ class GpuOps final : public Ops {
              "GatherRows");
   }
 
+  // ---- the drafter's operations (hip/drafter_kernels.hip.cpp) ------------
+  void DraftQkNormRope(float* q, const float* k, const float* v, const float* q_gamma,
+                       const float* k_gamma, void* k_store, void* v_store, KvType type,
+                       std::uint32_t tokens, std::uint32_t heads, std::uint32_t kv_heads,
+                       std::uint32_t head_dim, float eps, std::uint32_t start_pos,
+                       std::uint32_t slot_start, std::uint32_t capacity, bool rope,
+                       float theta) override {
+    std::string e;
+    Launched(rocm::DraftQkNormRope(q, k, v, q_gamma, k_gamma, k_store, v_store, Kv(type), tokens,
+                                   heads, kv_heads, head_dim, eps, start_pos, slot_start, capacity,
+                                   rope, theta, stream_, &e),
+             e, "DraftQkNormRope");
+  }
+  void DraftAttention(const float* q, const void* k_ctx, const void* v_ctx, KvType type,
+                      std::uint32_t ctx_capacity, std::uint32_t ctx_first, std::uint32_t anchor,
+                      const float* k_blk, const float* v_blk, float* out, std::uint32_t tokens,
+                      std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+                      std::uint32_t window, float scale) override {
+    std::string e;
+    Launched(rocm::DraftAttention(q, k_ctx, v_ctx, Kv(type), ctx_capacity, ctx_first, anchor, k_blk,
+                                  v_blk, out, tokens, heads, kv_heads, head_dim, window, scale,
+                                  stream_, &e),
+             e, "DraftAttention");
+  }
+  void DynamicConv(const float* input, const float* dynamic_coefficients, const float* base_kernel,
+                   float* output, std::uint32_t num_tokens, std::uint32_t hidden_size,
+                   std::uint32_t kernel_size, std::uint32_t group_size, std::uint32_t side,
+                   bool accumulate) override {
+    std::string e;
+    Launched(rocm::DraftDynamicConv(input, dynamic_coefficients, base_kernel, output, num_tokens,
+                                    hidden_size, kernel_size, group_size, side, accumulate, stream_, &e),
+             e, "DraftDynamicConv");
+  }
+  void SiluMul(float* gate, const float* up, std::uint32_t total_elements) override {
+    std::string e;
+    Launched(rocm::DraftSiluMul(gate, up, total_elements, stream_, &e), e, "DraftSiluMul");
+  }
+  void DraftSelect(const float* logits, const float* projected_hidden,
+                   const WeightView& predecessor_codebook, const WeightView& successor_codebook,
+                   std::int32_t* tokens, float* candidate_scores, std::int32_t* candidate_ids,
+                   float* partial_scores, std::int32_t* partial_ids, std::uint32_t rows,
+                   std::uint32_t vocab_size, std::uint32_t selector_rank,
+                   std::uint32_t selector_top_k) override {
+    for (const WeightView* w : {&predecessor_codebook, &successor_codebook}) {
+      if (w->data == nullptr || w->cols != selector_rank || w->rows < vocab_size)
+        throw std::runtime_error("ricursive GPU ops: DraftSelect: codebook shape");
+    }
+    std::string e;
+    Launched(rocm::DraftSelect(logits, projected_hidden, predecessor_codebook.data,
+                               EncodingOf(predecessor_codebook.type), successor_codebook.data,
+                               EncodingOf(successor_codebook.type), tokens, candidate_scores,
+                               candidate_ids, partial_scores, partial_ids, rows, vocab_size,
+                               selector_rank, selector_top_k, stream_, &e),
+             e, "DraftSelect");
+  }
+
  private:
   hipStream_t stream_{nullptr};
   rocm::Scratch scratch_;
@@ -152,6 +209,8 @@ class GpuOps final : public Ops {
 };
 
 }  // namespace
+
+std::unique_ptr<Ops> CreateGpuOps() { return std::make_unique<GpuOps>(); }
 
 GpuExecutor::GpuExecutor(std::shared_ptr<const DeviceModel> model,
                          const ExecutorConfig& config, const ExecFaults& faults)

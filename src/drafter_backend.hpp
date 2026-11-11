@@ -59,6 +59,17 @@ class DrafterEngine {
   /// Drafts the block whose first row is `anchor_token` at `anchor_position` (<= End()).
   /// The context it reads is the rows below the anchor that the engine holds.
   [[nodiscard]] virtual Block Draft(std::int32_t anchor_token, std::uint32_t anchor_position) = 0;
+  /// The same, when the caller needs at most `max_tokens` of the block: an engine may stop its
+  /// work after that many tokens and return only them (the tokens it returns are the first ones of
+  /// the whole block's, whatever the hint). The default ignores the hint, so an engine written
+  /// before it keeps returning the whole block.
+  [[nodiscard]] virtual Block Draft(std::int32_t anchor_token, std::uint32_t anchor_position,
+                                    std::uint32_t max_tokens) {
+    (void)max_tokens;
+    return Draft(anchor_token, anchor_position);
+  }
+  /// Device memory this engine's context and scratch hold (0: none, or not tracked).
+  [[nodiscard]] virtual std::uint64_t DeviceBytes() const noexcept { return 0; }
 };
 
 /// Feeds the rows a Session keeps into a DrafterEngine. A row at a position the engine

@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "hip/drafter_math.hpp"
 #include "hip/executor.hpp"
 
 namespace gufo::models::ricursive {
@@ -39,8 +40,10 @@ float Sigmoid(float x) { return 1.0F / (1.0F + std::exp(-x)); }
 
 class HostOps final : public Ops {
  public:
-  HostOps(bool lenient_capacity, bool poison)
-      : lenient_(lenient_capacity), poison_(poison) {}
+  explicit HostOps(const HostOpsOptions& options)
+      : lenient_(options.lenient_capacity),
+        poison_(options.poison_memory),
+        conv_across_block_start_(options.conv_across_block_start) {}
   ~HostOps() override {
     for (auto& [ptr, block] : blocks_) std::free(block.raw);
   }
@@ -414,6 +417,307 @@ class HostOps final : public Ops {
     }
   }
 
+
+  // ---- the drafter's operations (docs/DRAFTER-S2.md) --------------------
+  // The loops below follow hip/drafter_kernels.hip.cpp: same bounds, same indexing, same
+  // parameter names; sums in double where the kernels sum in fp32.
+
+  void DraftQkNormRope(float* q, const float* k, const float* v, const float* q_gamma,
+                       const float* k_gamma, void* k_store, void* v_store, KvType type,
+                       std::uint32_t tokens, std::uint32_t heads, std::uint32_t kv_heads,
+                       std::uint32_t head_dim, float eps, std::uint32_t start_pos,
+                       std::uint32_t slot_start, std::uint32_t capacity, bool rope,
+                       float theta) override {
+    const char* op = "DraftQkNormRope";
+    if (head_dim == 0 || head_dim % 2 != 0 || head_dim > km::kDraftMaxHeadDim)
+      Fail(op, "head_dim must be even and in [2, 256]");
+    if (kv_heads == 0 || (heads != 0 && heads % kv_heads != 0))
+      Fail(op, "heads must be 0 or a multiple of kv_heads");
+    if (rope && !(std::isfinite(theta) && theta > 1.0F)) Fail(op, "theta must be finite and > 1");
+    if (capacity == 0 || tokens > capacity) Fail(op, "capacity must be >= tokens");
+    if (std::uint64_t{start_pos} + tokens > (1ULL << 31)) Fail(op, "position out of range");
+    const std::size_t D = head_dim, kvw = std::size_t{kv_heads} * D;
+    const std::size_t esize = type == KvType::kF16 ? 2 : 4;
+    if (heads != 0) Range(op, "q", q, std::size_t{tokens} * heads * D * 4);
+    Range(op, "k", k, std::size_t{tokens} * kvw * 4);
+    Range(op, "v", v, std::size_t{tokens} * kvw * 4);
+    Range(op, "k_store", k_store, std::size_t{capacity} * kvw * esize);
+    Range(op, "v_store", v_store, std::size_t{capacity} * kvw * esize);
+    Weights(op, q_gamma, D);
+    Weights(op, k_gamma, D);
+    auto store = [&](void* cache, std::size_t index, float value) {
+      if (type == KvType::kF16) {
+        static_cast<std::uint16_t*>(cache)[index] = FloatToHalf(value);
+      } else {
+        static_cast<float*>(cache)[index] = value;
+      }
+    };
+    const std::size_t half = D / 2;
+    std::vector<float> inv(half), cs(half), sn(half), normed(D);
+    for (std::size_t i = 0; i < half; ++i)
+      inv[i] = 1.0F / std::pow(theta, static_cast<float>(2 * i) / static_cast<float>(D));
+    for (std::uint32_t t = 0; t < tokens; ++t) {
+      const std::uint32_t pos = start_pos + t;
+      const std::size_t slot = (std::size_t{slot_start} + t) % capacity;
+      if (rope) {
+        const float angle_pos = static_cast<float>(pos);
+        for (std::size_t i = 0; i < half; ++i) {
+          const float angle = angle_pos * inv[i];
+          cs[i] = std::cos(angle);
+          sn[i] = std::sin(angle);
+        }
+      }
+      for (std::uint32_t hh = 0; hh < heads + kv_heads; ++hh) {
+        const bool is_q = hh < heads;
+        const std::uint32_t h = is_q ? hh : hh - heads;
+        float* qrow = q + (std::size_t{t} * heads + h) * D;
+        const float* src = is_q ? qrow : k + std::size_t{t} * kvw + h * D;
+        const float scale = InvRms(src, D, eps);
+        const float* gamma = is_q ? q_gamma : k_gamma;
+        for (std::size_t d = 0; d < D; ++d) normed[d] = (src[d] * scale) * gamma[d];
+        for (std::size_t d = 0; d < D; ++d) {
+          float out = normed[d];
+          if (rope) {
+            const std::size_t pair = d < half ? d : d - half;
+            const float xa = normed[pair], xb = normed[pair + half];
+            out = d < half ? xa * cs[pair] - xb * sn[pair] : xb * cs[pair] + xa * sn[pair];
+          }
+          if (is_q) {
+            qrow[d] = out;
+          } else {
+            store(k_store, slot * kvw + h * D + d, out);
+          }
+        }
+      }
+      for (std::uint32_t h = 0; h < kv_heads; ++h)
+        for (std::size_t d = 0; d < D; ++d)
+          store(v_store, slot * kvw + h * D + d, v[std::size_t{t} * kvw + h * D + d]);
+    }
+  }
+
+  void DraftAttention(const float* q, const void* k_ctx, const void* v_ctx, KvType type,
+                      std::uint32_t ctx_capacity, std::uint32_t ctx_first, std::uint32_t anchor,
+                      const float* k_blk, const float* v_blk, float* out, std::uint32_t tokens,
+                      std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+                      std::uint32_t window, float scale) override {
+    const char* op = "DraftAttention";
+    if (head_dim == 0 || head_dim > km::kDraftMaxHeadDim) Fail(op, "head_dim must be in [1, 256]");
+    if (heads == 0 || kv_heads == 0 || heads % kv_heads != 0)
+      Fail(op, "heads must be a positive multiple of kv_heads");
+    if (!std::isfinite(scale)) Fail(op, "scale must be finite");
+    if (ctx_capacity == 0) Fail(op, "ctx_capacity is 0");
+    if (ctx_first > anchor) Fail(op, "ctx_first is above the anchor");
+    if (std::uint64_t{anchor} + tokens > (1ULL << 31)) Fail(op, "position out of range");
+    const std::uint32_t group = heads / kv_heads;
+    const std::size_t D = head_dim, kvw = std::size_t{kv_heads} * D;
+    const std::size_t esize = type == KvType::kF16 ? 2 : 4;
+    const std::size_t qn = std::size_t{tokens} * heads * D;
+    Range(op, "q", q, qn * 4);
+    Range(op, "out", out, qn * 4);
+    Range(op, "k_ctx", k_ctx, std::size_t{ctx_capacity} * kvw * esize);
+    Range(op, "v_ctx", v_ctx, std::size_t{ctx_capacity} * kvw * esize);
+    Range(op, "k_blk", k_blk, std::size_t{tokens} * kvw * 4);
+    Range(op, "v_blk", v_blk, std::size_t{tokens} * kvw * 4);
+    NoOverlap(op, out, qn * 4, q, qn * 4);
+    auto load = [&](const void* cache, std::size_t index) -> float {
+      if (type == KvType::kF16) return HalfToFloat(static_cast<const std::uint16_t*>(cache)[index]);
+      return static_cast<const float*>(cache)[index];
+    };
+    std::vector<double> p;
+    for (std::uint32_t t = 0; t < tokens; ++t) {
+      const km::DraftKeys keys = km::DraftVisibleKeys(t, anchor, ctx_first, tokens, window);
+      const std::uint32_t nctx = keys.ctx_end - keys.ctx_begin, nblk = keys.blk_end - keys.blk_begin;
+      if (nctx > ctx_capacity) Fail(op, "the visible context rows do not fit the ring");
+      p.assign(std::size_t{nctx} + nblk, 0.0);
+      for (std::uint32_t h = 0; h < heads; ++h) {
+        const std::uint32_t kvh = km::KvHeadOf(h, group);
+        const float* qh = q + (std::size_t{t} * heads + h) * D;
+        double mx = -INFINITY;
+        for (std::uint32_t n = 0; n < nctx + nblk; ++n) {
+          double dot = 0.0;
+          if (n < nctx) {
+            const std::size_t slot = (keys.ctx_begin + n) % ctx_capacity;
+            for (std::size_t d = 0; d < D; ++d)
+              dot += static_cast<double>(qh[d]) * load(k_ctx, slot * kvw + kvh * D + d);
+          } else {
+            const std::size_t row = keys.blk_begin + (n - nctx);
+            for (std::size_t d = 0; d < D; ++d)
+              dot += static_cast<double>(qh[d]) * k_blk[row * kvw + kvh * D + d];
+          }
+          p[n] = static_cast<double>(static_cast<float>(dot) * scale);
+          mx = std::max(mx, p[n]);
+        }
+        double sum = 0.0;
+        for (double& s : p) {
+          s = std::exp(s - mx);
+          sum += s;
+        }
+        float* o = out + (std::size_t{t} * heads + h) * D;
+        for (std::size_t d = 0; d < D; ++d) {
+          double acc = 0.0;
+          for (std::uint32_t n = 0; n < nctx + nblk; ++n) {
+            if (n < nctx) {
+              const std::size_t slot = (keys.ctx_begin + n) % ctx_capacity;
+              acc += p[n] * load(v_ctx, slot * kvw + kvh * D + d);
+            } else {
+              const std::size_t row = keys.blk_begin + (n - nctx);
+              acc += p[n] * v_blk[row * kvw + kvh * D + d];
+            }
+          }
+          o[d] = static_cast<float>(acc / sum);
+        }
+      }
+    }
+  }
+
+  void DynamicConv(const float* input, const float* dynamic_coefficients, const float* base_kernel,
+                   float* output, std::uint32_t num_tokens, std::uint32_t hidden_size,
+                   std::uint32_t kernel_size, std::uint32_t group_size, std::uint32_t side,
+                   bool accumulate) override {
+    const char* op = "DynamicConv";
+    if (hidden_size == 0 || kernel_size == 0 || group_size == 0 || hidden_size % group_size != 0)
+      Fail(op, "hidden_size must be a positive multiple of group_size and kernel_size > 0");
+    if (side > 1) Fail(op, "side must be 0 or 1");
+    const std::uint32_t groups = hidden_size / group_size;
+    const std::uint32_t coefficients_per_token = 2U * kernel_size * groups;
+    const std::size_t n = std::size_t{num_tokens} * hidden_size;
+    Range(op, "input", input, n * 4);
+    Range(op, "dynamic_coefficients", dynamic_coefficients,
+          std::size_t{num_tokens} * coefficients_per_token * 4);
+    Range(op, "output", output, n * 4);
+    Weights(op, base_kernel, 1);
+    if (!accumulate && output != input) NoOverlap(op, output, n * 4, input, n * 4);
+    if (output == input) Fail(op, "output must not alias input");
+    for (std::uint64_t index = 0; index < n; ++index) {
+      const std::uint32_t token = static_cast<std::uint32_t>(index / hidden_size);
+      const std::uint32_t channel = static_cast<std::uint32_t>(index % hidden_size);
+      const std::uint32_t group = channel / group_size;
+      float sum = 0.0F;
+      for (std::uint32_t tap = 0; tap < kernel_size; ++tap) {
+        std::uint32_t source = token;
+        if (token < tap) {
+          if (!conv_across_block_start_) continue;
+          source = token + num_tokens;  // the defect: the end of the block stands in for the rows before it
+        }
+        source -= tap;
+        const std::uint64_t dynamic_index =
+            std::uint64_t{token} * coefficients_per_token + (side * kernel_size + tap) * groups + group;
+        const std::uint64_t base_index = std::uint64_t{side * kernel_size + tap} * hidden_size + channel;
+        const std::uint64_t input_index = std::uint64_t{source} * hidden_size + channel;
+        sum += (base_kernel[base_index] + dynamic_coefficients[dynamic_index]) * input[input_index];
+      }
+      output[index] = accumulate ? output[index] + sum : sum;
+    }
+  }
+
+  void SiluMul(float* gate, const float* up, std::uint32_t total_elements) override {
+    Range("SiluMul", "gate", gate, std::size_t{total_elements} * 4);
+    Range("SiluMul", "up", up, std::size_t{total_elements} * 4);
+    for (std::uint32_t idx = 0; idx < total_elements; ++idx) {
+      const float g = gate[idx];
+      const float silu_g = g / (1.0F + std::exp(-g));
+      gate[idx] = silu_g * up[idx];
+    }
+  }
+
+  void DraftSelect(const float* logits, const float* projected_hidden,
+                   const WeightView& predecessor_codebook, const WeightView& successor_codebook,
+                   std::int32_t* tokens, float* candidate_scores, std::int32_t* candidate_ids,
+                   float* partial_scores, std::int32_t* partial_ids, std::uint32_t rows,
+                   std::uint32_t vocab_size, std::uint32_t selector_rank,
+                   std::uint32_t selector_top_k) override {
+    const char* op = "DraftSelect";
+    const std::uint32_t K = selector_top_k, V = vocab_size, R = selector_rank;
+    if (K == 0 || K > km::kDraftMaxTopK || K > V) Fail(op, "selector_top_k must be in [1, 32] and <= vocab_size");
+    if (R == 0) Fail(op, "selector_rank is 0");
+    const km::Enc pe = EncodingOf(predecessor_codebook.type), se = EncodingOf(successor_codebook.type);
+    if (pe == km::Enc::kNone || se == km::Enc::kNone)
+      Fail(op, "codebook type must be F32, BF16, Q8_0 or Q4_K");
+    const std::uint64_t prow = km::DequantRowBytes(pe, R), srow = km::DequantRowBytes(se, R);
+    if (prow == 0 || srow == 0) Fail(op, "selector_rank is not block aligned for the codebook type");
+    for (const WeightView* w : {&predecessor_codebook, &successor_codebook}) {
+      if (w->data == nullptr || w->cols != R || w->rows < V) Fail(op, "codebook shape");
+    }
+    const std::uint32_t P = km::DraftSelectPartials(V);
+    Range(op, "logits", logits, std::size_t{rows} * V * 4);
+    Range(op, "projected_hidden", projected_hidden, std::size_t{rows} * R * 4);
+    Range(op, "tokens", tokens, (std::size_t{rows} + 1) * 4);
+    Range(op, "candidate_scores", candidate_scores, std::size_t{rows} * K * 4);
+    Range(op, "candidate_ids", candidate_ids, std::size_t{rows} * K * 4);
+    Range(op, "partial_scores", partial_scores, std::size_t{rows} * P * K * 4);
+    Range(op, "partial_ids", partial_ids, std::size_t{rows} * P * K * 4);
+    // Sorted descending lists of K (score, id); strictly larger scores enter, so of equal scores the
+    // one seen first stays (ascending ids within a row).
+    auto insert = [&](float score, std::int32_t id, float* scores, std::int32_t* ids) {
+      if (score <= scores[K - 1]) return;
+      std::uint32_t at = K - 1;
+      while (at > 0 && score > scores[at - 1]) {
+        scores[at] = scores[at - 1];
+        ids[at] = ids[at - 1];
+        --at;
+      }
+      scores[at] = score;
+      ids[at] = id;
+    };
+    // Phase 1 (the GPU's partial kernel, one block per partial list): the top-K of each block of
+    // kDraftSelectTokensPerBlock vocabulary entries.
+    for (std::uint32_t row = 0; row < rows; ++row) {
+      for (std::uint32_t b = 0; b < P; ++b) {
+        float* scores = partial_scores + (std::size_t{row} * P + b) * K;
+        std::int32_t* ids = partial_ids + (std::size_t{row} * P + b) * K;
+        for (std::uint32_t i = 0; i < K; ++i) {
+          scores[i] = -INFINITY;
+          ids[i] = 0;
+        }
+        const std::uint32_t begin = b * km::kDraftSelectTokensPerBlock;
+        const std::uint32_t end = std::min(V, begin + km::kDraftSelectTokensPerBlock);
+        for (std::uint32_t token = begin; token < end; ++token)
+          insert(logits[std::size_t{row} * V + token], static_cast<std::int32_t>(token), scores, ids);
+      }
+    }
+    // Phase 2 (the GPU's finalize kernel, one block, the rows one after the other).
+    std::int32_t predecessor = tokens[0];
+    std::vector<float> top_scores(K), transition(K);
+    std::vector<std::int32_t> top_ids(K);
+    for (std::uint32_t row = 0; row < rows; ++row) {
+      std::fill(top_scores.begin(), top_scores.end(), -INFINITY);
+      std::fill(top_ids.begin(), top_ids.end(), 0);
+      const std::size_t base = std::size_t{row} * P * K;
+      for (std::uint32_t index = 0; index < P * K; ++index)
+        insert(partial_scores[base + index], partial_ids[base + index], top_scores.data(), top_ids.data());
+      if (predecessor < 0 || static_cast<std::uint32_t>(predecessor) >= V)
+        Fail(op, "predecessor token " + std::to_string(predecessor) + " outside the codebook");
+      const auto* pred_row =
+          static_cast<const std::uint8_t*>(predecessor_codebook.data) + std::size_t{static_cast<std::uint32_t>(predecessor)} * prow;
+      float best_score = -INFINITY;
+      std::uint32_t best_index = 0;
+      for (std::uint32_t c = 0; c < K; ++c) {
+        const auto* succ_row =
+            static_cast<const std::uint8_t*>(successor_codebook.data) + std::size_t{static_cast<std::uint32_t>(top_ids[c])} * srow;
+        // kDraftTransitionLanes partial sums over strided ranks, then added in lane order (as the GPU's lanes).
+        float lanes[km::kDraftTransitionLanes];
+        for (std::uint32_t part = 0; part < km::kDraftTransitionLanes; ++part) {
+          float partial = 0.0F;
+          for (std::uint32_t rank = part; rank < R; rank += km::kDraftTransitionLanes)
+            partial += km::DequantAt(pe, pred_row, rank) * projected_hidden[std::size_t{row} * R + rank] *
+                       km::DequantAt(se, succ_row, rank);
+          lanes[part] = partial;
+        }
+        float t = 0.0F;
+        for (std::uint32_t part = 0; part < km::kDraftTransitionLanes; ++part) t += lanes[part];
+        const float score = top_scores[c] + t;
+        candidate_scores[std::size_t{row} * K + c] = score;
+        candidate_ids[std::size_t{row} * K + c] = top_ids[c];
+        if (score > best_score) {
+          best_score = score;
+          best_index = c;
+        }
+      }
+      tokens[1 + row] = top_ids[best_index];
+      predecessor = top_ids[best_index];
+    }
+  }
+
  private:
   struct Block {
     unsigned char* raw;
@@ -468,6 +772,7 @@ class HostOps final : public Ops {
 
   bool lenient_;
   bool poison_;
+  bool conv_across_block_start_;
   std::map<unsigned char*, Block> blocks_;
   std::string corruption_;
 };
@@ -516,13 +821,17 @@ std::shared_ptr<const ModelHandles> BuildHandles(const ModelWeights& w) {
 
 }  // namespace
 
+std::unique_ptr<Ops> CreateHostOps(const HostOpsOptions& options) {
+  return std::make_unique<HostOps>(options);
+}
+
 HostOpsExecutor::HostOpsExecutor(const ModelWeights& weights,
                                  const ExecutorConfig& config, Options options)
     : HostOpsExecutor(BuildHandles(weights), config, options) {}
 
 HostOpsExecutor::HostOpsExecutor(std::shared_ptr<const ModelHandles> model,
                                  const ExecutorConfig& config, Options options)
-    : OpsExecutor(std::make_unique<HostOps>(options.lenient_capacity, options.poison_memory), *model,
+    : OpsExecutor(std::make_unique<HostOps>(HostOpsOptions{options.lenient_capacity, options.poison_memory}), *model,
                   model, config,
                   /*batch_invariant_rows=*/config.max_rows, options.faults) {}
 

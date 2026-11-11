@@ -147,4 +147,96 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& weights,
   return m;
 }
 
+
+std::unique_ptr<DeviceModel> DeviceModel::UploadHead(const ModelWeights& weights, const core::GgufReader& reader,
+                                                     std::string* error) {
+  std::unique_ptr<DeviceModel> m(new DeviceModel());
+  const auto regions = reader.GetMappedRegions();
+  const std::vector<core::GgufMappedRegion> shards(regions.begin(), regions.end());
+  auto stager = hip::WeightUpload::Create(shards, error);
+  if (!stager) return nullptr;
+  std::uint64_t file_bytes = 0;
+  for (const auto& shard : shards) file_bytes += shard.size;
+  const hip::WeightAllocator placement(file_bytes);
+  Uploader up{*stager, placement, m->allocations_, m->bytes_, error};
+  ModelHandles& h = m->handles_;
+  h.config = weights.config;
+  h.table = EmbeddingTable{weights.token_embd.data, weights.token_embd.type,
+                           static_cast<std::size_t>(weights.token_embd.rows),
+                           static_cast<std::size_t>(weights.token_embd.cols)};
+  h.output = up.Matrix(weights.output);
+  h.output_norm = up.Vector(weights.output_norm);
+  std::string finish_error;
+  const bool finished = stager->Finish(&finish_error);
+  if (!up.ok) return nullptr;
+  if (!finished) {
+    if (error != nullptr) *error = finish_error;
+    return nullptr;
+  }
+  const hipError_t status = hipDeviceSynchronize();
+  if (status != hipSuccess) {
+    if (error != nullptr) *error = std::string("weight upload failed: ") + hipGetErrorString(status);
+    return nullptr;
+  }
+  return m;
+}
+
+DeviceDrafter::~DeviceDrafter() {
+  for (void* ptr : allocations_) (void)hipFree(ptr);
+}
+
+std::unique_ptr<DeviceDrafter> DeviceDrafter::Upload(const DrafterWeights& w, const core::GgufReader& reader,
+                                                     std::string* error) {
+  std::unique_ptr<DeviceDrafter> m(new DeviceDrafter());
+  const auto regions = reader.GetMappedRegions();
+  const std::vector<core::GgufMappedRegion> shards(regions.begin(), regions.end());
+  auto stager = hip::WeightUpload::Create(shards, error);
+  if (!stager) return nullptr;
+  std::uint64_t file_bytes = 0;
+  for (const auto& shard : shards) file_bytes += shard.size;
+  const hip::WeightAllocator placement(file_bytes);
+  Uploader up{*stager, placement, m->allocations_, m->bytes_, error};
+  DrafterHandles& h = m->handles_;
+  h.config = w.config;
+  h.fc = up.Matrix(w.fc);
+  h.selector_hidden = up.Matrix(w.selector_hidden);
+  h.selector_predecessor = up.Matrix(w.selector_predecessor);
+  h.selector_successor = up.Matrix(w.selector_successor);
+  h.enc_output_norm = up.Vector(w.enc_output_norm);
+  h.output_norm = up.Vector(w.output_norm);
+  for (const DrafterLayerWeights& l : w.layers) {
+    DrafterLayerHandles d;
+    d.attn_q = up.Matrix(l.attn_q);
+    d.attn_k = up.Matrix(l.attn_k);
+    d.attn_v = up.Matrix(l.attn_v);
+    d.attn_output = up.Matrix(l.attn_output);
+    d.attn_conv_proj = up.Matrix(l.attn_conv_proj);
+    d.ffn_gate = up.Matrix(l.ffn_gate);
+    d.ffn_up = up.Matrix(l.ffn_up);
+    d.ffn_down = up.Matrix(l.ffn_down);
+    d.ffn_conv_proj = up.Matrix(l.ffn_conv_proj);
+    d.attn_norm = up.Vector(l.attn_norm);
+    d.attn_q_norm = up.Vector(l.attn_q_norm);
+    d.attn_k_norm = up.Vector(l.attn_k_norm);
+    d.attn_conv_base = up.Vector(l.attn_conv_base);
+    d.ffn_norm = up.Vector(l.ffn_norm);
+    d.ffn_conv_base = up.Vector(l.ffn_conv_base);
+    h.layers.push_back(d);
+    if (!up.ok) break;
+  }
+  std::string finish_error;
+  const bool finished = stager->Finish(&finish_error);
+  if (!up.ok) return nullptr;
+  if (!finished) {
+    if (error != nullptr) *error = finish_error;
+    return nullptr;
+  }
+  const hipError_t status = hipDeviceSynchronize();
+  if (status != hipSuccess) {
+    if (error != nullptr) *error = std::string("weight upload failed: ") + hipGetErrorString(status);
+    return nullptr;
+  }
+  return m;
+}
+
 }  // namespace gufo::models::ricursive

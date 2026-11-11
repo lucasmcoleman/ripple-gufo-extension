@@ -27,6 +27,9 @@
 #if defined(RICURSIVE_WITH_CPU_BACKEND)
 #include "drafter_engine_cpu.hpp"
 #endif
+#if defined(RICURSIVE_HAVE_GPU_EXECUTOR)
+#include "hip/drafter_gpu.hpp"
+#endif
 
 #if defined(RICURSIVE_HIP_CACHE)
 #include <gufo/ext/component_cache_resources.hpp>
@@ -63,7 +66,11 @@ class State final : public ext::TextRunnerState {
       : session_(&session), adapter_(&adapter), slot_(&slot) {}
   void Invalidate() noexcept override { (void)adapter_->Invalidate(*slot_); }
   [[nodiscard]] ext::TextRunnerMeasuredResources MeasuredResources() const noexcept override {
-    return {.per_request_state_bytes = session_->model().SessionBytes(session_->model().MaxContext()),
+    std::uint64_t drafter_bytes = 0;
+#if defined(ENGINE_ENABLE_HIP)
+    if (drafting_) drafter_bytes = drafting_->engine().DeviceBytes();  // its rings and scratch (0: not tracked)
+#endif
+    return {.per_request_state_bytes = session_->model().SessionBytes(session_->model().MaxContext()) + drafter_bytes,
             .temporary_scratch_bytes = 0};
   }
   [[nodiscard]] Session& session() const { return *session_; }
@@ -206,9 +213,14 @@ class Runner final : public ext::TextModelRunner {
 
   [[nodiscard]] ext::TextRunnerResourceClaim ResourceClaim() const override {
     return {
-        .resident_weights_bytes = model_->reader().GetSize(),
+        // The drafter's weights and, per session, its context rings and scratch (hip/drafter_executor.hpp).
+        .resident_weights_bytes = model_->reader().GetSize() + (speculative_ ? speculative_->reader->GetSize() : 0),
         .state_capacity_bytes = std::nullopt,
-        .per_request_state_bytes = model_->SessionBytes(model_->MaxContext()),
+        .per_request_state_bytes =
+            model_->SessionBytes(model_->MaxContext()) +
+            (speculative_ ? DrafterSessionBytes(speculative_->weights.config, model_->VocabSize(),
+                                                speculative_->drafter_options)
+                          : 0),
         .temporary_scratch_bytes = 0,
         .retained_snapshot_capacity_bytes = ext::HostSnapshotBudgetBytes(),
         .retained_snapshot_ceiling_bytes = ext::HostSnapshotCeilingBytes(),
@@ -432,7 +444,7 @@ void ArmForSpeculation(const SpeculativeSetup& setup, ModelOptions& options) {
 }
 
 bool HaveDrafterEngine() noexcept {
-#if defined(RICURSIVE_WITH_CPU_BACKEND) && defined(ENGINE_ENABLE_HIP)
+#if defined(ENGINE_ENABLE_HIP) && (defined(RICURSIVE_WITH_CPU_BACKEND) || defined(RICURSIVE_HAVE_GPU_EXECUTOR))
   return true;
 #else
   return false;
@@ -440,11 +452,25 @@ bool HaveDrafterEngine() noexcept {
 }
 
 std::unique_ptr<DrafterEngine> MakeDrafterEngine(const SpeculativeSetup& setup, const Model& model) {
+  if (setup.engine_factory) return setup.engine_factory(setup, model);
+  return MakeDefaultDrafterEngine(setup, model);
+}
+
+std::unique_ptr<DrafterEngine> MakeDefaultDrafterEngine(const SpeculativeSetup& setup, const Model& model) {
+#if defined(RICURSIVE_HAVE_GPU_EXECUTOR)
+  if (model.backend().uses_device) {
+    DrafterOptions options = setup.drafter_options;
+    options.kv_type = model.backend().kv_type;
+    options.exact = model.backend().exact;
+    std::string error;
+    auto engine = MakeGpuDrafterEngine(setup.weights, setup.reader, model.weights(), options, &error);
+    if (!engine) throw std::runtime_error("the GPU drafter could not be built: " + error);
+    return engine;
+  }
+#endif
 #if defined(RICURSIVE_WITH_CPU_BACKEND)
   return std::make_unique<CpuDrafterEngine>(setup.weights, model.weights(), setup.engine_faults);
 #else
-  (void)setup;
-  (void)model;
   return nullptr;
 #endif
 }
@@ -503,8 +529,8 @@ std::shared_ptr<ext::TextModelRunner> CreateRicursiveTextRunner(const ext::TextR
   if (drafting) {
     if (!HaveDrafterEngine()) {
       SetError(error,
-               "this build has no drafter implementation (the CPU reference is built with tests only; "
-               "the GPU drafter is not part of this build)");
+               "this build has no drafter implementation (the GPU drafter needs the HIP build with the GPU executor; "
+               "the CPU reference is built with tests only)");
       return nullptr;
     }
     if (options.speculative.draft_model_path.empty()) {
@@ -524,8 +550,11 @@ std::shared_ptr<ext::TextModelRunner> CreateRicursiveTextRunner(const ext::TextR
                                        options.speculative.max_draft_tokens, error);
     if (!speculative) return nullptr;
     ArmForSpeculation(*speculative, model_options);
-    std::cerr << "ricursive: --speculative dflash2 runs the CPU reference drafter (about a second per draft step, tests and "
-                 "tiny models): the output is exact, decoding is slower than without speculation until the GPU drafter exists\n";
+    const auto backend = BackendFromEnvironment(nullptr);
+    if (!backend || !backend->uses_device) {
+      std::cerr << "ricursive: --speculative dflash2 on the CPU backend runs the scalar CPU reference drafter (about a second per "
+                   "draft step, tests and tiny models): the output is exact, decoding is slower than without speculation\n";
+    }
   }
   std::string load_error;
   auto model = Model::Load(options.model_path, model_options, &load_error);

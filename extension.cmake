@@ -203,6 +203,8 @@ endif()
 gufo_extension_target(
   NAME gufo_ricursive_exec
   SOURCES
+    hip/drafter_engine.cpp
+    hip/drafter_executor.cpp
     hip/executor.cpp
     hip/profile.cpp
   LINK_LIBRARIES
@@ -264,8 +266,26 @@ _ricursive_test(speculative TIMEOUT 3000
     gufo_ricursive_reference gufo_ricursive gufo_ext_cache
   ARGS all "${RICURSIVE_STAGE}/perf/stage4")
 
+# The same tests with the drafter executor of docs/DRAFTER-S2.md (host operations) in place of the CPU reference.
+if(TARGET ricursive_speculative_test)
+  add_test(NAME ricursive.speculative_ops
+    COMMAND ricursive_speculative_test "real:tinyA,real:tinyB,runner:tinyA,runner:tinyB" "${RICURSIVE_STAGE}/perf/stage4")
+  set_tests_properties(ricursive.speculative_ops PROPERTIES
+    LABELS "ricursive;cpu" SKIP_RETURN_CODE 77 TIMEOUT 3000
+    ENVIRONMENT "OMP_NUM_THREADS=4;RICURSIVE_TEST_DRAFTER=ops")
+endif()
+
 _ricursive_test(profile
   SOURCES tests/profile_test.cpp LINK_LIBRARIES gufo_ricursive_exec gufo_ricursive)
+
+# The DFlash2 drafter on the operations layer, host ops only (docs/DRAFTER-S2.md): the executor
+# against DrafterReference on the tiny drafters of stages 1 and 2, bookkeeping, twins. The real-weights
+# check (`drafter_ops_test real ...`) is run by hand.
+_ricursive_test(drafter_ops TIMEOUT 1800
+  SOURCES tests/drafter_ops_test.cpp
+  LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec gufo_ricursive_reference
+    gufo_ricursive gufo_ext_cache
+  ARGS tiny "${RICURSIVE_STAGE}/fixtures/tinyB.gguf" "${RICURSIVE_STAGE}/perf")
 
 # GPU side: the S2 kernels (strict floating point, docs/S2-KERNELS.md), the
 # device model and the GPU ops, in their own target on top of
@@ -289,6 +309,7 @@ if(TARGET gufo_ricursive_gpuexec)
   gufo_extension_hip_sources(gufo_ricursive_gpuexec
     SOURCES
       hip/kernels.hip.cpp
+      hip/drafter_kernels.hip.cpp
     OPTIONS -O3 -fno-fast-math -ffp-contract=off
       -Wno-unused-command-line-argument
   )
@@ -449,6 +470,7 @@ endif()
 # them on the link line).
 if(TARGET gufo_ricursive AND TARGET gufo_ricursive_gpuexec)
   target_sources(gufo_ricursive_gpuexec PRIVATE
+    ${GUFO_EXTENSION_BUILD_ROOT}/hip/drafter_gpu.cpp
     ${GUFO_EXTENSION_BUILD_ROOT}/hip/gpu_executor_factory.cpp)
   target_compile_definitions(gufo_ricursive_gpuexec PRIVATE
     RICURSIVE_HAVE_GPU_EXECUTOR=1)
@@ -535,5 +557,18 @@ gufo_extension_target(
 )
 if(TARGET ricursive_kernel_bench)
   set_target_properties(ricursive_kernel_bench PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+# Tool, built on request (docs/DRAFTER-S2.md): ricursive_drafter_bench DRAFTER.gguf TARGET.gguf --dump DIR
+#   [--contexts 500,4096] [--draft 1,2,3,4,6,15] [--steps 20] [--warmup 3] [--kv f16|f32] [--backend gpu|host]
+# Times one draft step and appending context rows on real weights (the target's embedding and output head
+# only). RICURSIVE_PROFILE=1 adds the stage profile. Run on the GPU only through the wrapper (perf/gpu-run.sh).
+gufo_extension_target(
+  NAME ricursive_drafter_bench
+  SOURCES tools/drafter_bench.cpp
+  LINK_LIBRARIES gufo_ricursive gufo_ricursive_hostops gufo_ricursive_exec
+    gufo_ricursive_gpuexec gufo_ext_runtime gufo_ext_core gufo_ext_hip
+)
+if(TARGET ricursive_drafter_bench)
+  set_target_properties(ricursive_drafter_bench PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 # --- integration end ---

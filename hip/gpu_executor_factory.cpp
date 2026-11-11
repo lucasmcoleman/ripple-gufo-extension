@@ -109,6 +109,17 @@ bool GpuMemoryUsage(std::size_t* used_bytes, std::size_t* total_bytes, std::stri
   return true;
 }
 
+std::shared_ptr<const DeviceModel> AcquireGpuTargetModel(const ModelWeights& weights, std::string* error) {
+  try {
+    std::shared_ptr<SharedModel> shared = Acquire(weights, error);
+    if (!shared) return nullptr;
+    return std::shared_ptr<const DeviceModel>(shared, shared->device.get());
+  } catch (const std::exception& e) {
+    SetError(error, std::string("GPU executor: ") + e.what());
+  }
+  return nullptr;
+}
+
 std::unique_ptr<Executor> CreateGpuExecutor(const ModelWeights& weights,
                                             const ExecutorConfig& config,
                                             std::string* error) {

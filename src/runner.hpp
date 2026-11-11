@@ -2,6 +2,7 @@
 #define RICURSIVE_RUNNER_HPP_
 
 #include <chrono>
+#include <functional>
 #include <gufo/ext/options.hpp>
 #include <gufo/ext/text.hpp>
 #include <memory>
@@ -13,6 +14,7 @@
 #include "drafter_weights.hpp"
 #include "engine.hpp"
 #include "speculative_target.hpp"
+#include "hip/drafter_executor.hpp"
 
 namespace gufo::models::ricursive {
 
@@ -37,7 +39,11 @@ struct SpeculativeSetup {
   DrafterWeights weights;
   std::uint32_t max_draft_tokens{4};
   DraftBackendFaults faults;  ///< tests only
-  DrafterFaults engine_faults;  ///< tests only
+  DrafterFaults engine_faults;  ///< tests only (the CPU reference's)
+  /// The drafter engine's options (context storage follows the model's cache type: F32 in exact test mode).
+  DrafterOptions drafter_options;
+  /// Tests only: builds the session's drafter engine instead of MakeDrafterEngine's choice.
+  std::function<std::unique_ptr<DrafterEngine>(const SpeculativeSetup&, const Model&)> engine_factory;
 };
 
 /// Opens and validates the drafter GGUF against the target. Null and *error on failure.
@@ -49,12 +55,17 @@ struct SpeculativeSetup {
 /// Applies what drafting needs to the model options (verify rows, the drafter's tap layers).
 void ArmForSpeculation(const SpeculativeSetup& setup, ModelOptions& options);
 
-/// Whether this build has a drafter implementation (the CPU reference, tests and tiny models
-/// only, until the GPU drafter exists).
+/// Whether this build has a drafter implementation: the GPU drafter on a HIP build with the GPU
+/// executor (production), the scalar CPU reference in a test build (tiny models only).
 [[nodiscard]] bool HaveDrafterEngine() noexcept;
-/// One drafter engine for a session of `model`; nullptr when the build has none.
+/// One drafter engine for a session of `model`: `setup.engine_factory` when set, else the GPU
+/// drafter when the model runs on the device, else the CPU reference; nullptr when the build has none.
+/// A GPU engine that cannot be built throws std::runtime_error naming the cause.
 [[nodiscard]] std::unique_ptr<DrafterEngine> MakeDrafterEngine(const SpeculativeSetup& setup,
                                                               const Model& model);
+/// MakeDrafterEngine without the factory: the GPU drafter for a model that runs on the device, else the CPU reference.
+[[nodiscard]] std::unique_ptr<DrafterEngine> MakeDefaultDrafterEngine(const SpeculativeSetup& setup,
+                                                                     const Model& model);
 
 /// The serving runner over an already loaded model (CreateRicursiveTextRunner and tests).
 /// With `speculative` the model must have been armed (ArmForSpeculation).

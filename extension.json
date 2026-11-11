@@ -44,7 +44,7 @@
       "type": "path",
       "commands": ["serve", "bench", "prompt"],
       "providers": ["ricursive"],
-      "help": "DFlash2 draft model path for speculative decoding (ricursive: CPU reference drafter, tests and tiny models only until the GPU drafter exists)"
+      "help": "DFlash2 draft model path for speculative decoding (ricursive: the drafter runs on the GPU; with RICURSIVE_BACKEND=cpu the scalar CPU reference, tiny models only)"
     },
     {
       "name": "--allow-chat-template-mismatch",
@@ -285,6 +285,19 @@
     },
     "ricursive_drafter_cpu_test": {
       "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_drafter_ops_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_drafter_bench": {
+      "requires": [
+        "hip",
         "testing"
       ],
       "role": "test"

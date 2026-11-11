@@ -19,6 +19,7 @@
 #include <memory>
 #include <string>
 
+#include "hip/device_model.hpp"
 #include "src/weights.hpp"
 
 namespace gufo::models::ricursive {
@@ -30,6 +31,12 @@ namespace gufo::models::ricursive {
 /// on it exists, and holds no strong reference otherwise.
 void RegisterGpuWeightsReader(const ModelWeights& weights,
                               std::shared_ptr<const core::GgufReader> reader);
+
+/// The uploaded copy of `weights` (uploading it when no executor holds it yet), shared with the
+/// executors; nullptr and *error when the weights were not registered or the upload fails. The
+/// drafter takes the output head from it.
+[[nodiscard]] std::shared_ptr<const DeviceModel> AcquireGpuTargetModel(const ModelWeights& weights,
+                                                                       std::string* error);
 
 /// Number of uploaded device models that are currently alive (one per model
 /// whose weights are resident, however many executors share them).

@@ -25,9 +25,11 @@
 #include <cstdint>
 #include <cstring>
 #include <gufo/ext/gguf_reader.hpp>
+#include <memory>
 #include <span>
 #include <vector>
 
+#include "hip/dequant_math.hpp"
 #include "hip/embed.hpp"
 #include "hip/kernels_math.hpp"
 #include "src/config.hpp"
@@ -197,7 +199,103 @@ class Ops {
   virtual void GatherRows(const float* src, const std::int32_t* ids,
                           float* dst, std::uint32_t n_ids,
                           std::uint32_t src_rows, std::uint32_t dim) = 0;
+
+  // ---- the drafter's operations (docs/DRAFTER-S2.md) --------------------
+  // Additions for the DFlash2 drafter (hip/drafter_executor.cpp); the target's
+  // executor never calls them. Their GPU kernels are hip/drafter_kernels.hip.cpp,
+  // adapted from gufo's Qwen DFlash kernels; the host versions below use the same
+  // loop bounds, indexing and parameter names. Any head_dim up to 256 (the target's
+  // operators are written for 128 only).
+
+  /// Per-head RMSNorm of q [tokens][heads][head_dim] (in place) and k
+  /// [tokens][kv_heads][head_dim] (k is not modified), optional NeoX RoPE on both at
+  /// positions start_pos + t (`rope`: float32 frequencies theta^(-2i/head_dim), as the
+  /// drafter reference computes them), then the rows of k (normed, rotated) and v (raw)
+  /// are stored into k_store / v_store: [capacity][kv_heads * head_dim] elements of
+  /// `type`, row t into slot (slot_start + t) % capacity. heads == 0: no query rows
+  /// (q may be null). tokens <= capacity.
+  virtual void DraftQkNormRope(float* q, const float* k, const float* v,
+                               const float* q_gamma, const float* k_gamma,
+                               void* k_store, void* v_store, KvType type,
+                               std::uint32_t tokens, std::uint32_t heads,
+                               std::uint32_t kv_heads, std::uint32_t head_dim,
+                               float eps, std::uint32_t start_pos,
+                               std::uint32_t slot_start,
+                               std::uint32_t capacity, bool rope,
+                               float theta) = 0;
+  /// Non-causal attention of `tokens` block rows (positions anchor + t) over the context
+  /// rows [ctx_first, anchor) held in the ring k_ctx / v_ctx (position j in slot
+  /// j % ctx_capacity, elements of `type`) followed by the block's own rows k_blk / v_blk
+  /// ([tokens][kv_heads * head_dim] fp32, row i at position anchor + i). `window` == 0:
+  /// every key; else key j is visible to the query at p iff |p - j| < window. Query head
+  /// h reads KV head h / (heads / kv_heads). out [tokens][heads * head_dim], no overlap
+  /// with q. Softmax and the output sum in fp32 (GPU) / double (host).
+  virtual void DraftAttention(const float* q, const void* k_ctx,
+                              const void* v_ctx, KvType type,
+                              std::uint32_t ctx_capacity,
+                              std::uint32_t ctx_first, std::uint32_t anchor,
+                              const float* k_blk, const float* v_blk,
+                              float* out, std::uint32_t tokens,
+                              std::uint32_t heads, std::uint32_t kv_heads,
+                              std::uint32_t head_dim, std::uint32_t window,
+                              float scale) = 0;
+  /// The grouped dynamic causal convolution over the rows of one block:
+  /// out[t][c] (+)= sum over taps o < kernel_size, t >= o, of
+  /// (base[side*kernel_size + o][c] + dyn[t][side*kernel_size*G + o*G + c / group_size]) *
+  /// in[t - o][c], G = hidden_size / group_size, dyn rows 2 * kernel_size * G wide. Rows
+  /// before the block start are zero, never read. `accumulate`: output += sum, not = sum.
+  /// output may alias neither input nor dynamic_coefficients unless accumulate.
+  virtual void DynamicConv(const float* input, const float* dynamic_coefficients,
+                           const float* base_kernel, float* output,
+                           std::uint32_t num_tokens, std::uint32_t hidden_size,
+                           std::uint32_t kernel_size, std::uint32_t group_size,
+                           std::uint32_t side, bool accumulate) = 0;
+  /// gate[i] = silu(gate[i]) * up[i], no clamp.
+  virtual void SiluMul(float* gate, const float* up,
+                       std::uint32_t total_elements) = 0;
+  /// The candidate selector (top-k up to 32, the walk left to right). logits
+  /// [rows][vocab_size], projected_hidden [rows][selector_rank]. tokens: [rows + 1] int32;
+  /// tokens[0] is the anchor token (the first predecessor), written by the caller;
+  /// tokens[1 + r] receives row r's choice. For row r the candidates are the selector_top_k
+  /// largest logits (candidate_ids [rows][top_k], by descending logit, equal logits by
+  /// ascending id), score_k = logit_k + sum_i (pred[prev][i] * hidden[r][i]) * succ[id_k][i]
+  /// (candidate_scores [rows][top_k]), the choice the largest score (the first on ties),
+  /// prev = the previous row's choice. The codebooks are [vocab][selector_rank] matrices of
+  /// F32, BF16, Q8_0 or Q4_K. partial_scores / partial_ids: scratch of
+  /// rows * DraftSelectPartials(vocab_size) * selector_top_k elements.
+  virtual void DraftSelect(const float* logits, const float* projected_hidden,
+                           const WeightView& predecessor_codebook,
+                           const WeightView& successor_codebook,
+                           std::int32_t* tokens, float* candidate_scores,
+                           std::int32_t* candidate_ids, float* partial_scores,
+                           std::int32_t* partial_ids, std::uint32_t rows,
+                           std::uint32_t vocab_size,
+                           std::uint32_t selector_rank,
+                           std::uint32_t selector_top_k) = 0;
 };
+
+/// Test-only deliberate defects of the host operations (docs/DRAFTER-S2.md, the twins).
+struct HostOpsOptions {
+  bool lenient_capacity{false};   ///< see HostOpsExecutor::Options
+  bool poison_memory{true};       ///< see HostOpsExecutor::Options
+  /// DynamicConv reads the rows of the block's end for taps that reach before its start
+  /// (a cyclic buffer instead of zero padding).
+  bool conv_across_block_start{false};
+};
+/// A host operations object (ops_host.cpp) / a GPU one on its own stream (ops_gpu.cpp, HIP builds).
+[[nodiscard]] std::unique_ptr<Ops> CreateHostOps(const HostOpsOptions& options = {});
+[[nodiscard]] std::unique_ptr<Ops> CreateGpuOps();
+
+/// The DequantAt encoding of a matrix type (Enc::kNone: not usable as a selector codebook).
+[[nodiscard]] inline rocm::Enc EncodingOf(core::GgmlType type) noexcept {
+  switch (type) {
+    case core::GgmlType::kF32: return rocm::Enc::kF32;
+    case core::GgmlType::kBF16: return rocm::Enc::kBF16;
+    case core::GgmlType::kQ8_0: return rocm::Enc::kQ8_0;
+    case core::GgmlType::kQ4_K: return rocm::Enc::kQ4_K;
+    default: return rocm::Enc::kNone;
+  }
+}
 
 }  // namespace gufo::models::ricursive
 
