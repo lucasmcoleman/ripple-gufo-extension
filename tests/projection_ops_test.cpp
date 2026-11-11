@@ -673,10 +673,11 @@ void RunShape(Backend& b, const ShapeCase& c, const Options& opt) {
   std::cout << name << ": done in " << secs << " s" << (secs > 20 ? "  WARNING: over the 20 s budget" : "") << "\n";
 }
 
-/// Routing cases of the 1-row long-K Q4_K/Q5_K path (project.cpp sends K >= 16384 to the staged small-batch
-/// kernel). M = 47 is fewer rows than one 48-row block of that kernel, M = 5123 leaves a partial last block;
-/// K = 16640 is 16 full stages plus a partly filled one, 16384 is exactly the routing threshold, 16128 is just
-/// below it (stays on the GEMV).
+/// Routing cases of the 1-row Q4_K/Q5_K path (project.cpp sends every such row to the staged small-batch
+/// kernel, 4 waves x 2 rows = 8 rows per block, 128 sub-blocks per stage). M = 47 and 5123 leave partial last
+/// blocks (47 is less than one 48-row block of the earlier 16x3 geometry), K = 16640 is 32 full stages plus a
+/// partly filled one, 16384 is exactly 32 stages, 16128 is just short of them. (Originally written for a K >= 16384
+/// threshold; the threshold is gone, the shapes still cover the stage boundaries.)
 std::vector<ShapeCase> RouteCases() {
   std::vector<ShapeCase> cases;
   for (GgmlType t : {GgmlType::kQ4_K, GgmlType::kQ5_K}) {

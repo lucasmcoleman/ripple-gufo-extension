@@ -67,6 +67,12 @@ void LaunchBatchedQuantGEMMFp32(core::GgmlType type, const void* w,
     core::GgmlType type, const void* w, const float* fp32_x, float* y,
     std::size_t batch, std::size_t m, std::size_t k,
     hipStream_t stream = nullptr);
+/// One row (batch 1) of a Q4_K or Q5_K projection with the staged small-batch kernel: 4 waves, 2 rows per
+/// wave, 4 activation tiles per stage. Every output equals LaunchGEMV bit for bit; the input vector must be
+/// 16-byte aligned. Returns false without launching for other types or when 32-bit indexing does not fit.
+[[nodiscard]] bool LaunchKQuantSingleRow(core::GgmlType type, const void* w, const float* fp32_x,
+                                         float* y, std::size_t m, std::size_t k,
+                                         hipStream_t stream = nullptr);
 /// Quantizes FP32 activation tensor X[B, K] to tiled block_q8_1 activation
 /// blocks.
 void LaunchQuantizeActivationQ8_1FromFp32(const float* fp32_x, void* q8_1_out,

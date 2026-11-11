@@ -134,12 +134,14 @@ void Dispatch(const DeviceTensor& w, const float* x, int rows, float* y, Scratch
   // else (one pointer test) falls back to the GEMV, which has no alignment requirement. Defensive: with the
   // test removed, a misaligned x still gave identical bits on this gfx1151 (tests route_*), so the test case
   // does not prove the guard is needed, only that the fallback path is bit-equal.
-  // Long-K Q4_K/Q5_K rows (ffn_down): the single-row GEMV re-reads the whole activation vector from L2
-  // for every row; the small-batch kernel at batch 1 stages it in LDS and is bit-equal to the GEMV
-  // (same per-lane order). Measured +22..25 % on 5120x40960; Q6_K was slower there and stays on the GEMV.
-  if ((w.type == GgmlType::kQ4_K || w.type == GgmlType::kQ5_K) && k >= 16384 &&
+  // Q4_K/Q5_K rows (attn_q/gate, ffn_gate/up/down): the single-row GEMV re-reads the activation vector from
+  // L1/L2 for every weight row; the small-batch kernel at batch 1 stages it in LDS once per block and is
+  // bit-equal to the GEMV (same per-lane order). Geometry picked by micro-benchmark (docs/PERF-KERNELS.md):
+  // faster than the GEMV on every Q4_K/Q5_K shape of the model, so the rule depends on the type only.
+  // Q6_K spills in this kernel and Q8_0 gained nothing: both stay on the GEMV.
+  if ((w.type == GgmlType::kQ4_K || w.type == GgmlType::kQ5_K) &&
       reinterpret_cast<std::uintptr_t>(x) % 16 == 0 &&
-      ggml::LaunchKQuantSmallBatchDoubleStage(w.type, w.data, x, y, 1, m, k, stream)) {
+      ggml::LaunchKQuantSingleRow(w.type, w.data, x, y, m, k, stream)) {
     return;
   }
   ggml::LaunchGEMV(w.data, w.type, x, y, m, k, stream);

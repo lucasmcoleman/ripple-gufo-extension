@@ -155,7 +155,8 @@ void RunProjection(const std::string& tname, int M, int K, int reps) {
   else { std::fprintf(stderr, "unknown type %s\n", tname.c_str()); std::exit(1); }
   const std::size_t row_bytes = (static_cast<std::size_t>(K) / qk) * block_bytes;
   const std::size_t bytes = row_bytes * static_cast<std::size_t>(M);
-  const int copies = bytes > (96u << 20) ? 3 : 6;
+  // Enough distinct copies (>= ~192 MB) that the weights are not warm in the 32 MB infinity cache.
+  const int copies = static_cast<int>(std::max<std::size_t>(3, std::min<std::size_t>(40, (192u << 20) / bytes)));
   Rng rng{0x1234567ULL + static_cast<std::uint64_t>(M) * 31 + K};
   std::vector<std::uint8_t> host(bytes + k::kWeightTailBytes, 0);
   std::vector<const void*> w(copies);
@@ -227,6 +228,7 @@ int main(int argc, char** argv) {
     }
     RunProjection("q4k", 10240, 5120, 40);
     RunProjection("q8_0", 1024, 5120, 40);
+    RunProjection("q6k", 10240, 5120, 40);
   } else {
     std::fprintf(stderr, "bad arguments\n");
     return 1;

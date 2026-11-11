@@ -752,6 +752,27 @@ bool LaunchKQuantSmallBatchDoubleStage(core::GgmlType type, const void* w,
   return true;
 }
 
+bool LaunchKQuantSingleRow(core::GgmlType type, const void* w, const float* fp32_x, float* y,
+                           std::size_t m, std::size_t k, hipStream_t stream) {
+  if ((type != core::GgmlType::kQ4_K && type != core::GgmlType::kQ5_K) || m == 0 || k == 0 ||
+      k > std::numeric_limits<std::uint32_t>::max() ||
+      m > std::numeric_limits<std::uint32_t>::max() / quant::QuantizedRowBytes(type, k)) {
+    // 32-bit device indexing, as in LaunchKQuantSmallBatchDoubleStage.
+    return false;
+  }
+  constexpr std::uint32_t kWaves = 4;
+  constexpr std::size_t kRows = 2;
+  const dim3 grid(static_cast<unsigned>((m + kWaves * kRows - 1) / (kWaves * kRows)));
+  if (type == core::GgmlType::kQ4_K) {
+    SmallBatchKQuantExactFp32GEMMKernel<kWaves, 1, kRows, core::GgmlType::kQ4_K, 4, 12, true>
+        <<<grid, kWaves * 32, 0, stream>>>(w, fp32_x, y, m, k);
+  } else {
+    SmallBatchKQuantExactFp32GEMMKernel<kWaves, 1, kRows, core::GgmlType::kQ5_K, 4, 12, true>
+        <<<grid, kWaves * 32, 0, stream>>>(w, fp32_x, y, m, k);
+  }
+  return true;
+}
+
 bool LaunchQ8_0SmallBatchWide(const void* w, const float* fp32_x, float* y,
                               std::size_t batch, std::size_t m, std::size_t k,
                               hipStream_t stream) {
