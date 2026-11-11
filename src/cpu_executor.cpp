@@ -110,6 +110,24 @@ void CpuExecutor::DoForward(std::span<const std::int32_t> tokens,
   const Config& c = ref_.weights().config;
   const std::size_t n = tokens.size(), Q = c.QueryWidth(), KV = info.kv_width;
   const std::uint32_t p0 = first_position;
+  // Capture (off unless the caller gave a buffer): the layer outputs are the
+  // Reference's own "l_out" taps, copied into [tap][row][hidden]. With capture
+  // off the caller's tap is passed on untouched.
+  const std::span<float> capture = Capture();
+  const Tap capture_tap =
+      capture.empty()
+          ? tap
+          : Tap([&](std::string_view name, int layer, const float* data,
+                    std::size_t rows, std::size_t width) {
+              if (name == "l_out") {
+                for (std::size_t k = 0; k < info.capture_layers.size(); ++k) {
+                  if (static_cast<int>(info.capture_layers[k]) == layer) {
+                    std::copy_n(data, rows * width, capture.data() + k * rows * width);
+                  }
+                }
+              }
+              if (tap) tap(name, layer, data, rows, width);
+            });
   std::vector<float> x0;
   std::vector<float> h = (ref_.*Get(EmbedTag{}))(tokens, &x0);
   if (tap) tap("embd_scaled", -1, h.data(), n, c.embedding_length);
@@ -139,7 +157,7 @@ void CpuExecutor::DoForward(std::span<const std::int32_t> tokens,
       }
     };
     (ref_.*Get(LayerTag{}))(il, n, chunk_local_rope_ ? 0 : p0, h, x0, v_layer0,
-                            attend, tap);
+                            attend, capture_tap);
   }
   if (which == LogitRows::kNone) return;
   const auto out = (ref_.*Get(HeadTag{}))(h, n, which == LogitRows::kLast, tap);

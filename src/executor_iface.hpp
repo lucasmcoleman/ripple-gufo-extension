@@ -59,6 +59,9 @@ using Tap = std::function<void(std::string_view name, int layer,
   return window + max_rows - 1;
 }
 
+/// Most layers one executor can capture (the DFlash2 drafter reads five).
+inline constexpr std::size_t kMaxCaptureLayers = 5;
+
 struct ExecutorConfig {
   std::uint32_t max_context{0};     ///< positions; the runner's context cap
   std::uint32_t max_rows{0};        ///< tokens per Forward
@@ -66,6 +69,12 @@ struct ExecutorConfig {
   std::uint32_t ring_rows{0};       ///< sliding-layer slots; 0 = MinRingRows
   KvType kv_type{KvType::kF16};     ///< kF32: exact test mode
   bool exact{false};  ///< no activation rounding at any width (test mode)
+  /// Hidden-state capture (docs/DRAFTER-STAGE0.md): zero-based
+  /// layers, at most kMaxCaptureLayers, distinct, each below the layer count,
+  /// whose output (`l_out`, the residual stream after the layer, before the
+  /// final norm) a Forward copies to the caller's `capture` buffer. Empty = off
+  /// (the default): nothing is allocated and no Forward does any extra work.
+  std::vector<std::uint32_t> capture_layers;
 };
 
 struct ExecutorInfo {
@@ -84,6 +93,10 @@ struct ExecutorInfo {
   /// activations (GPU W8A8 prefill above 16 rows). Equals max_rows when
   /// config.exact is set or the backend never rounds.
   std::uint32_t batch_invariant_rows{0};
+  /// ExecutorConfig::capture_layers, validated (empty = capture off), and the
+  /// model's hidden width, the size of one captured row.
+  std::vector<std::uint32_t> capture_layers;
+  std::uint32_t hidden{0};
 
   /// Bytes of one exported K or V row: kv_width values of kv_type, layout
   /// [kv_head][head_dim], K after q/k-norm and RoPE, V as projected.
@@ -142,9 +155,16 @@ public:
   /// K/V rows in every layer. first_position must equal Position(); 1 <= rows
   /// <= max_rows; Position() + rows <= max_context. `logits` must hold
   /// exactly 0 (kNone), vocab (kLast) or rows * vocab (kAll) floats.
+  /// `capture` is empty (no capture, always allowed) or, when the executor was
+  /// configured with capture_layers, exactly capture_layers.size() * rows *
+  /// hidden floats, laid out [tap k][row t][hidden]: slot k holds the output of
+  /// layer capture_layers[k] for every row of this pass (float32, as the layer
+  /// leaves it). A capture buffer on an executor without capture_layers, or of
+  /// the wrong size, is refused before anything changes.
   void Forward(std::span<const std::int32_t> tokens,
                std::uint32_t first_position, LogitRows which,
-               std::span<float> logits, const Tap& tap = {});
+               std::span<float> logits, const Tap& tap = {},
+               std::span<float> capture = {});
 
   /// Moves Position() back to `position` (<= Position(), else
   /// invalid_argument). Returns false, changing nothing, when a sliding layer
@@ -185,6 +205,10 @@ protected:
   /// Throws std::invalid_argument for a ring below MinRingRows.
   explicit Executor(ExecutorInfo info, LedgerFault fault = LedgerFault::kNone);
 
+  /// The capture buffer of the Forward in progress (empty when none): see
+  /// Forward. Valid only inside DoForward.
+  [[nodiscard]] std::span<float> Capture() const noexcept { return capture_; }
+
   /// Arguments are validated. Write the K/V rows of every position in every
   /// layer (sliding: slot position % ring_rows; full: slot position) before
   /// any query reads them; write nothing else. Sliding query q reads
@@ -205,6 +229,7 @@ private:
 
   ExecutorInfo info_;
   LedgerFault fault_;
+  std::span<float> capture_;  ///< set by Forward around DoForward
   ExecState state_{ExecState::kReady};
   std::uint32_t end_{0};    ///< logical end
   std::uint32_t high_{0};   ///< high water: largest position written + 1

@@ -109,6 +109,8 @@ class OpsExecutor : public Executor {
   std::shared_ptr<const void> keep_alive_;
   ExecFaults faults_;
   bool exact_;
+  std::vector<std::int8_t> capture_slot_;  ///< per layer: capture slot, -1 = none (empty when capture is off)
+  bool capture_active_{false};             ///< the Forward in progress has a capture buffer
   std::unique_ptr<profile::StageProfile> prof_;  ///< null unless RICURSIVE_PROFILE=1
   std::uint64_t profile_reported_{0};            ///< passes already in a ProfileReport()
   std::unique_ptr<Buffers> buf_;  ///< destroyed before ops_ (declared after)

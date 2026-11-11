@@ -230,6 +230,19 @@
       ],
       "role": "test"
     },
+    "ricursive_dump_taps": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
+    },
+    "ricursive_capture_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
     "ricursive_kernel_bench": {
       "requires": [
         "hip",

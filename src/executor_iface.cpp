@@ -69,6 +69,21 @@ ExecutorInfo ExecutorInfo::Make(const Config& model,
       config.exact ? config.max_rows
                    : std::clamp<std::uint32_t>(batch_invariant_rows, 1,
                                                config.max_rows);
+  Refuse(config.capture_layers.size() > kMaxCaptureLayers,
+         "capture_layers has " + std::to_string(config.capture_layers.size()) +
+             " entries, at most " + std::to_string(kMaxCaptureLayers));
+  for (std::size_t i = 0; i < config.capture_layers.size(); ++i) {
+    const std::uint32_t layer = config.capture_layers[i];
+    Refuse(layer >= model.block_count,
+           "capture layer " + std::to_string(layer) + " out of range (the model has " +
+               std::to_string(model.block_count) + " layers)");
+    for (std::size_t j = 0; j < i; ++j) {
+      Refuse(config.capture_layers[j] == layer,
+             "capture layer " + std::to_string(layer) + " listed twice");
+    }
+  }
+  info.capture_layers = config.capture_layers;
+  info.hidden = model.embedding_length;
   return info;
 }
 
@@ -122,7 +137,8 @@ WritePlan Executor::PlanForward(std::uint32_t rows) const {
 
 void Executor::Forward(std::span<const std::int32_t> tokens,
                        std::uint32_t first_position, LogitRows which,
-                       std::span<float> logits, const Tap& tap) {
+                       std::span<float> logits, const Tap& tap,
+                       std::span<float> capture) {
   RequireReady("Forward");
   const auto rows = static_cast<std::uint32_t>(tokens.size());
   Refuse(first_position != end_,
@@ -146,17 +162,31 @@ void Executor::Forward(std::span<const std::int32_t> tokens,
                                     std::to_string(logits.size()) +
                                     " floats, expected " +
                                     std::to_string(want));
+  if (!capture.empty()) {
+    Refuse(info_.capture_layers.empty(),
+           "a capture buffer was given but the executor has no capture_layers");
+    const std::size_t need =
+        info_.capture_layers.size() * std::size_t{rows} * info_.hidden;
+    Refuse(capture.size() != need,
+           "capture buffer has " + std::to_string(capture.size()) +
+               " floats, expected " + std::to_string(need) + " (" +
+               std::to_string(info_.capture_layers.size()) + " layers x " +
+               std::to_string(rows) + " rows x " + std::to_string(info_.hidden) + ")");
+  }
   // Invariant (kept by Rewind and CommitImport): the keys the first row
   // reads are retained.
   if (info_.WindowFirst(end_) < end_ && info_.WindowFirst(end_) < RetainedBegin())
     throw std::logic_error("ricursive executor: window before the position "
                            "is not retained");
+  capture_ = capture;
   try {
     DoForward(tokens, first_position, which, logits, tap);
   } catch (...) {
+    capture_ = {};
     if (fault_ != LedgerFault::kFailureKeepsReady) state_ = ExecState::kFailed;
     throw;
   }
+  capture_ = {};
   end_ += rows;
   high_ = std::max(high_, end_);
 }

@@ -230,6 +230,13 @@ _ricursive_test(executor_host TIMEOUT 1800
   LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
     gufo_ricursive_reference gufo_ricursive)
 
+# Hidden-state capture (docs/DRAFTER-STAGE0.md): host ops and the scalar CPU
+# executor on the tiny fixtures.
+_ricursive_test(capture TIMEOUT 1800
+  SOURCES tests/capture_test.cpp tests/executor_backends_host.cpp
+  LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
+    gufo_ricursive_reference gufo_ricursive)
+
 # Per-stage timing accumulator and report (docs/PERF-PROFILE.md), fake clock.
 _ricursive_test(profile
   SOURCES tests/profile_test.cpp LINK_LIBRARIES gufo_ricursive_exec gufo_ricursive)
@@ -454,6 +461,21 @@ gufo_extension_target(
 )
 if(TARGET ricursive_decode_bench)
   set_target_properties(ricursive_decode_bench PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+# Tool, built on request (docs/DRAFTER-STAGE0.md): ricursive_dump_taps MODEL.gguf
+#   --tokens FILE.i32 --prompt-tokens P --generate G --out DIR [--backend cpu|host|gpu]
+#   [--layers a,b,c,d,e] [--rows R] [--context-cap N]
+# Greedy generation with logits-row hashes, then a re-evaluation of prompt and
+# output (generated part in 16-row passes) that saves the captured layer
+# outputs and the logits-row hashes. The drafter kill experiment's input.
+gufo_extension_target(
+  NAME ricursive_dump_taps
+  SOURCES tools/dump_taps.cpp
+  LINK_LIBRARIES gufo_ricursive gufo_ricursive_hostops gufo_ricursive_exec
+    gufo_ricursive_gpuexec gufo_ext_runtime gufo_ext_core gufo_ext_hip
+)
+if(TARGET ricursive_dump_taps)
+  set_target_properties(ricursive_dump_taps PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 # Tool, built on request: synthetic-tensor timing of the attention and projection kernels
 # (docs/PERF-KERNELS.md). Run only through the GPU wrapper.

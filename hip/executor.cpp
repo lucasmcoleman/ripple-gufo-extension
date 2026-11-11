@@ -84,6 +84,7 @@ struct OpsExecutor::Buffers {
   float *x0{}, *h{}, *a{}, *vin{}, *q{}, *k{}, *v{}, *o{}, *gate{}, *branch{},
       *f{}, *g{}, *u{}, *hg{}, *hn{}, *logits{};
   std::int32_t* ids{};
+  float* cap{};  ///< capture slots [tap][max_rows][hidden]; null when capture is off
   std::vector<void*> kc, vc;  ///< per layer K and V caches
   // Tap-only scratch, allocated on the first tapped Forward.
   float *tq{}, *tkv{}, *te{}, *ones{};
@@ -130,6 +131,13 @@ OpsExecutor::OpsExecutor(std::unique_ptr<Ops> ops, const ModelHandles& model,
   b.hn = b.Take(L * E);
   b.logits = b.Take(L * info.vocab);
   b.ids = b.Take<std::int32_t>(L);
+  if (!info.capture_layers.empty()) {
+    b.cap = b.Take(info.capture_layers.size() * M * E);
+    capture_slot_.assign(info.layers, -1);
+    for (std::size_t k = 0; k < info.capture_layers.size(); ++k) {
+      capture_slot_[info.capture_layers[k]] = static_cast<std::int8_t>(k);
+    }
+  }
   const std::size_t row_bytes = info.RowBytes();
   b.kc.resize(info.layers);
   b.vc.resize(info.layers);
@@ -347,6 +355,12 @@ void OpsExecutor::Layer(std::uint32_t il, std::uint32_t n, std::uint32_t p0,
   ops.ResidualPostNorm(b.h, b.branch, post_ffn, n, E, eps);
   Lap(il, LayerStage::kPostFfnResidual);
   Emit(tap, "l_out", il_tap, b.h, n, E);
+  if (capture_active_ && capture_slot_[il] >= 0) {
+    // Capture: one device-side copy of the n rows into this layer's slot.
+    ops.CopyInternal(b.cap + std::size_t{static_cast<std::uint8_t>(capture_slot_[il])} *
+                                 info.max_rows * E,
+                     b.h, std::size_t{n} * E * sizeof(float));
+  }
 }
 
 // ---- one forward -----------------------------------------------------------
@@ -361,6 +375,8 @@ void OpsExecutor::Run(std::span<const std::int32_t> tokens, std::uint32_t p0,
   const auto n = static_cast<std::uint32_t>(tokens.size());
   const std::uint32_t E = c.embedding_length;
   const std::size_t row_bytes = std::size_t{n} * E * sizeof(float);
+  const std::span<float> capture = Capture();
+  capture_active_ = !capture.empty();
 
   // x0 = embed * embedding_scale, kept for every layer's value mix; h starts
   // as the same row and becomes the residual stream.
@@ -398,6 +414,13 @@ void OpsExecutor::Run(std::span<const std::int32_t> tokens, std::uint32_t p0,
     }
     ops.CopyOut(logits.data(), b.logits, logits.size() * sizeof(float));
     Lap(profile::PassStage::kLogitsReadback);
+  }
+  if (capture_active_) {
+    // Read the slots back (CopyOut waits for everything enqueued before it).
+    for (std::size_t k = 0; k < info.capture_layers.size(); ++k) {
+      ops.CopyOut(capture.data() + k * n * E, b.cap + k * info.max_rows * E, row_bytes);
+    }
+    capture_active_ = false;
   }
   ops.Synchronize();
   if (prof_) prof_->EndPass();
