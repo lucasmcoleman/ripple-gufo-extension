@@ -16,7 +16,7 @@ mkdir -p "$ROOT/helpers"
 for bin in ricursive_kernel_ops_test ricursive_attention_ops_test ricursive_projection_ops_test \
            ricursive_embed_test ricursive_executor_gpu_test ricursive_executor_contract_gpu_test \
            ricursive_engine_test ricursive_continuation_test ricursive_draft_session_test \
-           ricursive_speculative_test; do
+           ricursive_speculative_test ricursive_drafter_ops_test; do
   cat >"$ROOT/bin/$bin" <<'FAKE'
 #!/usr/bin/env bash
 me="$(basename "$0") $* ${RICURSIVE_CONTRACT_BACKEND:-} ${RICURSIVE_TEST_BACKEND:-}"
@@ -59,9 +59,9 @@ run() {  # extra env assignments as arguments; output to $ROOT/last.txt, exit co
 row() { grep -E "^$1 +$2 " "$ROOT/last.txt"; }
 
 run
-check "all pass: exit 0, 82 PASS rows" '[ $RC -eq 0 ] && [ "$(grep -cE " PASS +[0-9.]+  ?" "$ROOT/last.txt")" -ge 82 ] && ! grep -E "^[a-z_]+ +[A-Za-z0-9_:.-]+ +(FAIL|NOT-RUN|LOCKED|SKIP)" "$ROOT/last.txt" | grep -q .'
-check "all pass: one wrapper call per invocation (82)" '[ "$(wc -l <"$CALLS")" -eq 82 ]'
-check "all pass: one log per invocation + summary" '[ "$(ls "$(ls -d "$ROOT"/out/* | tail -1)" | wc -l)" -eq 83 ]'
+check "all pass: exit 0, 92 PASS rows" '[ $RC -eq 0 ] && [ "$(grep -cE " PASS +[0-9.]+  ?" "$ROOT/last.txt")" -ge 92 ] && ! grep -E "^[a-z_]+ +[A-Za-z0-9_:.-]+ +(FAIL|NOT-RUN|LOCKED|SKIP)" "$ROOT/last.txt" | grep -q .'
+check "all pass: one wrapper call per invocation (92)" '[ "$(wc -l <"$CALLS")" -eq 92 ]'
+check "all pass: one log per invocation + summary" '[ "$(ls "$(ls -d "$ROOT"/out/* | tail -1)" | wc -l)" -eq 93 ]'
 
 run FAKE_FAIL='kernel_ops'
 check "kernel_ops FAIL: exit 1" '[ $RC -eq 1 ]'
@@ -88,7 +88,7 @@ check "embed SKIP(77): exit 2, executor_test NOT-RUN" '[ $RC -eq 2 ] && row embe
 run FAKE_LOCK_REFUSE='.'
 check "lock refused: exit 2, LOCKED(75) with the wrapper line" '[ $RC -eq 2 ] && row kernel_ops all | grep -q "LOCKED(75).*refusing to start"'
 check "lock refused: exactly one wrapper call, no retry" '[ "$(wc -l <"$CALLS")" -eq 1 ]'
-check "lock refused: independent gates not tried (LOCKED), dependents NOT-RUN" '[ "$(grep -Ec "^[a-z_]+ .*LOCKED\(75\)" "$ROOT/last.txt")" -eq 33 ] && [ "$(grep -Ec "^[a-z_]+ .* NOT-RUN" "$ROOT/last.txt")" -eq 49 ] && grep -q "not tried" "$ROOT/last.txt"'
+check "lock refused: independent gates not tried (LOCKED), dependents NOT-RUN" '[ "$(grep -Ec "^[a-z_]+ .*LOCKED\(75\)" "$ROOT/last.txt")" -eq 33 ] && [ "$(grep -Ec "^[a-z_]+ .* NOT-RUN" "$ROOT/last.txt")" -eq 59 ] && grep -q "not tried" "$ROOT/last.txt"'
 
 run FAKE_LOCK_REFUSE='ricursive_embed_test'
 check "lock lost mid-run: earlier gates PASS, embed LOCKED, dependents NOT-RUN, no retry" 'row kernel_ops all | grep -q " PASS " && row embed gpu | grep -q "LOCKED(75)" && row executor_test taps:tinyA | grep -q "NOT-RUN" && [ "$(wc -l <"$CALLS")" -eq 38 ]'
@@ -105,7 +105,7 @@ check "missing binary: FAIL, wrapper never called" '[ $RC -eq 1 ] && row embed g
 mv "$ROOT/bin/hidden" "$ROOT/bin/ricursive_embed_test"
 
 run LIST=1
-check "LIST=1: prints 82 invocations, runs nothing" '[ "$(grep -cE "^[a-z_]+ +[A-Za-z0-9_:.-]+ +(ricursive_|@)" "$ROOT/last.txt")" -eq 82 ] && [ "$(wc -l <"$CALLS")" -eq 0 ]'
+check "LIST=1: prints 92 invocations, runs nothing" '[ "$(grep -cE "^[a-z_]+ +[A-Za-z0-9_:.-]+ +(ricursive_|@)" "$ROOT/last.txt")" -eq 92 ] && [ "$(wc -l <"$CALLS")" -eq 0 ]'
 
 [ $fail -eq 0 ] && echo "ALL SELFTESTS PASS" || echo "SELFTEST FAILURES"
 exit $fail

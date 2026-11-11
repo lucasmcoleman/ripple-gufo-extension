@@ -2,6 +2,14 @@
 """Write a tiny random DFlash2 drafter GGUF that pairs with a tiny `ricursive` fixture.
 
 usage: make_drafter_fixture.py TARGET.gguf OUT.gguf [--seed N] [--quant q8_0|q4_k] [--taps N]
+                               [--top-k N] [--rank N] [--codebooks f32|mixed] [--selector-scale X]
+
+With only the first options the file is the stage 1 fixture (top-k 8, rank 16, F32 codebooks). Stage 2
+adds `--top-k 32 --rank 256 --codebooks mixed --selector-scale 0.25`: the real model's selector (32
+candidates, rank 256, predecessor codebook Q8_0 and successor codebook Q4_K, as stored in the real files)
+at a scale where the transition term decides between candidates (a selector limited to 16 candidates
+must choose differently), so the drafter's selector kernel and its element-wise codebook decoding are
+exercised.
 
 Same tensor names, shapes and metadata keys as the real Ripple-65B-Preview-DFlash2
 GGUF, at a size the CPU oracle runs in seconds: hidden size and vocabulary come
@@ -29,12 +37,16 @@ def main() -> int:
     ap.add_argument("--quant", choices=("q8_0", "q4_k"), default="q8_0")
     ap.add_argument("--taps", type=int, default=5, help="tapped target layers 0..N-1 (N <= 5); stage 1 uses 4 "
                     "so that a tap layer one too late is still a layer of the 5-layer tiny target")
+    ap.add_argument("--top-k", type=int, default=8)
+    ap.add_argument("--rank", type=int, default=16)
+    ap.add_argument("--codebooks", choices=("f32", "mixed"), default="f32")
+    ap.add_argument("--selector-scale", type=float, default=1.0)
     args = ap.parse_args()
     t = gguf.GGUFReader(args.target)
     H = int(t.fields["ricursive.embedding_length"].contents())
     V = int(t.fields["ricursive.vocab_size"].contents())
     n_target = int(t.fields["ricursive.block_count"].contents())
-    L, NH, NKV, HD, FF, RANK, TOPK, KS, GS = 5, 8, 2, 32, 256, 16, 8, 4, 16
+    L, NH, NKV, HD, FF, RANK, TOPK, KS, GS = 5, 8, 2, 32, 256, args.rank, args.top_k, 4, 16
     taps = list(range(args.taps))
     assert 1 <= len(taps) <= min(5, n_target) and H % GS == 0
     rng = np.random.default_rng(args.seed)
@@ -96,8 +108,15 @@ def main() -> int:
     put("enc.output_norm.weight", 1 + 0.1 * rng.standard_normal(H))
     put("output_norm.weight", 1 + 0.1 * rng.standard_normal(H))
     put("selector_hidden.weight", mat(RANK, H), True)
-    put("selector_predecessor.weight", rng.standard_normal((V, RANK)))
-    put("selector_successor.weight", rng.standard_normal((V, RANK)))
+    pred = args.selector_scale * rng.standard_normal((V, RANK))
+    succ = args.selector_scale * rng.standard_normal((V, RANK))
+    if args.codebooks == "mixed":
+        assert RANK % 256 == 0, "mixed codebooks need a rank that is a multiple of 256 (Q4_K blocks)"
+        w.add_tensor("selector_predecessor.weight", gguf.quants.quantize(pred.astype(np.float32), Q.Q8_0), raw_dtype=Q.Q8_0)
+        w.add_tensor("selector_successor.weight", q4k(V, RANK, args.selector_scale * np.sqrt(RANK)), raw_dtype=Q.Q4_K)
+    else:
+        put("selector_predecessor.weight", pred)
+        put("selector_successor.weight", succ)
     for i in range(L):
         b = f"blk.{i}."
         put(b + "attn_norm.weight", 1 + 0.1 * rng.standard_normal(H))

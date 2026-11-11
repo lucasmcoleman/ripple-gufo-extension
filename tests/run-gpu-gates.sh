@@ -14,11 +14,19 @@
 #   embed             -                   (embed_test gpu: host lookup + device copy)
 #   executor_test     kernel_ops attention_ops projection_ops embed   (every filter)
 #   executor_contract executor_test       (contract suite on the GPU backend)
-#   engine_tests      executor_contract   (engine_test, continuation_test and draft_session_test
+#   drafter_ops       kernel_ops projection_ops embed
+#                                         (docs/DRAFTER-S2.md: ricursive_drafter_ops_test with the drafter on the GPU
+#                                          operations against DrafterReference on the tiny drafters: gpu-exact = F32
+#                                          context storage, gpu = F16 (production); the GPU kernels of the drafter run
+#                                          here for the first time)
+#   engine_tests      executor_contract drafter_ops
+#                                         (engine_test, continuation_test and draft_session_test
 #                                          (docs/DRAFTER-S3.md: Session::Verify / AcceptVerified / taps, 6
 #                                          invocations: verify, rest and rewind0 of tinyA and tinyB; and 12 of ricursive_speculative_test,
 #                                          docs/DRAFTER-S4.md: mock, real and runner of both fixtures in gpu-exact and
-#                                          production mode) with the GPU backend,
+#                                          production mode; and 8 more of the same binary with the GPU drafter in place
+#                                          of the CPU reference (RICURSIVE_TEST_DRAFTER=ops: real and runner, both
+#                                          fixtures, both modes), docs/DRAFTER-S2.md) with the GPU backend,
 #                                          RICURSIVE_TEST_BACKEND=gpu-exact: F32 caches, no activation
 #                                          rounding, so they stay comparable with the scalar Reference;
 #                                          their twins still run on the CPU executor. output_parser,
@@ -57,9 +65,10 @@ LOCK_EXEC=${GPU_LOCK_EXEC:-/server/staging/gpu-serialization-20260929/gpu-lock-e
 export GPU_ADMISSION_LOCK=${GPU_ADMISSION_LOCK:-/server/state/gpu-admission/gpu.lock}
 OUT_ROOT=${GATES_OUT:-/server/staging/ripple-gufo/gpu-gates}
 ONLY=${ONLY:-}
+STAGE_DIR=${RICURSIVE_STAGE:-/server/staging/ripple-gufo}   # fixtures/tinyB.gguf and perf/ (the drafters' fixtures)
 
 GATES=(kernel_ops attention_ops projection_ops embed executor_test executor_contract
-       engine_tests engine_logits engine_prompt)
+       drafter_ops engine_tests engine_logits engine_prompt)
 declare -A DEPS=(
   [kernel_ops]=""
   [attention_ops]="kernel_ops"
@@ -67,7 +76,8 @@ declare -A DEPS=(
   [embed]=""
   [executor_test]="kernel_ops attention_ops projection_ops embed"
   [executor_contract]="executor_test"
-  [engine_tests]="executor_contract"
+  [drafter_ops]="kernel_ops projection_ops embed"
+  [engine_tests]="executor_contract drafter_ops"
   [engine_logits]="executor_contract"
   [engine_prompt]="engine_logits"
 )
@@ -106,6 +116,10 @@ invocations() {
       for b in gpu-f32-exact gpu-f16; do
         echo "$b|ricursive_executor_contract_gpu_test||RICURSIVE_CONTRACT_BACKEND=$b"
       done ;;
+    drafter_ops)
+      for b in gpu-exact gpu; do
+        echo "$b|ricursive_drafter_ops_test|tiny $STAGE_DIR/fixtures/tinyB.gguf $STAGE_DIR/perf|RICURSIVE_TEST_BACKEND=$b"
+      done ;;
     engine_tests)
       echo "engine|ricursive_engine_test||RICURSIVE_TEST_BACKEND=gpu-exact"
       echo "continuation|ricursive_continuation_test||RICURSIVE_TEST_BACKEND=gpu-exact"
@@ -125,6 +139,13 @@ invocations() {
         for f in tinyA tinyB; do
           echo "spec-$g-$f|ricursive_speculative_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu-exact"
           echo "spec-prod-$g-$f|ricursive_speculative_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu"
+        done
+      done
+      # docs/DRAFTER-S2.md: the same checks (real, runner) with the GPU drafter instead of the CPU reference.
+      for g in real runner; do
+        for f in tinyA tinyB; do
+          echo "spec-ops-$g-$f|ricursive_speculative_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu-exact RICURSIVE_TEST_DRAFTER=ops"
+          echo "spec-ops-prod-$g-$f|ricursive_speculative_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu RICURSIVE_TEST_DRAFTER=ops"
         done
       done ;;
     engine_logits)

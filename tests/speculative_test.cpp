@@ -22,8 +22,10 @@
 //   runner  5. the serving runner (prefill, preview, DecodeStep, prefix reuse): the same tokens as
 //              a runner without speculation; sampled, penalised requests draft nothing
 //
-// Argument: "all" or "<group>:<fixture>" (groups mock, real, runner, driver; fixtures tinyA, tinyB), then
+// Argument: "all", "<group>:<fixture>" or a comma separated list of them (groups mock, real, runner, driver; fixtures tinyA, tinyB), then
 // the directory of the tiny drafters (drafter-tinyA-q8_0.gguf, drafter-tinyB-q8_0.gguf).
+// RICURSIVE_TEST_DRAFTER=ops: the proposals come from the drafter executor (docs/DRAFTER-S2.md, host operations,
+// or the GPU drafter on a device backend) instead of the scalar CPU reference.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -46,6 +48,7 @@ int main() {
 }
 #else
 
+#include "hip/drafter_engine.hpp"
 #include "src/drafter_engine_cpu.hpp"
 #include "src/runner.hpp"
 
@@ -76,12 +79,40 @@ std::shared_ptr<EngineModel> VerifyModel(const TinyFixture& f, const DraftBacken
   return LoadDraftModel(f.path, be, kContext, kPrefillRows, kChunk, [](ModelOptions& o) { o.verify_rows = kMaxVerifyRows; });
 }
 
+/// RICURSIVE_TEST_DRAFTER=ops: the proposals come from the drafter executor (hip/drafter_executor.cpp) instead
+/// of the scalar CPU reference (the default, as in stage 4); the checks are the same, a proposal that differs
+/// from the reference's only at a near-tie of the two choices' scores is counted and reported.
+bool OpsDrafter() {
+  const char* env = std::getenv("RICURSIVE_TEST_DRAFTER");
+  const std::string name = env != nullptr ? env : "ref";
+  Require(name == "ref" || name == "ops", "RICURSIVE_TEST_DRAFTER must be ref or ops, not " + name);
+  return name == "ops";
+}
+
+std::size_t g_proposal_ties = 0;  ///< proposals that differed from the reference's at a near-tie only
+
 std::shared_ptr<const SpeculativeSetup> Setup(const TinyFixture& f, const std::string& dir, std::uint32_t d) {
   std::string error;
   std::shared_ptr<const core::GgufReader> reader = core::GgufReader::OpenFile(f.path, &error);
   Require(reader != nullptr, "open " + f.path + ": " + error);
-  auto setup = LoadSpeculativeSetup(dir + "/drafter-" + f.name + "-q8_0.gguf", *reader, d, &error);
-  Require(setup != nullptr, "drafter of " + f.name + ": " + error);
+  auto loaded = LoadSpeculativeSetup(dir + "/drafter-" + f.name + "-q8_0.gguf", *reader, d, &error);
+  Require(loaded != nullptr, "drafter of " + f.name + ": " + error);
+  auto setup = std::make_shared<SpeculativeSetup>(*loaded);
+  if (OpsDrafter()) {
+    // The drafter of docs/DRAFTER-S2.md: the GPU drafter when the model runs on the device, else the same
+    // executor on the host operations. F32 or F16 context storage as the model's cache type.
+    setup->engine_factory = [](const SpeculativeSetup& s, const EngineModel& m) -> std::unique_ptr<DrafterEngine> {
+      if (m.backend().uses_device) return MakeDefaultDrafterEngine(s, m);
+      DrafterOptions o = s.drafter_options;
+      o.kv_type = m.backend().kv_type;
+      return MakeHostOpsDrafterEngine(s.weights, m.weights(), o);
+    };
+  } else {
+    // The stage 4 drafter, whatever the build would choose by default (the GPU drafter on a device model).
+    setup->engine_factory = [](const SpeculativeSetup& s, const EngineModel& m) -> std::unique_ptr<DrafterEngine> {
+      return std::make_unique<CpuDrafterEngine>(s.weights, m.weights(), s.engine_faults);
+    };
+  }
   return setup;
 }
 
@@ -407,7 +438,24 @@ class ProposalCheck {
       return "the drafter read rows [" + std::to_string(got.context_first) + ", " + std::to_string(got.context_end) + ") for the anchor at " +
              std::to_string(p) + " (rows given from " + std::to_string(base_) + ")";
     }
-    if (got.tokens != expect.tokens) {
+    // The engine may return fewer tokens than the reference's whole block (the draft-length hint): compare those.
+    std::size_t row = 0;
+    const std::size_t shared = std::min(got.tokens.size(), expect.tokens.size());
+    while (row < shared && got.tokens[row] == expect.tokens[row]) ++row;
+    if (row < shared || got.tokens.size() > expect.tokens.size()) {
+      // A different token is acceptable only at a near-tie of the reference's own scores (another engine rounds
+      // differently); the rows after it follow another path and are not compared.
+      const std::size_t KT = expect.candidates.size() / std::max<std::size_t>(expect.tokens.size(), 1);
+      const auto score_of = [&](std::int32_t id) -> std::optional<float> {
+        for (std::size_t i = 0; i < KT && row < expect.tokens.size(); ++i)
+          if (expect.candidates[row * KT + i] == id) return expect.scores[row * KT + i];
+        return std::nullopt;
+      };
+      const auto a = row < shared ? score_of(got.tokens[row]) : std::nullopt, b = row < shared ? score_of(expect.tokens[row]) : std::nullopt;
+      if (OpsDrafter() && a && b && std::fabs(static_cast<double>(*a) - *b) <= 2e-3 * (1.0 + std::fabs(static_cast<double>(*b)))) {
+        ++g_proposal_ties;
+        return "";
+      }
       ++mismatched;
       return "the block proposed at position " + std::to_string(p) + " differs from the reference's";
     }
@@ -471,19 +519,20 @@ void RealTests(const TinyFixture& f, const DraftBackend& be, const std::string& 
   std::printf("  %s/%s: 2. real tiny drafter, d 1..15: %zu runs, %zu logits rows compared, %zu tokens drafted, %zu accepted; exactness and accounting hold, "
               "the drafter's context ends at the session's position after every step\n",
               be.name.c_str(), f.name.c_str(), runs, compared, drafted, accepted);
-  std::printf("  %s/%s: 3. all %zu proposals (%zu compared) equal DrafterReference driven with plain decoding's taps\n", be.name.c_str(), f.name.c_str(),
-              proposals, checked);
+  std::printf("  %s/%s: 3. all %zu proposals (%zu compared) equal DrafterReference driven with plain decoding's taps%s\n", be.name.c_str(), f.name.c_str(),
+              proposals, checked, OpsDrafter() ? (" (drafter executor; " + std::to_string(g_proposal_ties) + " proposals so far differ from the reference's at a near-tie only)").c_str() : "");
 
   // 3, twins: the output stays exact (the verifier checks every token) and the proposals go wrong.
   struct Twin {
     const char* name;
     std::function<void(SpeculativeSetup&)> apply;
   };
-  const Twin twins[] = {
+  std::vector<Twin> twins = {
       {"anchor position off by one", [](SpeculativeSetup& s) { s.faults.anchor_position_off_by_one = true; }},
       {"anchor token off by one", [](SpeculativeSetup& s) { s.faults.anchor_token_off_by_one = true; }},
-      {"context one row short", [](SpeculativeSetup& s) { s.engine_faults.context_one_row_short = true; }},
   };
+  // The scalar reference's own fault; the executor's twins are in tests/drafter_ops_test.cpp.
+  if (!OpsDrafter()) twins.push_back({"context one row short", [](SpeculativeSetup& s) { s.engine_faults.context_one_row_short = true; }});
   for (const Twin& twin : twins) {
     std::size_t twin_proposals = 0, twin_wrong = 0, exact_failures = 0;
     for (const std::uint32_t d : {1u, 3u, 7u}) {
@@ -890,8 +939,15 @@ void DriverTest(const TinyFixture& f, const std::string& dir) {
 int main(int argc, char** argv) {
   const std::string filter = argc > 1 ? argv[1] : "all";
   const std::string dir = argc > 2 ? argv[2] : "/server/staging/ripple-gufo/perf/stage4";
+  // "all", one "<group>:<fixture>", or several of them separated by commas.
   const auto wants = [&](const char* group, const TinyFixture& f) {
-    return filter == "all" || filter == std::string(group) + ":" + f.name;
+    const std::string want = std::string(group) + ":" + f.name;
+    for (std::size_t at = 0; at <= filter.size();) {
+      const std::size_t comma = std::min(filter.find(',', at), filter.size());
+      if (filter == "all" || filter.substr(at, comma - at) == want) return true;
+      at = comma + 1;
+    }
+    return false;
   };
   return Run([&] {
     std::size_t groups = 0;
