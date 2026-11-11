@@ -197,3 +197,65 @@ checked with the oracle's own drafts (PASS) and with corrupted ones (FAIL) on th
 - `ricursive.plain_fingerprint` passes with its golden hashes untouched (suite result above); `ricursive.executor_contract*`, `ricursive.executor_host`, `ricursive.engine`, `ricursive.continuation`, `ricursive.draft_session` pass.
 - Tests: no existing check was loosened or removed. In `tests/` the removed lines are the stage 1 generator's constants (the default output is byte-identical, checked with `cmp`), the gate self-test counts (raised by exactly the 10 entries added: 82 -> 92, 83 -> 93, 49 -> 59 not-run rows),
   and in `speculative_test.cpp` the proposal comparison (the same strict comparison for the CPU reference, a prefix comparison with near-tie reporting only in `RICURSIVE_TEST_DRAFTER=ops` mode), the twin list (the reference's own twin only in the default mode) and the filter (a comma list added).
+
+
+## Stage 2b (2026-11-11, branch `drafter-s2b` from `drafter-s4b` 72ced1a, job 1692): test reach before the first GPU run, a faster projection route, bookkeeping
+
+An independent review of stage 2 found no way for the drafter to change the target's output, but found that tonight's gates would not reach the code that only real shapes exercise, and
+several avoidable costs per draft step. **Statements above that this section replaces are marked SUPERSEDED, not deleted.** Everything ran on the CPU (host operations); the GPU code compiles for
+gfx1151 (`gufo_ricursive_gpuexec`, the GPU test targets and the tools were built) and **has not run**. One commit per item (items 1 and 5 have later `fixup!` commits that could not be folded: later items touch the same file).
+
+### Item 1: the operation-level test at the real shapes
+
+`tests/drafter_op_shapes_test.cpp` (ctest `ricursive.drafter_op_shapes`, gate `drafter_op_shapes`, 2 invocations: `gpu-exact` F32 rings, `gpu` F16 rings; gate list 124 -> 126, self-test counts adjusted and the self-test run: all pass).
+It drives each new operation alone through `Ops`, with seeded random inputs at the real shapes (hidden 5,120, head dimension 128, 80 query heads on 8 K/V heads, FFN 40,960, vocabulary 100,352 = 49 partial lists, top-k 32, rank 256).
+Side A is under test, side B the reference: cpu mode A = host operations, B = a naive implementation in the test (doubles, brute-force key sets, its own binary16 conversion and `DequantizeRow`, no code shared with `ops_host.cpp`);
+`RICURSIVE_TEST_BACKEND=gpu-exact|gpu`: A = GPU operations, B = host operations. The header of the file states every tolerance and derives it from the arithmetic. Coverage: `DraftQkNormRope` at 15 situations (block pass at positions 0 to 32,760;
+context passes of 1, 16 and 512 rows into the 5,120-row sliding ring and the 17,408-row full ring, ending at, 100 rows before, 1 row before and just after the wrap, and a second lap); `DraftAttention` at 14 context situations (87, 500, 4,096 rows,
+ring just full, one past the sliding wrap, second lap, 16,384 rows, one past the full ring's wrap with the 16,384-row clamp, position 30,000; contexts of 4,096 rows and more run 4 block rows instead of 16 because the sequential host operation takes 50 to 80 s
+for 16 rows at 16,384 keys); `DynamicConv` (both sides, plain and accumulating); `SiluMul`; `DraftSelect` with three codebook type pairs, six equal logits straddling the cut at 32 in every row, and a designed tie of final scores; `ProjectQ8` (item 2) on four real shapes.
+**Result (cpu mode, 4 threads): 70 checks, 0 failed, 197.7 s** (`perf/stage2b-op-shapes.log`); worst attention error 8.9e-7 against the tolerance 4e-6, worst convolution 2.0e-7 (1e-6), silu 2.3e-7 (3e-6), selector candidate lists equal in 75 of 75 rows, 0 near-ties,
+worst candidate score error 0.02 of its bound. **Twins** (one wrong ring index in the naive side: a slot off by one past the wrap, in the attention read and in the ring write): both fail the comparison, as they must.
+The test first failed on its own tolerance for F16 K rows (a result near zero whose float rounding differs in sign) and on its run time (11 min); both were fixed in the test, not in the code under test.
+
+**Tie rules.** Before stage 2b: the host top-k took the lowest token id for equal logits (strict insertion in id order), but for equal *final scores* the first candidate in logit order (so the higher logit, not the lower id); the GPU merged the per-thread lists keeping the *lower thread slot* for equal logits
+(not the lower id: thread t sees ids t, t+128, ...), and for equal final scores also the first in logit order; `DrafterReference` takes the lowest id in both cases. After: `rocm::DraftRanksAbove(score, id, score2, id2)` (`hip/drafter_math.hpp`: larger score, equal scores the lower id) is
+used for the host insertion and final choice and by the kernels' `InsertCandidate`, the tree merge and the finalize choice (three comparisons changed in `drafter_kernels.hip.cpp`, compiled, **not run**): all three implementations now choose the lowest token id at every tie. The test builds both tie kinds (the designed final-score tie is
+one candidate with logit 4 plus a transition term of exactly 1 against one with logit 5 and term 0: the lowest id must win; "first in logit order" would not).
+The check no longer grades itself: a differing choice is forgiven only if, in B's scores, the two choices are within the sum of their two score tolerances (5e-6 x (|logit| + sum of the 256 |terms|) each); near-ties are counted and printed, the run fails above 2% of the compared rows, and the built exact ties get no forgiveness.
+
+### Item 2: the 8-bit activation route at any row count
+
+`Ops::ProjectQ8(w, x, rows, y)` (new; `Project` and its callers unchanged): GPU `rocm::ProjectW8A8` in `hip/project.cpp` = Q8_1 quantization of the activations plus `LaunchBatchedQuantGEMMPreQuantized` at any row count for quantized weights (dense F32/BF16 weights take `Project`'s per-row GEMV); it refuses to run when
+the scratch is too small instead of reallocating inside a pass. `DrafterOptions::q8` = `DrafterRoutes{block, head, context}` (default none = today); `exact` overrides every route. Selectable by `RICURSIVE_DRAFTER_Q8=block,head,context|all|none` (the runner, via `EffectiveDrafterOptions`),
+`ricursive_drafter_bench --q8 SET/SET...`, `RICURSIVE_TEST_Q8` (the real-weights check). **The host has no model of the Q8_1 activation rounding** (the only W8A8 material in the tree is the GPU test's noise model), so on the host a routed projection computes `Project`'s result and the route is tested by call counting:
+`CheckRoutes` (16 configurations: 8 subsets x exact or not) finds exactly the chosen groups' matrices on the route (counts, rows, and the head's two weights by identity). The tiny walk with every group routed gives the same tokens as the reference (host: the same arithmetic), so the "95% of rows on real weights" report
+**is not available on the host and was not produced**; it needs the GPU (STAGE2-GPU.md steps 3c and 6). The GPU route's arithmetic is checked tonight by the op-level gate (relative RMSE per row <= 1.2e-2, derived in the test header: about 0.5% expected).
+
+### Item 3: avoidable work per draft step (final code)
+
+Construction: the 15 MASK rows are embedded once (one `EmbedRows`, which waits for the device) into a buffer the block pass reads. Per draft step, in this order: `CopyIn` of the anchor token (4 bytes; waits: the stream is idle), `EmbedRows` of one row (20,480 bytes up, waits),
+`CopyInternal` of the 15 MASK rows into the block input (307,200 bytes on the device, asynchronous), then only kernel launches (no wait: scratch is reserved at construction), then one `CopyOut` of 3,904 bytes (tokens, candidate ids and scores in one buffer, whatever `d` is; waits). **Three waits and two host-to-device copies per step** (before: five waits, one of them in the middle of the step
+before the selector's launch, and 16 embedded rows, about 327 KB, up per step; three read-backs). The context range read is known on the host and is not copied. No asynchrony was added between the drafter and the target. `HostOpsCounters` counts every call on the host and `CheckTransfers` asserts the list above.
+A context pass: one `CopyIn` of its feature rows (waits), no read-back. On the GPU `CopyIn`, `CopyOut` and `EmbedRows` synchronize the stream; `Project`/`ProjectQ8` and the drafter kernels do not.
+
+### Item 4: bookkeeping and accounting
+
+*Deep truncation.* `TruncateTo(p)` with `p + ring_slack <= highest row held` no longer empties the context: every layer's ring holds the rows `[highest - capacity, highest)`, so the base rises to `highest - (the smallest ring)` (the 5,120-row sliding rings: rows from `highest - 5120`);
+if no row is left below `p` the context is empty at `p`. Tested against the reference given the same rows: the bookkeeping script (truncation to 80 now keeps rows 72 to 79) and a sweep of every position from 40 to 87 of 88 rows across the slack edge (slack 8, smallest ring 16): 8 truncations kept rows, 33 left none, 63 drafts equal the reference's.
+*Accounting.* The projection scratch is now planned from what is used (`rocm::Q8ActivationBytes`; the Q8_1 tile layout of `prefill_quant_gemm.hpp`; only the context pass above 16 rows or on the route, the block pass and the head when routed; none with `exact`), the MASK rows are in the plan, `DeviceBytes()` adds `Ops::ProjectionScratchBytes()` (the real `Scratch` capacity on the GPU),
+and the runner's claim uses `EffectiveDrafterOptions` (the cache type and exactness of the backend, as the engine does). Per session, real configuration: **F16 rings 252.1 MiB** (rings 148.0, context pass 74.0, block pass 14.27, selector 0.18, scratch 15.6; the figure of stage 2, 236.2 MiB, left out the scratch and the MASK rows,
+and the engine really held 261.2 MiB: its scratch was reserved at (512, 40,960) = 25.0 MiB); **F32 rings 400.1 MiB** (the old claim assumed F16 rings: 236.2 against 409.2 allocated); `exact`: 236.5 / 384.5 MiB (no scratch); block route scratch 0.78 MiB, head route 0.10 MiB (below the context pass's 15.6 MiB). Tested on the host: `DeviceBytes() == DrafterSessionBytes` in 96 configurations
+(F16/F32, exact or not, 8 route subsets, 3 ring/pass sizes), and the runner's `ResourceClaim()` equals its state's `MeasuredResources()` in `ricursive.speculative_ops`. On the GPU `DeviceBytes()` reads the real scratch allocation, so the same check in the tiny gates tests the formula against ggml's.
+
+### Item 5: the bench and tonight's commands
+
+`ricursive_drafter_bench`: a 16,384-row context in the default list, `--engine head|factory` (the production `MakeGpuDrafterEngine` over the target's device copy; uploads the whole target first), `--q8 SET/SET...` (route sets in one process, the drafter's weights pinned between them), `--attention NAME` (`DrafterOptions::attention_kernel`,
+validated at construction; only `default` exists; `Ops::DraftAttention` takes no kernel yet: stage 2c adds the argument), the cost of creating an engine (first, and a second from the resident weights), allocated against claimed session bytes, medians with p10/p90/min/max and the per-stage profile as before. `drafter_ops_test real` now also compares every named stage with the oracle's stage file (relative RMSE table);
+`drafter_ops_test long` writes (host) or compares (GPU) drafts at 5,121 / 16,385 / 17,409 / 20,000 rows on real weights. **Not run**: both need 20 GB of free host memory (35 available) and `free -g` showed 12 GiB at the time; they were built and syntax-checked only. The ordered run list is `/server/staging/ripple-gufo/perf/STAGE2-GPU.md`.
+
+### Proof that the target's path is unchanged
+
+`git diff 72ced1a --stat` is empty for `hip/kernels.*`, `hip/kernels_math.hpp`, `hip/executor.*`, `hip/embed.*`, `hip/profile.*`, `hip/ggml/`, `src/engine.*`, `src/executor_iface.*`, `src/cpu_executor.cpp`, `src/reference.cpp`, and the tests `plain_fingerprint`, `executor_contract`, `executor`, `engine`, `kernel_ops`, `attention_ops`, `projection_ops`.
+`hip/project.cpp` only gained `ProjectW8A8` (nothing removed). `Ops` gained `ProjectQ8` and `ProjectionScratchBytes`; the target's executor calls neither; the host `Project` body was moved into a helper behind a call counter, bit for bit. `ReserveProjection` on the host now records a size (no allocation). Existing test lines removed are the gate-count constants (124 -> 126), the stage 2 bookkeeping expectations that item 4 supersedes,
+and the two engine-factory option lines (now `EffectiveDrafterOptions`); no check was loosened.
