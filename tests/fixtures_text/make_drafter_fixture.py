@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Write a tiny random DFlash2 drafter GGUF that pairs with a tiny `ricursive` fixture.
 
-usage: make_drafter_fixture.py TARGET.gguf OUT.gguf [--seed N]
+usage: make_drafter_fixture.py TARGET.gguf OUT.gguf [--seed N] [--quant q8_0|q4_k] [--taps N]
 
 Same tensor names, shapes and metadata keys as the real Ripple-65B-Preview-DFlash2
 GGUF, at a size the CPU oracle runs in seconds: hidden size and vocabulary come
 from the target (the drafter reads the target's embedding rows and output head),
 5 layers (4 sliding, window 8, then 1 full layer without rotary), 8 query / 2 KV
 heads of 32, convolution kernel 4 / group 16, selector rank 16 / top-k 8. The big
-matrices are Q8_0, the rest F32. All weights are seeded random; the tap layers are
+matrices are Q8_0 (default) or, with --quant q4_k, Q4_K (as in the Q4_K_M file of the real model; the blocks
+are random bytes with a zero-mean scale layout, not the quantization of anything), the rest F32. All weights are seeded random; the tap layers are
 the target's own layers 0..4 (GGUF numbering 1..5). Run with the oracle venv
 (numpy + gguf); nothing here is the real model, only the plumbing.
 """
@@ -25,18 +26,38 @@ def main() -> int:
     ap.add_argument("target")
     ap.add_argument("out")
     ap.add_argument("--seed", type=int, default=2026)
+    ap.add_argument("--quant", choices=("q8_0", "q4_k"), default="q8_0")
+    ap.add_argument("--taps", type=int, default=5, help="tapped target layers 0..N-1 (N <= 5); stage 1 uses 4 "
+                    "so that a tap layer one too late is still a layer of the 5-layer tiny target")
     args = ap.parse_args()
     t = gguf.GGUFReader(args.target)
     H = int(t.fields["ricursive.embedding_length"].contents())
     V = int(t.fields["ricursive.vocab_size"].contents())
     n_target = int(t.fields["ricursive.block_count"].contents())
     L, NH, NKV, HD, FF, RANK, TOPK, KS, GS = 5, 8, 2, 32, 256, 16, 8, 4, 16
-    taps = list(range(min(5, n_target)))
-    assert len(taps) == 5 and H % GS == 0
+    taps = list(range(args.taps))
+    assert 1 <= len(taps) <= min(5, n_target) and H % GS == 0
     rng = np.random.default_rng(args.seed)
 
     def mat(rows, cols):
         return (rng.standard_normal((rows, cols)) / np.sqrt(cols)).astype(np.float32)
+
+    def q4k(rows, cols, gain=1.0):
+        """Random Q4_K blocks (144 bytes per 256 values): sub-block scale = min = S, dmin = 7.5 d, so a value is
+        d * S * (q - 7.5), zero mean; d chosen for a standard deviation near gain / sqrt(cols)."""
+        assert cols % 256 == 0
+        nb = rows * (cols // 256)
+        raw = np.zeros((nb, 144), dtype=np.uint8)
+        d = (gain / (92.0 * np.sqrt(cols))) * rng.uniform(0.8, 1.2, size=nb)
+        raw[:, 0:2] = d.astype(np.float16).view(np.uint8).reshape(nb, 2)
+        raw[:, 2:4] = (7.5 * d.astype(np.float16).astype(np.float64)).astype(np.float16).view(np.uint8).reshape(nb, 2)
+        s4 = rng.integers(1, 64, size=(nb, 4), dtype=np.uint8)
+        t4 = rng.integers(1, 16, size=(nb, 4), dtype=np.uint8)
+        raw[:, 4:8] = s4
+        raw[:, 8:12] = s4
+        raw[:, 12:16] = (t4 << 4) | t4
+        raw[:, 16:] = rng.integers(0, 256, size=(nb, 128), dtype=np.uint8)
+        return raw.reshape(rows, cols // 256 * 144)
 
     w = GGUFWriter(args.out, "dflash")
     w.add_name("tiny-dflash2-random")
@@ -63,8 +84,10 @@ def main() -> int:
     w.add_uint32("dflash.attention.context_window", 64)
     w.add_uint32("tokenizer.ggml.mask_token_id", V - 1)
 
-    def put(name, arr, big=False):
-        if big:
+    def put(name, arr, big=False, gain=1.0):
+        if big and args.quant == "q4_k":
+            w.add_tensor(name, q4k(*arr.shape, gain), raw_dtype=Q.Q4_K)
+        elif big:
             w.add_tensor(name, gguf.quants.quantize(arr, Q.Q8_0), raw_dtype=Q.Q8_0)
         else:
             w.add_tensor(name, arr.astype(np.float32))
@@ -92,7 +115,7 @@ def main() -> int:
             base = 0.1 * rng.standard_normal((2, KS, H))
             base[:, 0] += 1.0  # tap 0 near identity, as a trained kernel would be
             put(b + side + "_conv_base", base)
-            put(b + side + "_conv_proj.weight", 0.1 * mat(2 * KS * (H // GS), H), True)
+            put(b + side + "_conv_proj.weight", 0.1 * mat(2 * KS * (H // GS), H), True, 0.1)
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()

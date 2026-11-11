@@ -5,6 +5,8 @@ gufo_extension_target(
   NAME gufo_ricursive
   SOURCES
     src/config.cpp
+    src/drafter_config.cpp
+    src/drafter_weights.cpp
     src/executor_iface.cpp
     src/extension.cpp
     src/probe.cpp
@@ -63,6 +65,7 @@ gufo_extension_target(
   NAME gufo_ricursive_reference
   SOURCES
     src/cpu_executor.cpp
+    src/drafter_reference.cpp
     src/reference.cpp
   LINK_LIBRARIES
     gufo_ricursive
@@ -448,6 +451,15 @@ gufo_extension_target(
 if(TARGET ricursive_gpu_logits)
   set_target_properties(ricursive_gpu_logits PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
+
+# DFlash2 drafter on the CPU against the Python oracle (docs/DRAFTER-S1.md). The
+# oracle's stage files are made by tools/drafter_stage1_fixtures.sh; the real-weights
+# check (`drafter_cpu_test real ...`) is run by hand, not by ctest.
+_ricursive_test(drafter_cpu TIMEOUT 1800
+  SOURCES tests/drafter_cpu_test.cpp
+  LINK_LIBRARIES gufo_ricursive_reference gufo_ricursive
+  ARGS tiny "${RICURSIVE_STAGE}/fixtures/tinyB.gguf"
+       "${RICURSIVE_STAGE}/perf/stage1/tiny")
 
 # Tool, built on request (docs/PERF-PROFILE.md): ricursive_decode_bench MODEL.gguf
 #   --tokens FILE.i32 --prompt-tokens N --generate M [--backend cpu|host|gpu]

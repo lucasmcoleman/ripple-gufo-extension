@@ -37,6 +37,10 @@ Commands:
              counts for every draft length (L: the lengths in --l-d)
   timing     --draft D.gguf --target T.gguf [--ctx N] [--anchors M]
              one-anchor and batched timing on random inputs, for the extrapolation
+  stages     --draft D.gguf --target T.gguf --dump DIR --out FILE.bin
+             (--anchors a,b,c | --first A --last B [--stride S])
+             variant R, one anchor per forward (the upstream mask path), with the named intermediate
+             stages of every anchor written to one binary file for the C++ drafter test (docs/DRAFTER-S1.md)
 """
 from __future__ import annotations
 
@@ -464,6 +468,93 @@ class Drafter:
             tokens, _, _ = m.propose(h[:, 1:], torch.tensor([anchor]), self.head, 0.0)
         self.active["layer"] = None
         return [int(x) for x in tokens[0]]
+
+    # ---- named stages (stage 1: the C++ drafter test) ---------------------------------------
+    def stage_ctx(self, feats: np.ndarray, rec) -> None:
+        """Context stages for positions [0, n): ctx_h (hidden_norm(fc(features))) and, per layer, the context
+        K (k_norm, rotated unless the layer is NoPE) and V rows, [n][kv_heads*head_dim]."""
+        torch, m = self.torch, self.model
+        n = feats.shape[0]
+        cache = self.build_ctx(feats, "R")
+        with torch.inference_mode():
+            ctx = m.hidden_norm(m.fc(torch.from_numpy(np.array(feats))[None]))
+        rec("ctx_h", ctx[0].numpy())
+        for li in range(len(m.layers)):
+            rec(f"ctx_k.{li}", cache.k[li][0].transpose(0, 1).reshape(n, -1).numpy())
+            rec(f"ctx_v.{li}", cache.v[li][0].transpose(0, 1).reshape(n, -1).numpy())
+
+    def stage_block(self, cache: CtxCache, anchor: int, s: int, rec) -> list[int]:
+        """Variant R for one anchor at position s (as draft_block), recording the intermediate stages of the
+        upstream forward through forward hooks on the upstream modules. The candidate selector's walk is
+        repeated here with the upstream modules to expose candidates and scores; its tokens are asserted equal
+        to the upstream `propose` result."""
+        torch, m = self.torch, self.model
+        self.set_variant_rope("R")
+        rows = self.block
+        ids = [anchor] + [self.mask_id] * (rows - 1)
+        emb = self.embed(ids)
+        rec("emb", emb[0].numpy())
+        lo = max(0, s - self.context_window) if self.context_window else 0
+        cache.set_range(lo, s)
+        empty = torch.zeros(1, 0, len(self.tap_ids) * self.hidden)
+        handles = []
+
+        def flat(t):
+            return t.detach().float().reshape(-1, t.shape[-1]).numpy()
+
+        for li, layer in enumerate(m.layers):
+            handles.append(layer.input_layernorm.register_forward_hook(
+                lambda mod, a, out, li=li: rec(f"attn_norm.{li}", flat(out))))
+            handles.append(layer.self_attn.register_forward_pre_hook(
+                lambda mod, a, kw, li=li: rec(f"attn_conv_in.{li}", flat(kw["hidden_states"])), with_kwargs=True))
+            handles.append(layer.self_attn.register_forward_hook(
+                lambda mod, a, kw, out, li=li: rec(f"attn_o.{li}", flat(out[0])), with_kwargs=True))
+            handles.append(layer.post_attention_layernorm.register_forward_pre_hook(
+                lambda mod, a, li=li: rec(f"h_attn.{li}", flat(a[0]))))
+            handles.append(layer.post_attention_layernorm.register_forward_hook(
+                lambda mod, a, out, li=li: rec(f"ffn_norm.{li}", flat(out))))
+            handles.append(layer.mlp.register_forward_pre_hook(
+                lambda mod, a, li=li: rec(f"mlp_conv_in.{li}", flat(a[0]))))
+            handles.append(layer.mlp.register_forward_hook(
+                lambda mod, a, out, li=li: rec(f"mlp_o.{li}", flat(out))))
+            handles.append(layer.register_forward_hook(
+                lambda mod, a, kw, out, li=li: rec(f"h.{li}", flat(out)), with_kwargs=True))
+        handles.append(m.norm.register_forward_hook(lambda mod, a, out: rec("final", flat(out))))
+        try:
+            with torch.inference_mode():
+                h = m(position_ids=torch.arange(s, s + rows)[None], noise_embedding=emb, target_hidden=empty,
+                      past_key_values=cache, use_cache=True)
+                hid = h[:, 1:]
+                logits = m.compute_logits(hid, self.head)
+                tokens, _, _ = m.propose(hid, torch.tensor([anchor]), self.head, 0.0)
+                sel = m.candidate_selector
+                unary, cands = torch.topk(logits, sel.top_k, dim=-1, sorted=False)
+                proj = sel.hidden_projection(hid)
+                prev = torch.tensor([anchor])
+                out_c, out_s, out_t, conf = [], [], [], []
+                for p in range(rows - 1):
+                    sc = unary[:, p] + torch.einsum("br,bkr->bk", sel.predecessor_codebook(prev) * proj[:, p],
+                                                    sel.successor_codebook(cands[:, p]))
+                    idx = torch.argmax(sc, dim=-1)
+                    prev = cands[:, p].gather(-1, idx[:, None])[:, 0]
+                    order = torch.argsort(cands[0, p])
+                    out_c.append(cands[0, p][order].numpy().astype(np.int32))
+                    out_s.append(sc[0][order].numpy().astype(np.float32))
+                    out_t.append(int(prev[0]))
+                    e = torch.exp(sc[0].double() - sc[0].double().max())
+                    conf.append(float(e[idx[0]] / e.sum()))
+        finally:
+            for hd in handles:
+                hd.remove()
+            self.active["layer"] = None
+        assert out_t == [int(x) for x in tokens[0]], "selector walk differs from the upstream propose()"
+        rec("hproj", proj[0].numpy())
+        rec("logits", logits[0].numpy())
+        rec("cand", np.stack(out_c))
+        rec("score", np.stack(out_s))
+        rec("conf", np.array(conf, dtype=np.float32)[:, None])
+        rec("tokens", np.array(out_t, dtype=np.int32)[:, None])
+        return out_t
 
     def draft_blocks(self, cache: CtxCache, anchor_pos: list[int], ids: np.ndarray, rows: int, scale: bool,
                      windowed: bool) -> list[list[int]]:
@@ -895,10 +986,67 @@ def timing(args) -> int:
     return 0
 
 
+def stages(args) -> int:
+    """Writes FILE.bin: records `u32 name_len, name, u32 rows, u32 width, u32 kind (0 float32, 1 int32),
+    data`. Names: `ctx_h`, `ctx_k.L`, `ctx_v.L` (positions 0..max anchor - 1), `anchors` ([A][1] int32) and,
+    per anchor s, `a<s>/<stage>`: emb, attn_norm.L, attn_conv_in.L, attn_o.L, h_attn.L, ffn_norm.L,
+    mlp_conv_in.L, mlp_o.L, h.L, final, hproj, logits, cand, score, conf, tokens."""
+    import struct
+    d = load_drafter(args)
+    dump = Path(args.dump)
+    meta = json.loads((dump / "meta.json").read_text())
+    if meta["tap_layers"] != d.tap_ids:
+        sys.exit(f"dump taps layers {meta['tap_layers']} differ from the drafter's {d.tap_ids}")
+    if meta["hidden"] != d.hidden:
+        sys.exit("dump hidden size differs from the drafter's")
+    n = meta["prompt_len"] + meta["generated"]
+    ids = np.fromfile(dump / meta["ids_file"], dtype=np.int32)
+    if len(ids) != n:
+        sys.exit("ids file has the wrong length")
+    taps = np.memmap(dump / meta["taps_file"], dtype=np.float32, mode="r",
+                     shape=(n, len(meta["tap_layers"]), meta["hidden"]))
+    if args.anchors:
+        anchors = [int(x) for x in args.anchors.split(",")]
+    else:
+        anchors = list(range(args.first, args.last + 1, args.stride))
+    if not anchors or min(anchors) < 1 or max(anchors) > n - 1:
+        sys.exit(f"anchors must lie in [1, {n - 1}]")
+    feats = taps.reshape(n, -1)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + ".tmp")
+    t0 = time.time()
+    with open(tmp, "wb") as f:
+        def write(name: str, arr: np.ndarray) -> None:
+            arr = np.ascontiguousarray(arr)
+            if arr.ndim == 1:
+                arr = arr[:, None]
+            kind = 0 if arr.dtype == np.float32 else 1
+            if arr.dtype not in (np.float32, np.int32):
+                raise TypeError(f"{name}: {arr.dtype}")
+            nb = name.encode()
+            f.write(struct.pack("<I", len(nb)) + nb + struct.pack("<III", arr.shape[0], arr.shape[1], kind))
+            f.write(arr.tobytes())
+
+        write("anchors", np.array(anchors, dtype=np.int32))
+        d.stage_ctx(np.array(feats[:max(anchors)]), write)
+        cache = d.build_ctx(np.array(feats[:max(anchors)]), "R")
+        for a in anchors:
+            t1 = time.time()
+            d.stage_block(cache, int(ids[a]), a, lambda name, arr, a=a: write(f"a{a}/{name}", arr))
+            print(f"  anchor {a}: {time.time() - t1:.2f} s", flush=True)
+    tmp.rename(out)
+    Path(str(out) + ".json").write_text(json.dumps({
+        "anchors": anchors, "draft": str(args.draft), "target": str(args.target), "dump": str(dump),
+        "variant": "R", "upstream_sha256": UPSTREAM_SHA256, "wall": time.time() - t0, "threads": args.threads}, indent=1))
+    print(f"wrote {out}: {len(anchors)} anchors in {time.time() - t0:.1f} s")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("selfcheck", "run", "timing"):
+    for name in ("selfcheck", "run", "timing", "stages"):
         s = sub.add_parser(name)
         s.add_argument("--upstream", default=DEFAULT_UPSTREAM)
         s.add_argument("--draft", required=True)
@@ -923,8 +1071,15 @@ def main() -> int:
         if name == "timing":
             s.add_argument("--ctx", type=int, default=600)
             s.add_argument("--anchors", type=int, default=3)
+        if name == "stages":
+            s.add_argument("--dump", required=True, help="one ricursive_dump_taps directory")
+            s.add_argument("--out", required=True, help="the binary stage file to write")
+            s.add_argument("--anchors", help="comma separated anchor positions")
+            s.add_argument("--first", type=int, default=1)
+            s.add_argument("--last", type=int, default=0)
+            s.add_argument("--stride", type=int, default=1)
     args = p.parse_args()
-    return {"selfcheck": selfcheck, "run": run, "timing": timing}[args.cmd](args)
+    return {"selfcheck": selfcheck, "run": run, "timing": timing, "stages": stages}[args.cmd](args)
 
 
 if __name__ == "__main__":

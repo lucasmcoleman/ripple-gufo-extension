@@ -243,6 +243,12 @@
       ],
       "role": "test"
     },
+    "ricursive_drafter_cpu_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
     "ricursive_kernel_bench": {
       "requires": [
         "hip",
