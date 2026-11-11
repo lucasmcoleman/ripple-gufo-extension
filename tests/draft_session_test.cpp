@@ -175,14 +175,16 @@ Matrix RunMatrix(const std::shared_ptr<EngineModel>& model, const Plain& plain, 
 }
 
 std::size_t VerifyRewindContinue(const TinyFixture& f, const DraftBackend& be,
-                                 const std::shared_ptr<EngineModel>& model, const Plain& plain) {
-  const auto boundaries = Boundaries(f, *model);
+                                 const std::shared_ptr<EngineModel>& model, const Plain& plain, int only_boundary) {
+  auto boundaries = Boundaries(f, *model);
+  if (only_boundary >= 0) boundaries = {boundaries.at(static_cast<std::size_t>(only_boundary))};
   const Matrix m = RunMatrix(model, plain, f, boundaries, {});
   Require(m.failed == 0, be.name + "/" + f.name + ": " + std::to_string(m.failed) + " of " +
                              std::to_string(m.scenarios) + " scenarios differ from plain; first: " + m.first_failure);
-  std::printf("  %s/%s: 1. %zu scenarios (k 1..16, every a, anchors across W=%u, 2W+3=%u, ring %u, 2 x ring), "
+  std::printf("  %s/%s: 1. %zu scenarios (k 1..16, every a, anchors across %zu boundar%s of W=%u, 2W+3=%u, ring %u, 2 x ring), "
               "%zu logits rows compared: all bit-identical to plain 1-row decoding\n",
-              be.name.c_str(), f.name.c_str(), m.scenarios, f.window, 2 * f.window + 3, model->RingRows(), m.rows);
+              be.name.c_str(), f.name.c_str(), m.scenarios, boundaries.size(), boundaries.size() == 1 ? "y" : "ies", f.window,
+              2 * f.window + 3, model->RingRows(), m.rows);
   return m.scenarios;
 }
 
@@ -546,9 +548,17 @@ void Refusals(const TinyFixture& f, const DraftBackend& be, const Plain& plain) 
 
 // Argument: "<group>:<fixture>" with group verify (check 1) or rest (checks 2 to 6) and
 // fixture tinyA or tinyB; none = everything. The GPU gates run one group of one fixture
-// per GPU-lock acquisition.
+// per GPU-lock acquisition. "verify:<fixture>:<n>" (n = 0..3) runs one of the four anchor
+// boundaries (W, 2W+3, ring, 2 x ring) only: the way to split a verify run that is too long.
 int main(int argc, char** argv) {
-  const std::string filter = argc > 1 ? argv[1] : "";
+  std::string filter = argc > 1 ? argv[1] : "";
+  int only_boundary = -1;
+  if (std::count(filter.begin(), filter.end(), ':') == 2) {
+    only_boundary = filter.back() - '0';
+    Require(only_boundary >= 0 && only_boundary <= 3 && filter.size() > 2 && filter[filter.size() - 2] == ':',
+            "the boundary index must be 0 to 3");
+    filter.resize(filter.size() - 2);
+  }
   const auto wants = [&](const char* group, const TinyFixture& f) {
     return filter.empty() || filter == std::string(group) + ":" + f.name;
   };
@@ -564,7 +574,7 @@ int main(int argc, char** argv) {
         const Plain unarmed = RunPlain(LoadDraftModel(f.path, be, kContext, kPrefillRows, kChunk), S);
         Require(SameBits(plain.logits, unarmed.logits), "verify_rows/capture armed but unused changed plain decoding");
         if (wants("verify", f)) {
-          scenario_total += VerifyRewindContinue(f, be, model, plain);
+          scenario_total += VerifyRewindContinue(f, be, model, plain, only_boundary);
           ++groups;
         }
         if (!wants("rest", f)) continue;

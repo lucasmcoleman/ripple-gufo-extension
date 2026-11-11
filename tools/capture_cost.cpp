@@ -1,5 +1,5 @@
 // ricursive_capture_cost MODEL.gguf --rows N --reps R [--layers a,b,c,d,e] [--backend cpu|host|gpu]
-//     [--base P] [--context-cap C] [--allow-template-mismatch]
+//     [--base P] [--warmup W] [--context-cap C] [--allow-template-mismatch]
 //
 // The cost test of hidden-state capture (docs/DRAFTER-S3.md): the wall time of
 // ONE Forward of N rows at position P, with capture off and with capture on
@@ -11,7 +11,7 @@
 // stage 3), 1 when it is not or on failure, 2 usage.
 //
 // The model is positioned at P (default 2048) with one prompt pass of P tokens
-// (synthetic ids), untimed. A pass of N rows needs P + N <= the context cap.
+// (synthetic ids), untimed, then W untimed warm-up passes of each kind (default 1). A pass of N rows needs P + N <= the context cap.
 // Backend gpu only through the GPU lock wrapper (tests/run-gpu-gates.sh style,
 // perf/gpu-run.sh); cpu and host are for tiny fixtures.
 #include <algorithm>
@@ -48,8 +48,8 @@ bool ParseUnsigned(const std::string& text, std::uint32_t* out) {
 
 void Usage() {
   std::cerr << "usage: ricursive_capture_cost MODEL.gguf --rows N --reps R [--layers a,b,c,d,e] "
-               "[--backend cpu|host|gpu] [--base P] [--context-cap C] [--allow-template-mismatch]\n"
-               "  --layers defaults to 1,20,39,58,77; --backend to gpu; --base to 2048.\n";
+               "[--backend cpu|host|gpu] [--base P] [--warmup W] [--context-cap C] [--allow-template-mismatch]\n"
+               "  --layers defaults to 1,20,39,58,77; --backend to gpu; --base to 2048; --warmup to 1.\n";
 }
 
 struct Stat {
@@ -65,7 +65,7 @@ Stat Summarize(std::vector<double> v) {
 
 int main(int argc, char** argv) {
   std::string model_path, backend_arg = "gpu", layers_arg = "1,20,39,58,77";
-  std::uint32_t rows = 0, reps = 0, base = 2048, context_cap = 0;
+  std::uint32_t rows = 0, reps = 0, base = 2048, context_cap = 0, warmup = 1;
   bool allow_mismatch = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -76,6 +76,8 @@ int main(int argc, char** argv) {
       if (!ParseUnsigned(argv[++i], &reps)) return Usage(), 2;
     } else if (a == "--base" && more) {
       if (!ParseUnsigned(argv[++i], &base)) return Usage(), 2;
+    } else if (a == "--warmup" && more) {
+      warmup = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
     } else if (a == "--context-cap" && more) {
       if (!ParseUnsigned(argv[++i], &context_cap)) return Usage(), 2;
     } else if (a == "--layers" && more) {
@@ -159,8 +161,10 @@ int main(int argc, char** argv) {
       exec.Forward(pass, base, which, logits, {}, capturing ? std::span<float>(capture) : std::span<float>());
       return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     };
-    (void)run(false);  // warm-up (kernels, allocator), untimed
-    (void)run(true);
+    for (std::uint32_t w = 0; w < warmup; ++w) {  // kernels, allocator: untimed
+      (void)run(false);
+      (void)run(true);
+    }
     std::vector<double> off, on;
     for (std::uint32_t r = 0; r < reps; ++r) {  // off, on, on, off, ...: no drift bias
       if (r % 2 == 0) {
@@ -173,8 +177,8 @@ int main(int argc, char** argv) {
     }
     const Stat a = Summarize(off), b = Summarize(on);
     const double ratio = b.median / a.median;
-    std::printf("capture cost: backend=%s rows=%u base=%u reps=%u layers=%s logits=%s\n", backend_arg.c_str(), rows,
-                base, reps, layers_arg.c_str(), which == LogitRows::kAll ? "all rows" : "last row");
+    std::printf("capture cost: backend=%s rows=%u base=%u reps=%u warmup=%u layers=%s logits=%s\n", backend_arg.c_str(),
+                rows, base, reps, warmup, layers_arg.c_str(), which == LogitRows::kAll ? "all rows" : "last row");
     std::printf("  capture off: median %.3f ms (min %.3f, max %.3f)\n", a.median, a.min, a.max);
     std::printf("  capture on : median %.3f ms (min %.3f, max %.3f)\n", b.median, b.min, b.max);
     std::printf("  on/off = %.4f  (%+.2f%%)  %s\n", ratio, (ratio - 1.0) * 100.0,
