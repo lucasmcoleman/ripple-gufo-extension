@@ -313,6 +313,23 @@ if(TARGET ricursive_drafter_op_shapes_test)
   target_link_libraries(ricursive_drafter_op_shapes_test PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
+# Stage 2c (docs/DRAFTER-S2.md, "Stage 2c: the second attention kernel"): the same two tests with the tiled attention kernel's
+# structural twin on the host operations: the tiny walks against DrafterReference, and the attention cases at the real shapes
+# against the existing host operation plus the three twins that must fail.
+if(TARGET ricursive_drafter_ops_test)
+  add_test(NAME ricursive.drafter_ops_tiled COMMAND ricursive_drafter_ops_test
+    tiny "${RICURSIVE_STAGE}/fixtures/tinyB.gguf" "${RICURSIVE_STAGE}/perf")
+  set_tests_properties(ricursive.drafter_ops_tiled PROPERTIES
+    LABELS "ricursive;cpu" SKIP_RETURN_CODE 77 TIMEOUT 1800
+    ENVIRONMENT "OMP_NUM_THREADS=4;RICURSIVE_TEST_ATTENTION=tiled")
+endif()
+if(TARGET ricursive_drafter_op_shapes_test)
+  add_test(NAME ricursive.drafter_op_shapes_tiled COMMAND ricursive_drafter_op_shapes_test)
+  set_tests_properties(ricursive.drafter_op_shapes_tiled PROPERTIES
+    LABELS "ricursive;cpu" SKIP_RETURN_CODE 77 TIMEOUT 1800
+    ENVIRONMENT "OMP_NUM_THREADS=4;RICURSIVE_TEST_ATTENTION=tiled")
+endif()
+
 # GPU side: the S2 kernels (strict floating point, docs/S2-KERNELS.md), the
 # device model and the GPU ops, in their own target on top of
 # gufo_ricursive_hip (projections, embedding). GPU tests are labelled `gpu`,

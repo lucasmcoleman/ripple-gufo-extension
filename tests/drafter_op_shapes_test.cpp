@@ -213,7 +213,8 @@ class Side {
 // ---- a side that runs through Ops (host or GPU operations) --------------------------------------------------------------------
 class OpsSide final : public Side {
  public:
-  explicit OpsSide(std::unique_ptr<Ops> ops) : ops_(std::move(ops)) {}
+  /// `tiled`: Attention runs Ops::DraftAttentionTiled (the second kernel, docs/DRAFTER-S2.md "Stage 2c") instead of DraftAttention.
+  explicit OpsSide(std::unique_ptr<Ops> ops, bool tiled = false) : ops_(std::move(ops)), tiled_(tiled) {}
   ~OpsSide() override { Release(); }
 
   RopeOut Rope(const RopeCase& c) override {
@@ -238,8 +239,14 @@ class OpsSide final : public Side {
     const void* rk = UpBytes(c.ring_k, ring_bytes);
     const void* rv = UpBytes(c.ring_v, ring_bytes);
     float* out = Alloc<float>(std::size_t{c.tokens} * kNH * kD);
-    ops_->DraftAttention(q, rk, rv, c.type, c.capacity, c.first, c.anchor, kb, vb, out, c.tokens, kNH, kNKV, kD, c.window,
-                         static_cast<float>(1.0 / std::sqrt(static_cast<double>(kD))));
+    const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kD)));
+    if (tiled_) {
+      float* scratch = Alloc<float>(static_cast<std::size_t>(rocm::DraftTiledScratchFloats(c.tokens, kNH, kD)));
+      ops_->DraftAttentionTiled(q, rk, rv, c.type, c.capacity, c.first, c.anchor, kb, vb, out, c.tokens, kNH, kNKV, kD, c.window, scale,
+                                scratch);
+    } else {
+      ops_->DraftAttention(q, rk, rv, c.type, c.capacity, c.first, c.anchor, kb, vb, out, c.tokens, kNH, kNKV, kD, c.window, scale);
+    }
     auto result = Down<float>(out, std::size_t{c.tokens} * kNH * kD);
     Release();
     return result;
@@ -344,6 +351,7 @@ class OpsSide final : public Side {
     owned_.clear();
   }
   std::unique_ptr<Ops> ops_;
+  bool tiled_{false};
   std::vector<void*> owned_;
 };
 
@@ -1192,18 +1200,77 @@ void CheckHostModelsScratch(Report& report) {
   std::printf("  host scratch model: a missing or short reservation is refused, the right one runs (%zu cases: Q8_0 and Q4_K at 15 rows)\n", checks);
 }
 
+// ---- stage 2c: the tiled attention kernel -------------------------------------------------------------------------------------
+/// Stage 2c: RICURSIVE_TEST_ATTENTION=tiled. Only DraftAttention's cases run (the other operations do not depend on the kernel
+/// and are checked by the default run): A = the tiled kernel (GPU modes) or its structural twin (cpu mode, the host operations),
+/// B = the existing host operation (Ops::DraftAttention on the host), at every context length and wrap position of AttentionSpecs, with
+/// the GPU's attention tolerance (both A sides compute in fp32 as the GPU does). cpu mode also runs the three faulty twins, which must fail.
+void RunTiled(const Backend& be, Rng& rng, const Rings& rings, Report& report) {
+  OpsSide a(be.gpu ? CreateGpuOps() : CreateHostOps(), /*tiled=*/true);
+  OpsSide b(CreateHostOps());
+  const Tolerances tol = TolFor(true);
+  for (const KvType type : {KvType::kF32, KvType::kF16}) {
+    if (be.gpu && (type == KvType::kF16) != be.f16) continue;
+    const auto t0 = Clock::now();
+    RunAttention(a, b, rng, rings, type, report, tol);
+    std::printf("  (attention, tiled against the host operation, %s ring: %.1f s)\n", type == KvType::kF16 ? "F16" : "F32", Seconds(t0));
+  }
+  if (be.gpu) return;
+  // Twins through the structural twin: each fault must make the comparison fail on at least one of these cases (a refused
+  // read past the ring counts as failing: the host checks every slot, the GPU would read past the allocation).
+  using F = HostOpsOptions::TiledFault;
+  const AttnSpec cases[] = {
+      {"sliding, 500 context rows", kSlideCap, kSlideWindow, 500, 0, 16},
+      {"sliding, one past the ring's wrap (position 5120 in slot 0)", kSlideCap, kSlideWindow, kSlideCap + 1, 1, 4},
+      {"full, position 30000 (rows 13616 to 29999 wrap)", kFullCap, 0, 30000, 30000 - kContextWindow, 4},
+  };
+  for (const auto& [fault, what] : {std::pair{F::kTileOffByOne, "a tile boundary off by one key (every tile one key late)"},
+                                    std::pair{F::kNoSplitRescale, "the splits combined without rescaling to the common maximum"},
+                                    std::pair{F::kNoWrapCheck, "the ring slot without its wrap check"}}) {
+    HostOpsOptions faulty;
+    faulty.tiled_fault = fault;
+    OpsSide twin(CreateHostOps(faulty), /*tiled=*/true);
+    std::string results;
+    bool failed = false;
+    for (const AttnSpec& spec : cases) {
+      const AttnCase c = MakeAttn(rng, rings, KvType::kF16, spec);
+      std::string result;
+      try {
+        const double worst = WorstRowRel(twin.Attention(c), b.Attention(c), kD);
+        result = Sci(worst);
+        if (Exceeds(worst, tol.attn_rel)) failed = true;
+      } catch (const std::exception& e) {
+        result = std::string("refused (") + e.what() + ")";
+        failed = true;
+      }
+      results += std::string(results.empty() ? "" : "; ") + spec.name + ": " + result;
+    }
+    std::printf("  twin '%s': %s [%s]\n", what, failed ? "fails the comparison, as it must" : "PASSES (the test is too weak)", results.c_str());
+    ++report.checks;
+    if (!failed) ++report.failures;
+  }
+}
+
 // ---- the whole run --------------------------------------------------------------------------------------------------------------
 void RunAll() {
   const Backend& be = TheBackend();
   const auto t_start = Clock::now();
+  bool tiled = false;
   if (const char* kernel = std::getenv("RICURSIVE_TEST_ATTENTION")) {
-    // The attention kernel by name (DrafterOptions::attention_kernel). Ops::DraftAttention takes no kernel yet: stage 2c adds the
-    // argument and passes it in OpsSide::Attention; until then only "default" is accepted so that nothing is silently ignored.
-    Require(std::string(kernel) == "default", std::string("RICURSIVE_TEST_ATTENTION=") + kernel + ": only 'default' exists");
+    // The attention kernel by name (DrafterOptions::attention_kernel): "default" (Ops::DraftAttention) or "tiled"
+    // (Ops::DraftAttentionTiled, stage 2c). SUPERSEDED (stage 2b): only "default" was accepted.
+    Require(std::string(kernel) == "default" || std::string(kernel) == "tiled",
+            std::string("RICURSIVE_TEST_ATTENTION=") + kernel + ": 'default' or 'tiled'");
+    tiled = std::string(kernel) == "tiled";
     std::printf("  attention kernel: %s\n", kernel);
   }
-  std::printf("  backend %s (A = %s, B = %s)\n", be.name.c_str(), be.gpu ? "the GPU operations" : "the host operations",
-              be.gpu ? "the host operations" : "the naive implementation of this file");
+  if (tiled) {
+    std::printf("  backend %s, attention only (A = %s, B = the host operations' DraftAttention)\n", be.name.c_str(),
+                be.gpu ? "the GPU operations' DraftAttentionTiled" : "the host operations' DraftAttentionTiled (the structural twin)");
+  } else {
+    std::printf("  backend %s (A = %s, B = %s)\n", be.name.c_str(), be.gpu ? "the GPU operations" : "the host operations",
+                be.gpu ? "the host operations" : "the naive implementation of this file");
+  }
   Rng rng(20261111);
   Rings rings;
   rings.k = Normals(rng, std::size_t{kFullCap} * kKVW, 1.0);
@@ -1212,6 +1279,13 @@ void RunAll() {
     const KvType t = i == 0 ? KvType::kF32 : KvType::kF16;
     rings.kb[i] = RingBytes(rings.k, t);
     rings.vb[i] = RingBytes(rings.v, t);
+  }
+  if (tiled) {
+    Report report;
+    RunTiled(be, rng, rings, report);
+    std::printf("  %zu checks, %zu failed, %.1f s in total\n", report.checks, report.failures, Seconds(t_start));
+    Require(report.failures == 0, std::to_string(report.failures) + " of " + std::to_string(report.checks) + " checks failed");
+    return;
   }
   std::unique_ptr<Side> a = std::make_unique<OpsSide>(be.gpu ? CreateGpuOps() : CreateHostOps());
   std::unique_ptr<Side> b = be.gpu ? std::unique_ptr<Side>(std::make_unique<OpsSide>(CreateHostOps())) : std::make_unique<NaiveSide>();

@@ -22,7 +22,8 @@
 //      reference's given the same rows;
 //   4. twins that must fail (1): attention window off by one row, rotary on the no-rotary layer,
 //      convolution reading across the block start;
-//   plus the draft-length hint, DequantAt against gufo::quant::DequantizeRow and DraftVisibleKeys by brute force.
+//   plus the draft-length hint, DequantAt against gufo::quant::DequantizeRow, DraftVisibleKeys and the tiled attention's key plan
+//   (DraftTiledSplits, DraftTiledSplitKeys, DraftTiledSlot; stage 2c) by brute force.
 // real: the real drafter weights on the host ops against the oracle's stage file (not part of ctest): the named stages (relative RMSE
 //   per stage, a table of the largest) and the tokens; with RICURSIVE_TEST_BACKEND=gpu|gpu-exact the same on the GPU operations.
 // long (docs/DRAFTER-S2.md, "Stage 2b"): a synthetic context on the real weights (the dump's rows repeated cyclically) up to anchors beyond
@@ -30,7 +31,8 @@
 //   candidates, scores) of every anchor to FILE (about 25 ms per context row on 4 threads: 8 minutes for 20,000 rows; no GPU needed, so
 //   it is made before the GPU window); on a GPU backend it drafts the same anchors and COMPARES with FILE. Production options (F16 rings);
 //   gpu-exact = FP32 activations, gpu = the production 8-bit route of the context passes.
-// RICURSIVE_TEST_ATTENTION=NAME picks the attention kernel by name (DrafterOptions::attention_kernel) for every engine built here.
+// RICURSIVE_TEST_ATTENTION=NAME picks the attention kernel by name (DrafterOptions::attention_kernel) for every engine built here:
+// default or tiled (stage 2c; ctest ricursive.drafter_ops_tiled runs the tiny checks with the tiled kernel's structural twin).
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -154,7 +156,9 @@ Backend& TheBackend() {
 /// gpu-exact: exact=true; gpu: exact=false; cpu: as requested.
 DrafterOptions EffectiveOptions(const DrafterOptions& requested) {
   DrafterOptions options = requested;
-  if (const char* kernel = std::getenv("RICURSIVE_TEST_ATTENTION")) options.attention_kernel = kernel;  // by name (stage 2c)
+  // By name (stage 2c); a check that asks for a kernel by name itself (the unknown-name check) keeps its own.
+  if (const char* kernel = std::getenv("RICURSIVE_TEST_ATTENTION"); kernel != nullptr && requested.attention_kernel == "default")
+    options.attention_kernel = kernel;
   if (TheBackend().gpu) options.exact = !TheBackend().f16;
   return options;
 }
@@ -407,6 +411,56 @@ void CheckVisibleKeys() {
     }
   }
   std::printf("  DraftVisibleKeys against the definition: %zu (row, anchor, window) combinations\n", checked);
+}
+
+/// The tiled attention's key plan (hip/drafter_math.hpp, docs/DRAFTER-S2.md "Stage 2c") by brute force: the union of the rows'
+/// visible context rows is [plan.ctx_begin, anchor) and every row's range lies inside it; the splits are at most
+/// kDraftTiledMaxSplits, never empty, made of whole tiles but the last, and cut [0, ctx_keys) into consecutive ranges; DraftTiledSlot
+/// from the split's first slot equals position % capacity for every key of the split and every capacity >= ctx_keys.
+void CheckTiledSplits() {
+  std::size_t plans = 0, slots = 0;
+  for (std::uint32_t window : {0U, 1U, 8U, 17U, 100U, 4096U}) {
+    for (std::uint32_t tokens : {1U, 4U, 16U}) {
+      for (std::uint32_t anchor : {0U, 3U, 40U, 200U, 1000U, 5121U, 30000U}) {
+        for (std::uint32_t first : {0U, 2U, 150U, 999U, 5000U, 13616U}) {
+          if (first > anchor) continue;
+          const km::DraftTiledPlan plan = km::DraftTiledSplits(anchor, first, tokens, window);
+          std::uint32_t lo = anchor, hi = first;
+          for (std::uint32_t t = 0; t < tokens; ++t) {
+            const km::DraftKeys k = km::DraftVisibleKeys(t, anchor, first, tokens, window);
+            Require(k.ctx_end == anchor && k.ctx_begin >= plan.ctx_begin, "DraftTiledSplits: a row's range outside the plan's");
+            if (k.ctx_begin < k.ctx_end) {
+              lo = std::min(lo, k.ctx_begin);
+              hi = std::max(hi, k.ctx_end);
+            }
+          }
+          if (plan.ctx_keys != 0) Require(lo == plan.ctx_begin && hi == anchor, "DraftTiledSplits: the plan is not the union of the rows' ranges");
+          Require(plan.ctx_begin + plan.ctx_keys == anchor, "DraftTiledSplits: the plan does not end at the anchor");
+          Require(plan.splits <= km::kDraftTiledMaxSplits && plan.tiles_per_split >= 1, "DraftTiledSplits: split count");
+          Require((plan.ctx_keys == 0) == (plan.splits == 0), "DraftTiledSplits: splits without keys or keys without splits");
+          std::uint32_t next = 0;
+          for (std::uint32_t sp = 0; sp < plan.splits; ++sp) {
+            std::uint32_t n0 = 0, n1 = 0;
+            km::DraftTiledSplitKeys(plan, sp, &n0, &n1);
+            Require(n0 == next && n1 > n0 && n0 % km::kDraftTiledKeys == 0 && (n1 - n0 == plan.tiles_per_split * km::kDraftTiledKeys || n1 == plan.ctx_keys),
+                    "DraftTiledSplitKeys: split " + std::to_string(sp) + " is not the next whole-tile range");
+            next = n1;
+            for (std::uint32_t cap : {plan.ctx_keys, plan.ctx_keys + 1, plan.ctx_keys + 37, 5120U, 17408U}) {
+              if (cap == 0 || cap < plan.ctx_keys) continue;
+              const std::uint32_t slot0 = (plan.ctx_begin + n0) % cap;
+              for (std::uint32_t n = n0; n < n1; ++n) {
+                Require(km::DraftTiledSlot(slot0, n - n0, cap) == (plan.ctx_begin + n) % cap, "DraftTiledSlot: key " + std::to_string(n));
+                ++slots;
+              }
+            }
+          }
+          Require(next == plan.ctx_keys, "DraftTiledSplitKeys: the splits do not cover the keys");
+          ++plans;
+        }
+      }
+    }
+  }
+  std::printf("  tiled attention plan against brute force: %zu plans, %zu ring slots\n", plans, slots);
 }
 
 // ---- fixtures and cases --------------------------------------------------------------------------------
@@ -747,6 +801,7 @@ void TinyCase(const ricursive_test::Model& target, const std::string& dir) {
   if (host) {  // host code only: the functions the GPU kernels share with the host operations
     CheckDequantAt();
     CheckVisibleKeys();
+    CheckTiledSplits();
   }
 
   // 1. stage by stage, F32 and F16 context storage, three fixtures.
