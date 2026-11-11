@@ -371,7 +371,7 @@ __global__ void AttentionKernel(const float* __restrict__ q,
       acc[g] *= alpha[g];
     }
     const std::uint32_t count = TileKeys(ts, p);
-#pragma unroll 8
+#pragma unroll 16
     for (std::uint32_t jj = 0; jj < count; ++jj) {
       const float vv = LoadCache(&v_cache[std::size_t{RingSlot(ts + jj, capacity)} *
                                               kv_width +
