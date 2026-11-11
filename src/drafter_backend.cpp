@@ -68,17 +68,27 @@ void DrafterHealth::DraftSucceeded() noexcept {
 void DrafterIngest::Rows(std::uint32_t first_position, std::uint32_t rows,
                          std::span<const float> data) noexcept {
   if (rows == 0 || (health_ != nullptr && health_->disabled())) return;
+  bool resetting = false;
   try {
     if (first_position < engine_->End()) engine_->TruncateTo(first_position);
-    if (first_position != engine_->End()) engine_->ResetTo(first_position);  // a hole
+    if (first_position != engine_->End()) {  // a hole
+      resetting = true;
+      engine_->ResetTo(first_position);
+      resetting = false;
+    }
     engine_->Append(first_position, data);
     rows_given_ += rows;
   } catch (...) {
+    // One failed step counts once, whichever of its calls failed; a reset that threw is also counted as one.
     ++failures_;
-    if (health_ != nullptr) health_->Failed("ingest", Describe(), true);
+    if (health_ != nullptr) {
+      if (resetting) health_->ResetFailed();
+      health_->Failed("ingest", Describe(), true);
+    }
     try {
       engine_->ResetTo(first_position + rows);
     } catch (...) {
+      if (health_ != nullptr) health_->ResetFailed();
     }
   }
 }
@@ -103,7 +113,10 @@ void DrafterIngest::Replaced(std::uint32_t position) noexcept {
     engine_->ResetTo(position);
   } catch (...) {
     ++failures_;
-    if (health_ != nullptr) health_->Failed("ingest", Describe(), true);
+    if (health_ != nullptr) {
+      health_->ResetFailed();
+      health_->Failed("ingest", Describe(), true);
+    }
   }
 }
 
@@ -119,17 +132,22 @@ speculative::DraftProposal DFlash2DraftBackend::Propose(std::span<const sampling
   if (max_tokens == 0) return proposal;
   if (health_ != nullptr && health_->disabled()) return proposal;
   // The engine is a device object that can fail (memory, a lost queue): that costs speed, never the request. A
-  // failed call becomes an empty proposal and the context restarts at the current position.
-  const auto reset = [&](std::string_view where) noexcept {
+  // failed call becomes an empty proposal and the context restarts at the current position. A failed step counts once:
+  // `is_the_failure` says whether the reset is the step's failure (a desync) or only the recovery after a failed draft (counted
+  // as a failed reset, not as another failed step).
+  const auto reset = [&](std::string_view where, bool is_the_failure) noexcept {
     try {
       engine_->ResetTo(current_pos);
     } catch (...) {
-      if (health_ != nullptr) health_->Failed(where, Describe(), false);
+      if (health_ != nullptr) {
+        health_->ResetFailed();
+        if (is_the_failure) health_->Failed(where, Describe(), false);
+      }
     }
   };
   if (prompt_tokens.size() != std::size_t{current_pos} + 1 || engine_->End() != current_pos) {
     ++desyncs_;
-    reset("reset after a desync");
+    reset("reset after a desync", true);
     return proposal;
   }
   const std::size_t anchor_index = faults_.anchor_token_off_by_one && prompt_tokens.size() > 1
@@ -144,7 +162,7 @@ speculative::DraftProposal DFlash2DraftBackend::Propose(std::span<const sampling
   } catch (...) {
     last_block_ = {};
     if (health_ != nullptr) health_->Failed("draft", Describe(), false);
-    reset("reset after a failed draft");
+    reset("reset after a failed draft", false);
     return proposal;
   }
   if (health_ != nullptr) health_->DraftSucceeded();

@@ -597,6 +597,7 @@ std::shared_ptr<DraftedSession> DraftedSession::For(Session& session, const Spec
         if (held->drafted->engine_->End() != session.Position()) held->drafted->engine_->ResetTo(session.Position());
       } catch (...) {
         const std::string why = DescribeCurrent();
+        held->health->ResetFailed();
         held->health->Failed("reset at the bind", why, false);
         WarnOff("the drafter's context could not be brought to the session's position", why);
         return nullptr;

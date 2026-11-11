@@ -469,6 +469,7 @@ struct FaultPlan {
   std::set<std::size_t> draft, append;
   std::size_t draft_from{SIZE_MAX};   ///< every Draft from this call on throws
   std::size_t resets_after_append{0};  ///< when an Append throws, this many following ResetTo calls throw too
+  std::size_t resets_after_draft{0};   ///< the same after a Draft that throws
   std::size_t drafts{0}, appends{0}, resets{0}, pending_resets{0};
 };
 
@@ -508,7 +509,10 @@ class FlakyEngine final : public DrafterEngine {
  private:
   void Hit() {
     const std::size_t call = plan_->drafts++;
-    if (plan_->draft.contains(call) || call >= plan_->draft_from) throw std::runtime_error("injected Draft failure");
+    if (plan_->draft.contains(call) || call >= plan_->draft_from) {
+      plan_->pending_resets = plan_->resets_after_draft;
+      throw std::runtime_error("injected Draft failure");
+    }
   }
   std::unique_ptr<DrafterEngine> inner_;
   std::shared_ptr<FaultPlan> plan_;
@@ -533,18 +537,30 @@ void FailTests(const TinyFixture& f, const DraftBackend& be, const std::string& 
     std::size_t failures;  ///< what the drafter's health must have counted after the first request
     bool disabled;
     std::size_t ingest{0};  ///< and the ingest's own counter (0: not checked)
+    std::size_t reset_failures{0};  ///< item 5: the context resets that threw (a counter of its own; a failed step counts once, whichever calls failed inside it)
     std::size_t cold_failures{0};  ///< item 4: after a cold start on the same session (a new conversation): what the record counts after that request
     bool cold_disabled{false};
   };
+  // {name, plan, failed steps, switched off, ingest failures (0: not checked), failed context resets, failures / switched off after a cold start}
   const std::vector<Case> cases = {
-      {"Draft throws at calls 1 and 3", [](FaultPlan& p) { p.draft = {1, 3}; }, 2, false},
-      {"Draft throws on every call", [](FaultPlan& p) { p.draft_from = 0; }, 3, true, 0, 3, true},
-      {"Draft throws from call 2 on", [](FaultPlan& p) { p.draft_from = 2; }, 3, true, 0, 3, true},
-      {"Append throws at calls 2, 3, 4 (the ingest path)", [](FaultPlan& p) { p.append = {2, 3, 4}; }, 3, true, 3, 0, false},
+      {"Draft throws at calls 1 and 3", [](FaultPlan& p) { p.draft = {1, 3}; }, 2, false, 0, 0},
+      {"Draft throws on every call", [](FaultPlan& p) { p.draft_from = 0; }, 3, true, 0, 0, 3, true},
+      {"Draft throws from call 2 on", [](FaultPlan& p) { p.draft_from = 2; }, 3, true, 0, 0, 3, true},
+      {"Append throws at calls 2, 3, 4 (the ingest path)", [](FaultPlan& p) { p.append = {2, 3, 4}; }, 3, true, 3, 0, 0, false},
       {"Append throws once and the two following ResetTo calls too", [](FaultPlan& p) {
          p.append = {3};
          p.resets_after_append = 2;
-       }, 2, false, 1},
+       }, 2, false, 1, 2},
+      // one failed step counts once: the Draft and the ResetTo that follows it both throw, 1 failure and 1 failed reset
+      {"Draft throws once and the ResetTo that follows it too", [](FaultPlan& p) {
+         p.draft = {1};
+         p.resets_after_draft = 1;
+       }, 1, false, 0, 1},
+      // the Draft throws on every call and every ResetTo after it too: each step still counts once
+      {"Draft throws on every call and every ResetTo after it too", [](FaultPlan& p) {
+         p.draft_from = 0;
+         p.resets_after_draft = 1;
+       }, 3, true, 0, 3, 3, true},
   };
   std::size_t checked = 0;
   for (const Case& c : cases) {
@@ -568,6 +584,8 @@ void FailTests(const TinyFixture& f, const DraftBackend& be, const std::string& 
     Require(ds->health().failures() == c.failures && ds->health().disabled() == c.disabled,
             what + ": the drafter counted " + std::to_string(ds->health().failures()) + " failures" + (ds->health().disabled() ? ", switched off" : "") +
                 " (expected " + std::to_string(c.failures) + (c.disabled ? ", switched off" : ", still on") + ")");
+    Require(ds->health().reset_failures() == c.reset_failures, what + ": the drafter counted " + std::to_string(ds->health().reset_failures()) + " failed context resets (expected " +
+                                                                  std::to_string(c.reset_failures) + ")");
     if (c.ingest > 0) Require(ds->ingest().failures() == c.ingest, what + ": the ingest counted " + std::to_string(ds->ingest().failures()) + " failures");
     const std::size_t before = ds->health().failures();
     // The second turn of the conversation, with the engine still failing as planned.
@@ -714,7 +732,8 @@ void BuildFailTests(const TinyFixture& f, const DraftBackend& be, const std::str
     p2 = plain.Run(next2, limit);
     Require(r2.published == p2.published && r2.drafted == 0, what + ": the request must run as plain (no drafts) with plain's tokens");
     RequireSameState(plain, spec, what);
-    Require(DraftingHealthOf(*spec.state)->failures() == 1 && DraftingOf(*spec.state) == nullptr, what + ": the failed bind must be counted once and leave drafting off for it");
+    Require(DraftingHealthOf(*spec.state)->failures() == 1 && DraftingHealthOf(*spec.state)->reset_failures() == 1 && DraftingOf(*spec.state) == nullptr,
+            what + ": the failed bind must be counted once (and as one failed reset) and leave drafting off for it");
     const Tokens next3 = Extend(p2.checkpoint_tokens, 7, 6);
     const Result r3 = spec.Run(next3, limit), p3 = plain.Run(next3, limit);
     Require(r3.published == p3.published, what + ": the request after the failed bind differs from plain's");

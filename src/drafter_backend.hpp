@@ -85,6 +85,9 @@ class DrafterHealth {
   /// Records one failure; `where` names the call, `what` the exception's message; `in_ingest`: it happened
   /// while rows were being fed (between two proposals), not inside a proposal.
   void Failed(std::string_view where, std::string_view what, bool in_ingest) noexcept;
+  /// A context reset (`ResetTo`) threw. Counted here whatever step it belonged to; the step is counted by `Failed`, once, however many of its
+  /// calls failed (a failed `Draft` and the reset after it are one failed step).
+  void ResetFailed() noexcept { ++reset_failures_; }
   /// A proposal whose draft succeeded: ends a run of failures unless rows failed to arrive since the previous one.
   void DraftSucceeded() noexcept;
   /// A drafter that was built: ends a run of failed builds.
@@ -97,6 +100,8 @@ class DrafterHealth {
   void Restored() noexcept;
   [[nodiscard]] std::size_t failures() const noexcept { return failures_; }
   [[nodiscard]] std::size_t consecutive() const noexcept { return consecutive_; }
+  /// Context resets (`ResetTo`) that threw, wherever they were made: a diagnostic of its own, not a failed step.
+  [[nodiscard]] std::size_t reset_failures() const noexcept { return reset_failures_; }
   [[nodiscard]] bool disabled() const noexcept { return disabled_; }
   [[nodiscard]] const std::string& last_error() const noexcept { return last_error_; }
 
@@ -106,7 +111,7 @@ class DrafterHealth {
     bool disabled{false}, failed_since_proposal{false};
     std::string last_error;
   };
-  std::size_t failures_{0}, consecutive_{0};
+  std::size_t failures_{0}, consecutive_{0}, reset_failures_{0};
   bool disabled_{false}, failed_since_proposal_{false};
   std::string last_error_;
   std::optional<State> before_clear_;  ///< what the last Clear() took
