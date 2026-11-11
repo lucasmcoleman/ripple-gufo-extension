@@ -1,6 +1,6 @@
 // ricursive_drafter_bench DRAFTER.gguf TARGET.gguf --dump DIR [--contexts 500,4096,16384] [--draft 1,2,3,4,6,15]
 //     [--steps 20] [--warmup 3] [--appends 5] [--kv f16|f32] [--backend gpu|host] [--append-rows 512]
-//     [--engine head|factory] [--q8 none/block/head/context/block,head,context/all ...] [--attention default|tiled]
+//     [--engine head|factory] [--q8 none/block/head/context/block,head,context/all ...] [--attention default|tiled|default/tiled]
 //     [--drafts-out FILE.i32 --from A --to B]
 //
 // Stage 2b switches (docs/DRAFTER-S2.md): --engine head (default) uploads the target's output head alone (0.42 GB);
@@ -8,7 +8,8 @@
 // uploaded first: its time is printed). --q8 takes route sets separated by '/' (groups block, head, context of
 // DrafterOptions::q8; "none" = today's behaviour) and runs the whole table once per set, in one process (the drafter's weights
 // stay resident between sets). --attention NAME picks the attention kernel by name ("default" or "tiled": the second kernel,
-// added in stage 2c; the name is validated when the engine is built). The cost of creating an engine is printed for the first set: the first engine (which uploads the drafter's weights
+// added in stage 2c; the name is validated when the engine is built); NAME/NAME runs the whole table once per kernel (outer loop) and route
+// set (inner loop) in one process, for an A/B inside one process. The cost of creating an engine is printed for the first set: the first engine (which uploads the drafter's weights
 // unless pinned) and a second one made from the resident weights.
 //
 // With --drafts-out the tool does not time anything: for every anchor s in [A, B) of the dump it drafts the
@@ -56,7 +57,7 @@ namespace {
 void Usage() {
   std::cerr << "usage: ricursive_drafter_bench DRAFTER.gguf TARGET.gguf --dump DIR [--contexts 500,4096] "
                "[--draft 1,2,3,4,6,15] [--steps 20] [--warmup 3] [--appends 5] [--kv f16|f32] "
-               "[--backend gpu|host] [--append-rows 512] [--engine head|factory] [--q8 SET/SET...] [--attention NAME]\n";
+               "[--backend gpu|host] [--append-rows 512] [--engine head|factory] [--q8 SET/SET...] [--attention NAME/NAME...]\n";
 }
 
 std::vector<std::uint32_t> ParseList(const std::string& text) {
@@ -107,7 +108,8 @@ int main(int argc, char** argv) {
   }
   std::string drafter_path = argv[1], target_path = argv[2], dump_dir, backend = "gpu", kv = "f16";
   std::vector<std::uint32_t> contexts{500, 4096, 16384}, drafts{1, 2, 3, 4, 6, 15};
-  std::string engine_kind = "head", attention = "default";
+  std::string engine_kind = "head";
+  std::vector<std::string> attentions{"default"};  // --attention NAME/NAME...: the kernels in one process (stage 2c A/B)
   std::vector<DrafterRoutes> route_sets{DrafterRoutes{}};
   std::uint32_t steps = 20, warmup = 3, appends = 5, append_rows = 512, from = 0, to = 0;
   std::string drafts_out;
@@ -129,7 +131,12 @@ int main(int argc, char** argv) {
       else if (a == "--from") from = static_cast<std::uint32_t>(std::stoul(next()));
       else if (a == "--to") to = static_cast<std::uint32_t>(std::stoul(next()));
       else if (a == "--engine") engine_kind = next();
-      else if (a == "--attention") attention = next();
+      else if (a == "--attention") {
+        attentions.clear();
+        std::stringstream ss(next());
+        for (std::string item; std::getline(ss, item, '/');) attentions.push_back(item);
+        if (attentions.empty()) attentions.push_back("default");
+      }
       else if (a == "--q8") {
         route_sets.clear();
         const std::string list = next();
@@ -207,6 +214,7 @@ int main(int argc, char** argv) {
     };
 
     bool first_set = true;
+    for (const std::string& attention : attentions)
     for (const DrafterRoutes& routes : route_sets) {
       DrafterOptions options;
       options.kv_type = kv == "f16" ? KvType::kF16 : KvType::kF32;
