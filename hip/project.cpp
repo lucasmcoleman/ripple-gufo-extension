@@ -1,6 +1,7 @@
 #include "hip/project.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <gufo/ext/experimental/ggml_dequant.hpp>
 #include <stdexcept>
 #include <string>
@@ -129,10 +130,15 @@ void Dispatch(const DeviceTensor& w, const float* x, int rows, float* y, Scratch
     ggml::LaunchBatchedQuantGEMMFp32(w.type, w.data, x, y, n, m, k, stream);
     return;
   }
+  // The staged kernel loads the input vector 16 bytes at a time, so it assumes a 16-byte-aligned x; anything
+  // else (one pointer test) falls back to the GEMV, which has no alignment requirement. Defensive: with the
+  // test removed, a misaligned x still gave identical bits on this gfx1151 (tests route_*), so the test case
+  // does not prove the guard is needed, only that the fallback path is bit-equal.
   // Long-K Q4_K/Q5_K rows (ffn_down): the single-row GEMV re-reads the whole activation vector from L2
   // for every row; the small-batch kernel at batch 1 stages it in LDS and is bit-equal to the GEMV
   // (same per-lane order). Measured +22..25 % on 5120x40960; Q6_K was slower there and stays on the GEMV.
   if ((w.type == GgmlType::kQ4_K || w.type == GgmlType::kQ5_K) && k >= 16384 &&
+      reinterpret_cast<std::uintptr_t>(x) % 16 == 0 &&
       ggml::LaunchKQuantSmallBatchDoubleStage(w.type, w.data, x, y, 1, m, k, stream)) {
     return;
   }

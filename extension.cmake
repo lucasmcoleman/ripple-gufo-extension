@@ -170,7 +170,11 @@ if(TARGET ricursive_embed_test)
 endif()
 set(_ricursive_projection_cases q4k_10240x5120 q8_0_1024x5120
   q6k_5120x10240 q4k_40960x5120 q5k_40960x5120 q4k_5120x40960
-  q5k_5120x40960 q6k_100352x5120 f32-tiny twins reject)
+  q5k_5120x40960 q6k_100352x5120 f32-tiny twins reject
+  route_q4k_47x16640 route_q4k_47x16384 route_q4k_47x16128
+  route_q4k_5123x16640 route_q4k_5123x16384 route_q4k_5123x16128
+  route_q5k_47x16640 route_q5k_47x16384 route_q5k_47x16128
+  route_q5k_5123x16640 route_q5k_5123x16384 route_q5k_5123x16128)
 _ricursive_test(projection_ops NO_TEST
   SOURCES tests/projection_ops_test.cpp
   LINK_LIBRARIES gufo_ricursive_hip gufo_ricursive gufo_ext_hip)

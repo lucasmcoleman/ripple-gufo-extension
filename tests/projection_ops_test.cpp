@@ -673,6 +673,67 @@ void RunShape(Backend& b, const ShapeCase& c, const Options& opt) {
   std::cout << name << ": done in " << secs << " s" << (secs > 20 ? "  WARNING: over the 20 s budget" : "") << "\n";
 }
 
+/// Routing cases of the 1-row long-K Q4_K/Q5_K path (project.cpp sends K >= 16384 to the staged small-batch
+/// kernel). M = 47 is fewer rows than one 48-row block of that kernel, M = 5123 leaves a partial last block;
+/// K = 16640 is 16 full stages plus a partly filled one, 16384 is exactly the routing threshold, 16128 is just
+/// below it (stays on the GEMV).
+std::vector<ShapeCase> RouteCases() {
+  std::vector<ShapeCase> cases;
+  for (GgmlType t : {GgmlType::kQ4_K, GgmlType::kQ5_K}) {
+    for (std::size_t m : {std::size_t{47}, std::size_t{5123}}) {
+      for (std::size_t k : {std::size_t{16640}, std::size_t{16384}, std::size_t{16128}}) {
+        cases.push_back({std::string("route_") + (t == GgmlType::kQ4_K ? "q4k_" : "q5k_") + std::to_string(m) + "x" +
+                             std::to_string(k),
+                         t, m, k});
+      }
+    }
+  }
+  return cases;
+}
+
+/// 1. Project(rows=1) is memcmp-equal to the plain GEMV launched directly, for 16 different x rows;
+/// 2. rows 2..16 are bit-equal to the 1-row results; 3. an input pointer that is only 4, 8 or 12 bytes aligned
+/// (the staged kernel reads 16 bytes at a time, so Project must fall back to the GEMV) gives the same bits.
+/// The output guard words are checked on every call (RunChecked / Fetch).
+void RunRoute(Backend& b, const ShapeCase& c, const Options& opt) {
+  const std::size_t m = opt.cpu ? std::min<std::size_t>(c.m, 392) : c.m;
+  const std::size_t k = c.k;
+  const std::size_t rows = 16;
+  g_device_bytes = 0;
+  auto mat = MakeMatrix(b, c.type, m, k, 0x2007E000 + m * 7 + k);
+  const auto xh = RandomX(rows, k, 0xABCD + k);
+  Harness h(b, *mat, xh, rows, m);
+  Buf gemv_out(b, m);
+  std::vector<float> single(rows * m);
+  for (std::size_t r = 0; r < rows; ++r) {
+    const auto out = h.RunChecked(1, r, false);
+    b.RawGemv(c.type, mat->dev->data(), h.x.ptr() + r * k, gemv_out.ptr(), m, k);
+    bool guards = true;
+    const auto want = gemv_out.Fetch(m, &guards);
+    Require(guards, h.ctx + ": plain GEMV wrote outside its output");
+    RequireBitEqual(out.data(), want.data(), 1, m, c.name + ": Project(1 row) vs plain GEMV, x row " + std::to_string(r));
+    std::memcpy(&single[r * m], out.data(), m * 4);
+  }
+  for (std::size_t w = 2; w <= rows; ++w) {
+    const auto out = h.RunChecked(static_cast<int>(w), 0, false);
+    RequireBitEqual(out.data(), single.data(), w, m, c.name + ": rows=" + std::to_string(w) + " vs 1-row results");
+  }
+  for (std::size_t off : {std::size_t{1}, std::size_t{2}, std::size_t{3}}) {
+    Buf xs(b, k + 4);
+    std::vector<float> shifted(off, 0.0F);
+    shifted.insert(shifted.end(), xh.begin(), xh.begin() + static_cast<std::ptrdiff_t>(k));
+    xs.Set(shifted);
+    b.Project(mat->Tensor(), xs.ptr() + off, 1, h.y.ptr(), false);
+    bool guards = true;
+    const auto out = h.y.Fetch(m, &guards);
+    Require(guards, c.name + ": misaligned input (+" + std::to_string(off * 4) + " bytes) wrote outside the output");
+    RequireBitEqual(out.data(), single.data(), 1, m,
+                    c.name + ": input pointer +" + std::to_string(off * 4) + " bytes vs aligned 1-row result");
+  }
+  std::cout << c.name << ": 1-row Project memcmp-equal to the plain GEMV (16 x rows), rows 2..16 bit-equal, "
+            << "inputs misaligned by 4/8/12 bytes bit-equal, guards intact\n";
+}
+
 void RunDense(Backend& b, GgmlType type, std::size_t m, std::size_t k) {
   g_device_bytes = 0;
   auto mat = MakeMatrix(b, type, m, k, 0xD35E + m * 3 + k);
@@ -863,6 +924,7 @@ void RunReject(Backend&, const Options&) {
 std::vector<std::string> AllCases() {
   std::vector<std::string> names;
   for (const auto& c : ShapeCases()) names.push_back(c.name);
+  for (const auto& c : RouteCases()) names.push_back(c.name);
   names.push_back("f32-tiny");
   names.push_back("twins");
   names.push_back("reject");
@@ -919,6 +981,11 @@ int main(int argc, char** argv) {
     } else if (which == "reject") {
       Require(!opt.cpu, "reject needs the real Project");
       RunReject(b, opt);
+    } else if (which.rfind("route_", 0) == 0) {
+      const auto cases = RouteCases();
+      const auto it = std::find_if(cases.begin(), cases.end(), [&](const ShapeCase& c) { return c.name == which; });
+      Require(it != cases.end(), "unknown case " + which);
+      RunRoute(b, *it, opt);
     } else {
       const auto& cases = ShapeCases();
       const auto it = std::find_if(cases.begin(), cases.end(), [&](const ShapeCase& c) { return c.name == which; });
