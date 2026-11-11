@@ -591,6 +591,11 @@ std::shared_ptr<DraftedSession> DraftedSession::For(Session& session, const Spec
       session.SetAttachment(held);
     }
     if (held->drafted) {
+      // A drafter that is switched off is neither reset nor warned about again: its ingest ignores rows, so its context is stale on purpose.
+      if (held->health->disabled()) {
+        held->drafted->decoder_->Restart();
+        return held->drafted;
+      }
       // The sink told the engine of every change since the last request; a context that does not end at the
       // session's position (it cannot, short of a missed event) restarts there.
       try {

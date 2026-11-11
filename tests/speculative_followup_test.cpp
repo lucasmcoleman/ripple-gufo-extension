@@ -25,6 +25,7 @@ int main() {
 
 #include <iostream>
 #include <set>
+#include <sstream>
 
 using namespace ricursive_test;
 
@@ -626,6 +627,53 @@ void FailTests(const TinyFixture& f, const DraftBackend& be, const std::string& 
               checked);
 }
 
+/// Stage 4c-fix item 4: a drafter that is switched off is neither reset nor warned about at later binds. Its ingest ignores rows once it is off, so its
+/// context is stale on purpose; the bind used to "repair" that with a ResetTo at every request (and, when the reset threw, one warning and one more
+/// failed reset per request). Ten more requests after the switch-off, every ResetTo throwing: no further reset call, no warning line, the tokens and
+/// the end state are plain's.
+void DisabledBindTests(const TinyFixture& f, const DraftBackend& be, const std::string& dir) {
+  const auto base = Setup(f, dir, 4);
+  const std::size_t limit = 16;
+  const auto plan = std::make_shared<FaultPlan>();
+  plan->draft_from = 0;  // every Draft throws: 3 failures, switched off
+  const auto setup = Flaky(*base, plan);
+  const auto spec_model = ArmedModel(f, be, *setup);
+  const auto plain_model = PlainModel(f, be);
+  Serve spec(CreateRunnerForModel(spec_model, "", setup), spec_model), plain(CreateRunnerForModel(plain_model, "", nullptr), plain_model);
+  const std::string what = be.name + "/" + f.name + " C disabled binds";
+  Tokens next = ToTokens(SyntheticTokens(55 + f.window, 27));
+  Result rs = spec.Run(next, limit), rp = plain.Run(next, limit);
+  Require(rs.published == rp.published, what + ": the first request differs from plain's");
+  const DrafterHealth* health = DraftingHealthOf(*spec.state);
+  Require(health != nullptr && health->disabled() && health->failures() == DrafterHealth::kLimit, what + ": drafting must be switched off after the first request");
+  const std::size_t resets_before = plan->resets, reset_failures_before = health->reset_failures(), failures_before = health->failures();
+  plan->pending_resets = 1000;  // from here on every context reset throws: the old code would count and warn at each bind
+  std::ostringstream captured;
+  std::streambuf* const old_buf = std::cerr.rdbuf(captured.rdbuf());
+  std::string failure;
+  try {
+    for (int turn = 0; turn < 10; ++turn) {
+      next = Extend(rp.checkpoint_tokens, 7, 5 + turn);
+      rs = spec.Run(next, limit);
+      rp = plain.Run(next, limit);
+      if (rs.published != rp.published) throw std::runtime_error("request " + std::to_string(turn + 2) + "'s tokens differ from plain's");
+    }
+  } catch (const std::exception& e) {
+    failure = e.what();
+  }
+  std::cerr.rdbuf(old_buf);
+  Require(failure.empty(), what + ": " + failure);
+  RequireSameState(plain, spec, what);
+  const std::string log = captured.str();
+  const std::size_t warnings = static_cast<std::size_t>(std::count(log.begin(), log.end(), '\n'));
+  Require(plan->resets == resets_before && health->reset_failures() == reset_failures_before && health->failures() == failures_before,
+          what + ": ten binds after the switch-off made " + std::to_string(plan->resets - resets_before) + " ResetTo calls (" + std::to_string(health->reset_failures() - reset_failures_before) +
+              " failed) and " + std::to_string(health->failures() - failures_before) + " more failures; expected none");
+  Require(warnings == 0, what + ": ten binds after the switch-off printed " + std::to_string(warnings) + " warning lines; expected none");
+  std::printf("  %s/%s: C disabled binds. ten requests after the switch-off: %zu ResetTo calls, %zu warning lines, tokens and end state equal plain's\n", be.name.c_str(), f.name.c_str(),
+              plan->resets - resets_before, warnings);
+}
+
 /// Item 1 (stage 4c): a drafter that cannot be BUILT (the engine, or the shared device upload) costs speed, never the request.
 /// `builds` counts the attempts of each kind across the setup; a build that fails in a row 3 times switches drafting off for the session
 /// and nothing is attempted after that.
@@ -946,6 +994,7 @@ int main(int argc, char** argv) {
         if (wants("fail", f)) {
           FailTests(f, be, dir);
           BuildFailTests(f, be, dir);
+          DisabledBindTests(f, be, dir);
           ++groups;
         }
       }
