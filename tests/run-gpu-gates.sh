@@ -22,7 +22,8 @@
 #   engine_tests      executor_contract drafter_ops
 #                                         (engine_test, continuation_test and draft_session_test
 #                                          (docs/DRAFTER-S3.md: Session::Verify / AcceptVerified / taps, 6
-#                                          invocations: verify, rest and rewind0 of tinyA and tinyB; and 12 of ricursive_speculative_test,
+#                                          invocations: verify, rest and rewind0 of tinyA and tinyB; and 32 of ricursive_speculative_followup_test
+#                                          (docs/DRAFTER-S4.md, Follow-ups: reuse, end, fail, flow; both modes, both drafters); and 12 of ricursive_speculative_test,
 #                                          docs/DRAFTER-S4.md: mock, real and runner of both fixtures in gpu-exact and
 #                                          production mode; and 8 more of the same binary with the GPU drafter in place
 #                                          of the CPU reference (RICURSIVE_TEST_DRAFTER=ops: real and runner, both
@@ -146,6 +147,17 @@ invocations() {
         for f in tinyA tinyB; do
           echo "spec-ops-$g-$f|ricursive_speculative_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu-exact RICURSIVE_TEST_DRAFTER=ops"
           echo "spec-ops-prod-$g-$f|ricursive_speculative_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu RICURSIVE_TEST_DRAFTER=ops"
+        done
+      done
+      # docs/DRAFTER-S4.md, "Follow-ups" (job 1692): the drafter's context across requests (reuse), the state a request
+      # leaves (end: in production mode compared with plain given the same call sequence), a failing drafter (fail),
+      # flows as gufo's pool issues them (flow). Exact and production mode, with the CPU reference drafter and the GPU one.
+      for g in reuse end fail flow; do
+        for f in tinyA tinyB; do
+          echo "follow-$g-$f|ricursive_speculative_followup_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu-exact"
+          echo "follow-prod-$g-$f|ricursive_speculative_followup_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu"
+          echo "follow-ops-$g-$f|ricursive_speculative_followup_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu-exact RICURSIVE_TEST_DRAFTER=ops"
+          echo "follow-ops-prod-$g-$f|ricursive_speculative_followup_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu RICURSIVE_TEST_DRAFTER=ops"
         done
       done ;;
     engine_logits)

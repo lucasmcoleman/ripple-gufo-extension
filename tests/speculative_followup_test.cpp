@@ -6,6 +6,7 @@
 //   end    B. a request that ends by its token limit (or by a stop token, or is cancelled) leaves the session
 //             and its checkpoint where plain generation leaves them, given the same call sequence
 //   fail   C. a drafter that throws costs speed, never the request
+//   flow   D. flows through the runner as gufo's pool issues them (interleaving, cancel, cut by limit, restore)
 //
 // Requests are driven the way gufo's scheduler drives the runner pool (the budget arithmetic of
 // StepMultiTokenDecode, the preview, Commit and Cancel with their checkpoint bound): see Serve::Run.
@@ -538,6 +539,90 @@ void FailTests(const TinyFixture& f, const DraftBackend& be, const std::string& 
               checked);
 }
 
+// ---- D: requests the way gufo's pool and scheduler issue them -------------------------------------------------------
+// gufo's TextRunnerPool and ComponentTextCache live in gufo's serving library, which an out-of-tree extension may not
+// link (cmake/GufoExtensionDiscovery.cmake rejects gufo_serving) and which no public header declares. Serve::Run is the
+// closest this tree allows: a new runner state per acquire, the scheduler's budget and preview arithmetic, Commit/Cancel
+// checkpoint bounds. What it cannot reach: the cache's own bookkeeping (snapshot publication, disk, leases); those are
+// gate entries for the night run (docs/DRAFTER-S4.md, Follow-ups, item D).
+
+void FlowTests(const TinyFixture& f, const DraftBackend& be, const std::string& dir) {
+  const Models m = MakeModels(f, be, dir);
+  const std::size_t limit = 20;
+  const std::string tag = be.name + "/" + f.name + " D";
+  const Tokens prompt_a = ToTokens(SyntheticTokens(55 + f.window, 27)), prompt_b = ToTokens(SyntheticTokens(901 + f.window, 21));
+  std::size_t checked = 0;
+
+  // 1. two sessions interleaved at step granularity: a whole request of B runs inside every step of A's second turn.
+  {
+    Serve a(m.spec_runner, m.spec), b(m.spec_runner, m.spec), pa(m.plain_runner, m.plain), pb(m.plain_runner, m.plain);
+    const Result a1 = a.Run(prompt_a, limit), pa1 = pa.Run(prompt_a, limit);
+    Require(a1.published == pa1.published, tag + " interleaved: first turn of A differs from plain");
+    Tokens b_prompt = prompt_b, pb_prompt = prompt_b;
+    std::size_t inner = 0;
+    Hooks h;
+    h.after_step = [&](Serve&) {
+      const Result rb = b.Run(b_prompt, 6), rpb = pb.Run(pb_prompt, 6);
+      Require(rb.published == rpb.published, tag + " interleaved: a request of B inside A's step differs from plain");
+      // the conversation continues while it fits the context cap, then starts over (a cold start on the same slot)
+      const bool fits = rb.checkpoint_tokens.size() + 4 + 6 <= 90;
+      b_prompt = fits ? Extend(rb.checkpoint_tokens, 4, 3 + inner) : prompt_b;
+      pb_prompt = fits ? Extend(rpb.checkpoint_tokens, 4, 3 + inner) : prompt_b;
+      ++inner;
+    };
+    const Tokens p2 = Extend(a1.checkpoint_tokens, 6, 5);
+    const Result a2 = a.Run(p2, limit, Ending::kLimit, 0, h), pa2 = pa.Run(p2, limit);
+    Require(inner > 1 && a2.cached == a1.checkpoint && a2.published == pa2.published, tag + " interleaved: A's second turn differs from plain, or B did not interleave");
+    DraftedSession* ds = DraftingOf(*a.state);
+    Require(ds != nullptr && Ledger(*ds, 0).empty(), tag + " interleaved: A's drafter lost its context");
+    ++checked;
+  }
+
+  // 2. a cancelled request, then a new one: the same conversation, then an unrelated prompt (cold), then a restore into another slot.
+  {
+    Serve a(m.spec_runner, m.spec), b(m.spec_runner, m.spec), pa(m.plain_runner, m.plain), pb(m.plain_runner, m.plain);
+    const Truth running = FindTruth(m.spec, 23, 100 + 23 * 7, limit + 18, false);
+    const Tokens p1 = ToTokens(running.prompt);
+    const Result c1 = a.Run(p1, 24, Ending::kCancel, 2), pc1 = pa.Run(p1, 24, Ending::kCancel, 2);
+    const std::size_t common = std::min(c1.published.size(), pc1.published.size());
+    Require(common > 0 && std::equal(c1.published.begin(), c1.published.begin() + common, pc1.published.begin()), tag + " cancel: tokens differ from plain");
+    RequireLive(a, c1, tag + " cancel");
+    const Tokens next = Extend(c1.checkpoint_tokens, 5, 4);
+    const Result n1 = a.Run(next, limit), pn1 = pa.Run(next, limit);
+    Require(n1.published == pn1.published && n1.cached > 0, tag + " cancel: the request after a cancellation differs from plain");
+    const Result u1 = a.Run(prompt_b, limit), pu1 = pa.Run(prompt_b, limit);  // unrelated: cold start on the same slot
+    Require(u1.published == pu1.published && u1.cached == 0, tag + " cancel: an unrelated request after a cancellation differs from plain");
+    // the checkpoint the cancelled request left is restored into another slot
+    const Result c2 = b.Run(p1, 24, Ending::kCancel, 2);
+    const Checkpoint ck = Capture(*b.rig);
+    Hooks hr;
+    hr.after_acquire = [&](Serve& s) { Require(Restore(*s.rig, ck), "restore refused"); };
+    const Tokens next2 = Extend(c2.checkpoint_tokens, 5, 8);
+    const Result r2 = a.Run(next2, limit, Ending::kLimit, 0, hr), pr2 = pb.Run(next2, limit);
+    Require(r2.cached == ck.n && r2.published == pr2.published, tag + " cancel: a restore of a cancelled checkpoint differs from plain");
+    ++checked;
+  }
+
+  // 3. a request cut by its limit inside a draft, its checkpoint restored into another slot, which continues the conversation.
+  for (const std::size_t cut : {1u, 3u, 7u}) {
+    Serve a(m.spec_runner, m.spec), b(m.spec_runner, m.spec), pa(m.plain_runner, m.plain), pb(m.plain_runner, m.plain);
+    const Result r1 = a.Run(prompt_a, cut), p1 = pa.Run(prompt_a, cut);
+    Require(r1.published == p1.published, tag + " cut " + std::to_string(cut) + ": tokens differ from plain");
+    RequireSameState(pa, a, tag + " cut " + std::to_string(cut));
+    const Checkpoint ck = Capture(*a.rig);
+    Hooks hr;
+    hr.after_acquire = [&](Serve& s) { Require(Restore(*s.rig, ck), "restore refused"); };
+    hr.after_prefill = [&](Serve& s) { Require(Ledger(*DraftingOf(*s.state), static_cast<std::uint32_t>(ck.n)).empty(), tag + ": drafter after a restore"); };
+    const Tokens next = Extend(r1.checkpoint_tokens, 6, 2);
+    const Result r2 = b.Run(next, limit, Ending::kLimit, 0, hr), p2 = pb.Run(next, limit, Ending::kLimit, 0, {});
+    Require(r2.cached == ck.n && r2.published == p2.published, tag + " cut " + std::to_string(cut) + ": the restored continuation differs from plain");
+    ++checked;
+  }
+  std::printf("  %s/%s: D. %zu flows through the runner as gufo's pool issues them (two sessions interleaved inside each other's steps, a cancellation then a new request, "
+              "a limit inside a draft then a restore into another slot): tokens equal plain's\n",
+              be.name.c_str(), f.name.c_str(), checked);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -562,6 +647,10 @@ int main(int argc, char** argv) {
         }
         if (wants("end", f)) {
           EndTests(f, be, dir);
+          ++groups;
+        }
+        if (wants("flow", f)) {
+          FlowTests(f, be, dir);
           ++groups;
         }
         if (wants("fail", f)) {
