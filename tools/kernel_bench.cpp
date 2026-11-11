@@ -62,6 +62,14 @@ std::uint64_t Fnv(const std::vector<float>& v) {
   return h;
 }
 
+std::uint64_t FnvBytes(const std::vector<std::uint8_t>& v, std::uint64_t h = 1469598103934665603ULL) {
+  for (std::uint8_t b : v) {
+    h ^= b;
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
 double Median(std::vector<double> v) {
   std::sort(v.begin(), v.end());
   return v[v.size() / 2];
@@ -141,6 +149,106 @@ void RunAttention(int keys, bool sliding, int reps) {
   HCHECK(hipFree(out));
 }
 
+// ---- multi-row passes (prompt processing) -------------------------------------------
+
+/// QkNormRopeAppend for `rows` rows (position 0..rows-1) into F16 caches. The hash covers q (rotated in
+/// place), the K cache and the V cache. Each timed call recomputes from the same inputs: q is restored first
+/// (the kernel works in place), which is part of the timed region only as a device copy of 84 MB at 2048 rows,
+/// so it is timed separately and subtracted.
+void RunQkRope(int rows, bool sliding, int reps) {
+  constexpr int kHeads = 80, kKv = 8, kDim = 128;
+  const std::uint32_t capacity = sliding ? 1024 + rows - 1 : rows;
+  Rng rng{0xABCDEF12345ULL};
+  std::vector<float> hq(std::size_t{rows} * kHeads * kDim), hk(std::size_t{rows} * kKv * kDim),
+      hv(hk.size()), gq(kDim), gk(kDim);
+  for (auto& x : hq) x = rng.Unit();
+  for (auto& x : hk) x = rng.Unit();
+  for (auto& x : hv) x = rng.Unit();
+  for (auto& x : gq) x = 0.5F + rng.Unit() * 0.25F;
+  for (auto& x : gk) x = 0.5F + rng.Unit() * 0.25F;
+  float *q, *q0, *kk, *vv, *dgq, *dgk;
+  void *kc, *vc;
+  const std::size_t cbytes = std::size_t{capacity} * kKv * kDim * 2;
+  HCHECK(hipMalloc(&q, hq.size() * 4));
+  HCHECK(hipMalloc(&q0, hq.size() * 4));
+  HCHECK(hipMalloc(&kk, hk.size() * 4));
+  HCHECK(hipMalloc(&vv, hv.size() * 4));
+  HCHECK(hipMalloc(&dgq, kDim * 4));
+  HCHECK(hipMalloc(&dgk, kDim * 4));
+  HCHECK(hipMalloc(&kc, cbytes));
+  HCHECK(hipMalloc(&vc, cbytes));
+  HCHECK(hipMemcpy(q0, hq.data(), hq.size() * 4, hipMemcpyHostToDevice));
+  HCHECK(hipMemcpy(kk, hk.data(), hk.size() * 4, hipMemcpyHostToDevice));
+  HCHECK(hipMemcpy(vv, hv.data(), hv.size() * 4, hipMemcpyHostToDevice));
+  HCHECK(hipMemcpy(dgq, gq.data(), kDim * 4, hipMemcpyHostToDevice));
+  HCHECK(hipMemcpy(dgk, gk.data(), kDim * 4, hipMemcpyHostToDevice));
+  std::string err;
+  auto call = [&](int) {
+    HCHECK(hipMemcpyAsync(q, q0, hq.size() * 4, hipMemcpyDeviceToDevice, nullptr));
+    if (!k::QkNormRopeAppend(q, kk, vv, dgq, dgk, kc, vc, k::KvType::kF16, rows, kHeads, kKv, 1e-6F, 0, capacity,
+                             kDim, 10000.0F, nullptr, &err)) {
+      std::fprintf(stderr, "QkNormRopeAppend: %s\n", err.c_str());
+      std::exit(2);
+    }
+  };
+  call(0);
+  HCHECK(hipDeviceSynchronize());
+  std::vector<std::uint8_t> bq(hq.size() * 4), bk(cbytes), bv(cbytes);
+  HCHECK(hipMemcpy(bq.data(), q, bq.size(), hipMemcpyDeviceToHost));
+  HCHECK(hipMemcpy(bk.data(), kc, cbytes, hipMemcpyDeviceToHost));
+  HCHECK(hipMemcpy(bv.data(), vc, cbytes, hipMemcpyDeviceToHost));
+  const std::uint64_t h = FnvBytes(bv, FnvBytes(bk, FnvBytes(bq)));
+  const double both = TimeIt(reps, call);
+  const double copy = TimeIt(reps, [&](int) {
+    HCHECK(hipMemcpyAsync(q, q0, hq.size() * 4, hipMemcpyDeviceToDevice, nullptr));
+  });
+  std::printf("qkrope %-7s rows=%-5d  %9.1f us (q restore %.1f us subtracted)   hash=%016llx\n",
+              sliding ? "sliding" : "full", rows, both - copy, copy, static_cast<unsigned long long>(h));
+  for (void* p : {static_cast<void*>(q), static_cast<void*>(q0), static_cast<void*>(kk), static_cast<void*>(vv),
+                  static_cast<void*>(dgq), static_cast<void*>(dgk), kc, vc})
+    HCHECK(hipFree(p));
+}
+
+/// Attention128 for a pass of `rows` rows starting at position `start` (window 0 = full).
+void RunAttentionRows(int rows, int start, int window, int reps) {
+  constexpr int kHeads = 80, kKv = 8, kDim = 128;
+  const std::uint32_t capacity = window != 0 ? static_cast<std::uint32_t>(window + rows - 1)
+                                             : static_cast<std::uint32_t>(start + rows);
+  Rng rng{0x5151515151ULL};
+  const std::size_t cache_elems = std::size_t{capacity} * kKv * kDim;
+  std::vector<__half> hc(cache_elems);
+  std::vector<float> hq(std::size_t{rows} * kHeads * kDim);
+  for (auto& x : hq) x = rng.Unit();
+  void *kc, *vc;
+  HCHECK(hipMalloc(&kc, cache_elems * 2));
+  HCHECK(hipMalloc(&vc, cache_elems * 2));
+  for (auto x = hc.begin(); x != hc.end(); ++x) *x = __float2half(rng.Unit());
+  HCHECK(hipMemcpy(kc, hc.data(), cache_elems * 2, hipMemcpyHostToDevice));
+  for (auto x = hc.begin(); x != hc.end(); ++x) *x = __float2half(rng.Unit());
+  HCHECK(hipMemcpy(vc, hc.data(), cache_elems * 2, hipMemcpyHostToDevice));
+  float *q, *out;
+  HCHECK(hipMalloc(&q, hq.size() * 4));
+  HCHECK(hipMalloc(&out, hq.size() * 4));
+  HCHECK(hipMemcpy(q, hq.data(), hq.size() * 4, hipMemcpyHostToDevice));
+  std::string err;
+  auto call = [&](int) {
+    if (!k::Attention128(q, kc, vc, k::KvType::kF16, out, rows, kHeads, kKv, window, start, capacity,
+                         0.08838834764831845F, nullptr, &err)) {
+      std::fprintf(stderr, "Attention128: %s\n", err.c_str());
+      std::exit(2);
+    }
+  };
+  call(0);
+  HCHECK(hipDeviceSynchronize());
+  std::vector<float> ho(hq.size());
+  HCHECK(hipMemcpy(ho.data(), out, ho.size() * 4, hipMemcpyDeviceToHost));
+  const double us = TimeIt(reps, call);
+  std::printf("attn-rows %-7s rows=%-5d start=%-5d  %10.1f us   hash=%016llx\n", window != 0 ? "sliding" : "full",
+              rows, start, us, static_cast<unsigned long long>(Fnv(ho)));
+  for (void* p : {static_cast<void*>(kc), static_cast<void*>(vc), static_cast<void*>(q), static_cast<void*>(out)})
+    HCHECK(hipFree(p));
+}
+
 // ---- projection ----------------------------------------------------------------
 
 void RunProjection(const std::string& tname, int M, int K, int reps) {
@@ -216,6 +324,17 @@ int main(int argc, char** argv) {
     RunAttention(std::atoi(argv[2]), argc < 4 || std::string(argv[3]) != "full", argc >= 5 ? std::atoi(argv[4]) : 60);
   } else if (mode == "proj" && argc >= 5) {
     RunProjection(argv[2], std::atoi(argv[3]), std::atoi(argv[4]), argc >= 6 ? std::atoi(argv[5]) : 40);
+  } else if (mode == "rows-suite") {
+    for (int rows : {510, 2048}) {
+      RunQkRope(rows, true, 3);
+      RunQkRope(rows, false, 3);
+    }
+    RunAttentionRows(510, 0, 1024, 3);
+    RunAttentionRows(2048, 0, 1024, 3);
+    RunAttentionRows(2048, 2048, 1024, 3);
+    RunAttentionRows(510, 0, 0, 3);
+    RunAttentionRows(2048, 0, 0, 3);
+    RunAttentionRows(2048, 2048, 0, 3);
   } else if (mode == "attn-suite") {
     RunAttention(540, true, 60);
     RunAttention(1024, true, 60);

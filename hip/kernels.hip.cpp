@@ -194,10 +194,15 @@ __global__ void GatherRowsKernel(const float* src, const std::int32_t* ids,
 
 // ---- q/k norm, RoPE, KV append ----------------------------------------------
 
-/// grid (tokens, heads + 2 * kv_heads), block 128 (one thread per dimension).
-/// Block y < heads: query head (norm, RoPE, in place). Next kv_heads blocks:
-/// key heads (norm, RoPE, into the cache). Last kv_heads blocks: value heads
-/// (no norm, into the cache). Norm: y = (x * rsqrt(mean(x^2) + eps)) * gamma.
+/// grid (tokens, ceil((heads + 2 * kv_heads) / hb)), block 128 (one thread per
+/// dimension). Each block handles hb consecutive "heads" of one token: indices
+/// b < heads are query heads (norm, RoPE, in place), the next kv_heads key
+/// heads (norm, RoPE, into the cache), the last kv_heads value heads (no norm,
+/// into the cache). Norm: y = (x * rsqrt(mean(x^2) + eps)) * gamma. The RoPE
+/// cos/sin of (position, pair) is the same for every head, so a block that
+/// serves several heads evaluates it once (it is double-precision pow, cos and
+/// sin, which dominated the kernel when every head recomputed it); the value
+/// each element gets is unchanged.
 template<class CacheT>
 __global__ void QkNormRopeAppendKernel(
     float* __restrict__ q, const float* __restrict__ k,
@@ -205,53 +210,63 @@ __global__ void QkNormRopeAppendKernel(
     const float* __restrict__ k_gamma, CacheT* __restrict__ k_cache,
     CacheT* __restrict__ v_cache, std::uint32_t heads, std::uint32_t kv_heads,
     float eps, std::uint32_t start_pos, std::uint32_t capacity,
-    std::uint32_t rotary_dim, double theta) {
+    std::uint32_t rotary_dim, double theta, std::uint32_t hb) {
   const std::uint32_t t = blockIdx.x;
-  const std::uint32_t b = blockIdx.y;
   const std::uint32_t d = threadIdx.x;
   const std::uint32_t pos = start_pos + t;
   const std::size_t kv_width = std::size_t{kv_heads} * kHeadDim;
   const std::size_t slot = RingSlot(pos, capacity);
-  if (b >= heads + kv_heads) {
-    const std::uint32_t h = b - heads - kv_heads;
-    StoreCache(&v_cache[slot * kv_width + h * kHeadDim + d],
-               v[std::size_t{t} * kv_width + h * kHeadDim + d]);
-    return;
-  }
-  const bool is_q = b < heads;
-  const std::uint32_t h = is_q ? b : b - heads;
-  float* qrow = q + (std::size_t{t} * heads + h) * kHeadDim;
-  const float* krow = k + std::size_t{t} * kv_width + h * kHeadDim;
-  const float x = is_q ? qrow[d] : krow[d];
-  __shared__ float part[kMaxWaves];
-  __shared__ float normed[kHeadDim];
-  float ss = WaveSum(x * x);
-  if (d % warpSize == 0) {
-    part[d / warpSize] = ss;
-  }
-  __syncthreads();
-  float total = part[0];
-  for (int i = 1; i < static_cast<int>(kHeadDim) / warpSize; ++i) {
-    total += part[i];
-  }
-  const float mean = total / static_cast<float>(kHeadDim);
-  const float scale = 1.0F / sqrtf(mean + eps);
-  normed[d] = (x * scale) * (is_q ? q_gamma[d] : k_gamma[d]);
-  __syncthreads();
-  float out = normed[d];
-  if (rotary_dim != 0) {
+  const std::uint32_t total_heads = heads + 2 * kv_heads;
+  const std::uint32_t first = blockIdx.y * hb;
+  const std::uint32_t last = first + hb < total_heads ? first + hb : total_heads;
+  float c = 0.0F;
+  float s = 0.0F;
+  if (rotary_dim != 0 && first < heads + kv_heads) {
     const std::uint32_t pair = RopePair(d, rotary_dim);
     const double angle = RopeAngle(pos, pair, rotary_dim, theta);
-    const float c = static_cast<float>(cos(angle));
-    const float s = static_cast<float>(sin(angle));
-    const float xa = normed[pair];
-    const float xb = normed[pair + rotary_dim / 2];
-    out = d < rotary_dim / 2 ? xa * c - xb * s : xa * s + xb * c;
+    c = static_cast<float>(cos(angle));
+    s = static_cast<float>(sin(angle));
   }
-  if (is_q) {
-    qrow[d] = out;
-  } else {
-    StoreCache(&k_cache[slot * kv_width + h * kHeadDim + d], out);
+  __shared__ float part[kMaxWaves];
+  __shared__ float normed[kHeadDim];
+  for (std::uint32_t b = first; b < last; ++b) {
+    if (b >= heads + kv_heads) {
+      const std::uint32_t h = b - heads - kv_heads;
+      StoreCache(&v_cache[slot * kv_width + h * kHeadDim + d],
+                 v[std::size_t{t} * kv_width + h * kHeadDim + d]);
+      continue;
+    }
+    const bool is_q = b < heads;
+    const std::uint32_t h = is_q ? b : b - heads;
+    float* qrow = q + (std::size_t{t} * heads + h) * kHeadDim;
+    const float* krow = k + std::size_t{t} * kv_width + h * kHeadDim;
+    const float x = is_q ? qrow[d] : krow[d];
+    float ss = WaveSum(x * x);
+    __syncthreads();  // part and normed are reused by the previous head
+    if (d % warpSize == 0) {
+      part[d / warpSize] = ss;
+    }
+    __syncthreads();
+    float total = part[0];
+    for (int i = 1; i < static_cast<int>(kHeadDim) / warpSize; ++i) {
+      total += part[i];
+    }
+    const float mean = total / static_cast<float>(kHeadDim);
+    const float scale = 1.0F / sqrtf(mean + eps);
+    normed[d] = (x * scale) * (is_q ? q_gamma[d] : k_gamma[d]);
+    __syncthreads();
+    float out = normed[d];
+    if (rotary_dim != 0) {
+      const std::uint32_t pair = RopePair(d, rotary_dim);
+      const float xa = normed[pair];
+      const float xb = normed[pair + rotary_dim / 2];
+      out = d < rotary_dim / 2 ? xa * c - xb * s : xa * s + xb * c;
+    }
+    if (is_q) {
+      qrow[d] = out;
+    } else {
+      StoreCache(&k_cache[slot * kv_width + h * kHeadDim + d], out);
+    }
   }
 }
 
@@ -531,17 +546,21 @@ bool QkNormRopeAppend(float* q, const float* k, const float* v,
       k_gamma == nullptr || k_cache == nullptr || v_cache == nullptr) {
     return Fail(error, "QkNormRopeAppend: null pointer");
   }
-  const dim3 grid(tokens, heads + 2 * kv_heads);
+  // Few rows: one head per block keeps the GPU busy; many rows: one block per row serves every head and
+  // evaluates the RoPE angle once.
+  const std::uint32_t total_heads = heads + 2 * kv_heads;
+  const std::uint32_t hb = tokens <= 4 ? 1U : total_heads;
+  const dim3 grid(tokens, (total_heads + hb - 1) / hb);
   if (type == KvType::kF16) {
     QkNormRopeAppendKernel<__half><<<grid, kHeadDim, 0, stream>>>(
         q, k, v, q_gamma, k_gamma, static_cast<__half*>(k_cache),
         static_cast<__half*>(v_cache), heads, kv_heads, eps, start_pos,
-        capacity, rotary_dim, static_cast<double>(theta));
+        capacity, rotary_dim, static_cast<double>(theta), hb);
   } else {
     QkNormRopeAppendKernel<float><<<grid, kHeadDim, 0, stream>>>(
         q, k, v, q_gamma, k_gamma, static_cast<float*>(k_cache),
         static_cast<float*>(v_cache), heads, kv_heads, eps, start_pos,
-        capacity, rotary_dim, static_cast<double>(theta));
+        capacity, rotary_dim, static_cast<double>(theta), hb);
   }
   return Launched(error, "QkNormRopeAppend");
 }
