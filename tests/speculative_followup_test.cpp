@@ -805,6 +805,50 @@ void BuildFailTests(const TinyFixture& f, const DraftBackend& be, const std::str
     Require(health != nullptr && health->build_given_up() && health->build_failures() == DrafterHealth::kLimit, what + ": the build must be given up after the third failure");
     ++checked;
   }
+  // Stage 4c-fix item 1: the endings a stop sequence and a cancellation give a request that runs WITHOUT a drafter (the build failed). Under --speculative
+  // the runner sets multi_token_decode, so gufo always calls DecodeStep, and with no decoder that is ext::TextModelRunner::DecodeStep: select AND
+  // advance, before the scheduler publishes. A stop sequence on the E-th token then leaves L + E rows where plain (PrepareDecode: publish, stop, no
+  // advance) leaves L + E - 1: one extra row, the same class as the divergence docs/DRAFTER-S4.md records for drafted requests. A cancellation between
+  // steps has advanced every published token on both sides (L + n). Exact back ends only: on the production route the extra row changes the next
+  // request's pass boundaries (group `fail` has production-mode gate entries; this part skips there, as group `endcut` has none).
+  if (!be.exact) {
+    std::printf("  %s/%s: C build (stop sequence and cancellation without a drafter): skipped, exact back ends only (docs/DRAFTER-S4.md, \"Known divergences from plain\")\n", be.name.c_str(), f.name.c_str());
+  } else {
+    auto setup = std::make_shared<SpeculativeSetup>(*base);
+    setup->engine_factory = [](const SpeculativeSetup&, const EngineModel&) -> std::unique_ptr<DrafterEngine> { throw std::runtime_error("injected engine build failure"); };
+    const auto spec_model = ArmedModel(f, be, *setup);
+    const auto plain_model = PlainModel(f, be);
+    const Truth running = FindTruth(spec_model, 23, 100 + 23 * 7, limit + 18, false);
+    const Tokens run_prompt = ToTokens(running.prompt);
+    {  // a stop sequence at the 5th published token
+      Serve spec(CreateRunnerForModel(spec_model, "", setup), spec_model), plain(CreateRunnerForModel(plain_model, "", nullptr), plain_model);
+      const std::string what = be.name + "/" + f.name + " C build, stop sequence at token 5, no drafter";
+      const Result rs = spec.Run(run_prompt, 24, Ending::kStopSequence, 5), rp = plain.Run(run_prompt, 24, Ending::kStopSequence, 5);
+      Require(rs.published.size() == 5 && rs.published == rp.published && rs.drafted == 0, what + ": the published tokens must be plain's (5, no drafts)");
+      RequireLive(spec, rs, what);
+      RequireLive(plain, rp, what);
+      // the documented state: plain L + E - 1, the fallback L + E (its checkpoint is plain's plus the last published token, advanced)
+      Require(rp.checkpoint == run_prompt.size() + 4 && rs.checkpoint == run_prompt.size() + 5 &&
+                  std::equal(rp.checkpoint_tokens.begin(), rp.checkpoint_tokens.end(), rs.checkpoint_tokens.begin()),
+              what + ": plain must leave L + 4 = " + std::to_string(run_prompt.size() + 4) + " rows and the fallback L + 5 (plain's plus one); got plain " + std::to_string(rp.checkpoint) +
+                  ", fallback " + std::to_string(rs.checkpoint));
+      Require(DraftingOf(*spec.state) == nullptr, what + ": the build must have failed (no drafting)");
+    }
+    {  // a cancellation before step 2
+      Serve spec(CreateRunnerForModel(spec_model, "", setup), spec_model), plain(CreateRunnerForModel(plain_model, "", nullptr), plain_model);
+      const std::string what = be.name + "/" + f.name + " C build, cancelled before step 2, no drafter";
+      const Result rs = spec.Run(run_prompt, 24, Ending::kCancel, 2), rp = plain.Run(run_prompt, 24, Ending::kCancel, 2);
+      const std::size_t common = std::min(rs.published.size(), rp.published.size());
+      Require(common > 0 && std::equal(rs.published.begin(), rs.published.begin() + static_cast<std::ptrdiff_t>(common), rp.published.begin()), what + ": the tokens differ from plain's");
+      RequireLive(spec, rs, what);
+      RequireLive(plain, rp, what);
+      // the documented state: both have advanced every published token of two steps: L + 2 rows, plain's checkpoint
+      Require(rs.checkpoint == run_prompt.size() + 2 && rp.checkpoint == run_prompt.size() + 2 && rs.checkpoint_tokens == rp.checkpoint_tokens,
+              what + ": after two steps both must hold L + 2 = " + std::to_string(run_prompt.size() + 2) + " rows (plain " + std::to_string(rp.checkpoint) + ", fallback " + std::to_string(rs.checkpoint) + ")");
+    }
+    ++checked;
+    std::printf("  %s/%s: C build (no drafter): a stop sequence leaves plain's checkpoint plus one row (the documented divergence), a cancellation leaves plain's\n", be.name.c_str(), f.name.c_str());
+  }
   // Stage 4c-fix item 5: the message of the exception is copied into a fixed buffer, not built as a string inside the handler (a bad_alloc there ends the
   // process). A 20,000-character message is truncated to the buffer; the request completes as plain.
   {

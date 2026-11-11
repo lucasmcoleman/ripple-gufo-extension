@@ -170,6 +170,9 @@ invocations() {
           echo "follow-ops-prod-$g-$f|ricursive_speculative_followup_test|$g:$f|RICURSIVE_TEST_BACKEND=gpu RICURSIVE_TEST_DRAFTER=ops"
         done
       done
+      # The `fail` group also holds a stop-sequence and a cancellation ending of a request without a drafter (a failed build): the fallback advances
+      # the token before it is published, so it leaves one row more than plain (docs/DRAFTER-S4.md, "Known divergences from plain"); that part runs
+      # in the exact-mode entries only (the production entries print a skip), for the reason given for endcut below. No entry was added.
       # endcut (a stop sequence and a cancellation) has exact-mode entries only: such a request leaves the rows of the whole step it was cut in,
       # which plain does not, so on the production route the next request's pass boundaries differ from plain's by construction (docs/DRAFTER-S4.md,
       # "Known divergences from plain"). Reuse in production mode compares with plain given the same call sequence (stage 4c, item 3).
