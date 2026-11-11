@@ -237,6 +237,12 @@
       ],
       "role": "test"
     },
+    "ricursive_plain_fingerprint_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
     "ricursive_capture_test": {
       "requires": [
         "testing"

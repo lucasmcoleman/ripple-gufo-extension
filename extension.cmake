@@ -241,6 +241,14 @@ _ricursive_test(capture TIMEOUT 1800
     gufo_ricursive_reference gufo_ricursive)
 
 # Per-stage timing accumulator and report (docs/PERF-PROFILE.md), fake clock.
+# Plain generation fingerprint and the target side of drafting (verification
+# pass, rewind, taps; docs/DRAFTER-S3.md): CPU executor and host ops, tiny
+# fixtures.
+_ricursive_test(plain_fingerprint TIMEOUT 1800
+  SOURCES tests/plain_fingerprint_test.cpp tests/draft_hostops.cpp
+  LINK_LIBRARIES gufo_ricursive_hostops gufo_ricursive_exec
+    gufo_ricursive_reference gufo_ricursive gufo_ext_cache)
+
 _ricursive_test(profile
   SOURCES tests/profile_test.cpp LINK_LIBRARIES gufo_ricursive_exec gufo_ricursive)
 
