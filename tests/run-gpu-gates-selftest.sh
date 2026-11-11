@@ -20,7 +20,7 @@ for bin in ricursive_kernel_ops_test ricursive_attention_ops_test ricursive_proj
            ricursive_drafter_op_shapes_test; do
   cat >"$ROOT/bin/$bin" <<'FAKE'
 #!/usr/bin/env bash
-me="$(basename "$0") $* ${RICURSIVE_CONTRACT_BACKEND:-} ${RICURSIVE_TEST_BACKEND:-}"
+me="$(basename "$0") $* ${RICURSIVE_CONTRACT_BACKEND:-} ${RICURSIVE_TEST_BACKEND:-} ${RICURSIVE_TEST_ATTENTION:-}"
 [ -n "${FAKE_SLEEP:-}" ] && grep -Eq -- "$FAKE_SLEEP" <<<"$me" && sleep 30
 if [ -n "${FAKE_SKIP:-}" ] && grep -Eq -- "$FAKE_SKIP" <<<"$me"; then echo "SKIP: no GPU device"; exit 77; fi
 if [ -n "${FAKE_FAIL:-}" ] && grep -Eq -- "$FAKE_FAIL" <<<"$me"; then echo "FAIL: injected failure in $me"; exit 1; fi
@@ -93,6 +93,9 @@ check "lock refused: independent gates not tried (LOCKED), dependents NOT-RUN" '
 
 run FAKE_LOCK_REFUSE='ricursive_embed_test'
 check "lock lost mid-run: earlier gates PASS, embed LOCKED, dependents NOT-RUN, no retry" 'row kernel_ops all | grep -q " PASS " && row embed gpu | grep -q "LOCKED(75)" && row executor_test taps:tinyA | grep -q "NOT-RUN" && [ "$(wc -l <"$CALLS")" -eq 38 ]'
+
+run FAKE_FAIL='tiled$'
+check "tiled kernel FAIL (stage 2c gates): only the 4 tiled rows FAIL, the default drafter gates and engine_tests still run and PASS" '[ $RC -eq 1 ] && [ "$(grep -Ec "^drafter_(op_shapes|ops)_tiled +gpu(-exact)? +FAIL" "$ROOT/last.txt")" -eq 4 ] && [ "$(grep -Ec "^gate .* FAIL$" "$ROOT/last.txt")" -eq 2 ] && grep -Eq "^gate drafter_ops +PASS$" "$ROOT/last.txt" && grep -Eq "^gate engine_tests +PASS$" "$ROOT/last.txt" && row drafter_ops gpu | grep -q " PASS " && row engine_tests engine | grep -q " PASS " && ! grep -q NOT-RUN "$ROOT/last.txt"'
 
 run FAKE_SLEEP='attention_ops_test small' INVOCATION_TIMEOUT=1
 check "timeout: FAIL with timed out note" 'row attention_ops small | grep -q " FAIL " && row attention_ops small | grep -q "timed out"'

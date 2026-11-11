@@ -18,14 +18,18 @@
 #                                         (docs/DRAFTER-S2.md, "Stage 2b": ricursive_drafter_op_shapes_test, each new drafter
 #                                          operation alone at the real model's shapes, the GPU operations against the host
 #                                          operations: gpu-exact = F32 rings, gpu = F16 rings (production). Run before
-#                                          drafter_ops: the cheapest and most diagnostic check of the new kernels;
-#                                          gpu-exact-tiled, gpu-tiled: the stage 2c tiled attention kernel, attention only)
+#                                          drafter_ops: the cheapest and most diagnostic check of the new kernels)
 #   drafter_ops       kernel_ops projection_ops embed
 #                                         (docs/DRAFTER-S2.md: ricursive_drafter_ops_test with the drafter on the GPU
 #                                          operations against DrafterReference on the tiny drafters: gpu-exact = F32
 #                                          context storage, gpu = F16 (production); the GPU kernels of the drafter run
-#                                          here for the first time; gpu-exact-tiled, gpu-tiled: the same with the stage 2c
-#                                          tiled attention kernel)
+#                                          here for the first time)
+#   drafter_op_shapes_tiled kernel_ops projection_ops
+#                                         (docs/DRAFTER-S2.md, "Stage 2c": drafter_op_shapes with the tiled attention
+#                                          kernel, attention cases only, gpu-exact and gpu; no gate depends on it)
+#   drafter_ops_tiled kernel_ops projection_ops embed
+#                                         (stage 2c: drafter_ops' tiny walks with the tiled attention kernel, gpu-exact
+#                                          and gpu; no gate depends on it, so a tiled failure never blocks the default path)
 #   engine_tests      executor_contract drafter_ops
 #                                         (engine_test, continuation_test and draft_session_test
 #                                          (docs/DRAFTER-S3.md: Session::Verify / AcceptVerified / taps, 6
@@ -76,7 +80,7 @@ ONLY=${ONLY:-}
 STAGE_DIR=${RICURSIVE_STAGE:-/server/staging/ripple-gufo}   # fixtures/tinyB.gguf and perf/ (the drafters' fixtures)
 
 GATES=(kernel_ops attention_ops projection_ops embed executor_test executor_contract
-       drafter_op_shapes drafter_ops engine_tests engine_logits engine_prompt)
+       drafter_op_shapes drafter_ops drafter_op_shapes_tiled drafter_ops_tiled engine_tests engine_logits engine_prompt)
 declare -A DEPS=(
   [kernel_ops]=""
   [attention_ops]="kernel_ops"
@@ -86,6 +90,8 @@ declare -A DEPS=(
   [executor_contract]="executor_test"
   [drafter_op_shapes]="kernel_ops projection_ops"
   [drafter_ops]="kernel_ops projection_ops embed"
+  [drafter_op_shapes_tiled]="kernel_ops projection_ops"
+  [drafter_ops_tiled]="kernel_ops projection_ops embed"
   [engine_tests]="executor_contract drafter_ops"
   [engine_logits]="executor_contract"
   [engine_prompt]="engine_logits"
@@ -128,18 +134,20 @@ invocations() {
     drafter_op_shapes)
       for b in gpu-exact gpu; do
         echo "$b|ricursive_drafter_op_shapes_test||RICURSIVE_TEST_BACKEND=$b"
-      done
+      done ;;
+    drafter_op_shapes_tiled)
       # docs/DRAFTER-S2.md, "Stage 2c": the tiled attention kernel against the host operation, attention cases only.
       for b in gpu-exact gpu; do
-        echo "$b-tiled|ricursive_drafter_op_shapes_test||RICURSIVE_TEST_BACKEND=$b RICURSIVE_TEST_ATTENTION=tiled"
+        echo "$b|ricursive_drafter_op_shapes_test||RICURSIVE_TEST_BACKEND=$b RICURSIVE_TEST_ATTENTION=tiled"
       done ;;
     drafter_ops)
       for b in gpu-exact gpu; do
         echo "$b|ricursive_drafter_ops_test|tiny $STAGE_DIR/fixtures/tinyB.gguf $STAGE_DIR/perf|RICURSIVE_TEST_BACKEND=$b"
-      done
+      done ;;
+    drafter_ops_tiled)
       # Stage 2c: the tiny walks with the tiled attention kernel (exact and production mode).
       for b in gpu-exact gpu; do
-        echo "$b-tiled|ricursive_drafter_ops_test|tiny $STAGE_DIR/fixtures/tinyB.gguf $STAGE_DIR/perf|RICURSIVE_TEST_BACKEND=$b RICURSIVE_TEST_ATTENTION=tiled"
+        echo "$b|ricursive_drafter_ops_test|tiny $STAGE_DIR/fixtures/tinyB.gguf $STAGE_DIR/perf|RICURSIVE_TEST_BACKEND=$b RICURSIVE_TEST_ATTENTION=tiled"
       done ;;
     engine_tests)
       echo "engine|ricursive_engine_test||RICURSIVE_TEST_BACKEND=gpu-exact"
