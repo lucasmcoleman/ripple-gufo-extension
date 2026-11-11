@@ -36,7 +36,7 @@ struct Sizes {
   std::uint64_t select{0};        ///< 4-byte elements of the selector's buffers
   std::uint64_t rings{0};         ///< bytes of the K/V rings
   std::uint64_t scratch{0};       ///< bytes of the projection scratch (Q8_1 activations)
-  /// The (rows, cols) pairs ReserveProjection is called with; scratch is the largest of their sizes.
+  /// The (rows, cols) pairs ReserveProjection is called with (rows = what the 8-bit kernel reads: km::Q8ReserveRows); scratch is the largest of their sizes.
   std::vector<std::pair<std::uint64_t, std::uint64_t>> reserve;
   std::uint32_t window{0};
   std::uint32_t append_rows{0};
@@ -69,9 +69,9 @@ Sizes Plan(const DrafterConfig& c, std::uint32_t vocab, const DrafterOptions& o)
   // (Project's own W8A8 route) or on the chosen route, the block pass and the head when chosen. `exact` uses none.
   // The widest input of the context pass is fc's (F); of the block pass the FFN down projection's (FF); of the head E.
   if (!o.exact) {
-    if (o.q8.context || M > 16) s.reserve.emplace_back(M, F);
-    if (o.q8.block) s.reserve.emplace_back(B, std::max({E, Q, FF}));
-    if (o.q8.head) s.reserve.emplace_back(R, E);
+    if (o.q8.context || M > 16) s.reserve.emplace_back(km::Q8ReserveRows(M), F);
+    if (o.q8.block) s.reserve.emplace_back(km::Q8ReserveRows(B), std::max({E, Q, FF}));
+    if (o.q8.head) s.reserve.emplace_back(km::Q8ReserveRows(R), E);
   }
   for (const auto& [rows, cols] : s.reserve) s.scratch = std::max(s.scratch, km::Q8ActivationBytes(rows, cols));
   return s;

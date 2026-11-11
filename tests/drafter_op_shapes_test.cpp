@@ -63,6 +63,7 @@
 #include <string>
 #include <vector>
 
+#include "hip/drafter_math.hpp"
 #include "hip/ops.hpp"
 #include "tests/check.hpp"
 
@@ -267,7 +268,7 @@ class OpsSide final : public Side {
     w.bytes = c.weights.size();
     const float* x = Up(c.x);
     float* y = Alloc<float>(std::size_t{static_cast<std::size_t>(c.rows)} * c.m);
-    ops_->ReserveProjection(static_cast<std::size_t>(c.rows), c.k);
+    ops_->ReserveProjection(static_cast<std::size_t>(rocm::Q8ReserveRows(static_cast<std::uint64_t>(c.rows))), c.k);  // what the kernel reads
     ops_->ProjectQ8(w, x, c.rows, y);
     auto result = Down<float>(y, std::size_t{static_cast<std::size_t>(c.rows)} * c.m);
     Release();
@@ -1102,6 +1103,53 @@ void RunProjectQ8(Side& a, Side& b, Rng& rng, Report& report, bool gpu) {
   }
 }
 
+/// The scratch the 8-bit route reserves covers every byte the vendored Q8_0 kernel reads (review of stage 2b, finding 3). The expectation
+/// is written from the kernel's own constants, not from the helper under test: LaunchBatchedQuantGEMMPreQuantized picks, for Q8_0,
+/// BN = 16 (up to 8 rows, m < 3k), 32 (up to 8 rows, m >= 3k), 64 (9 to 95 rows) or 128 (96 rows and more); the grid is
+/// ceil(rows / BN) blocks across the tokens, each of which loads BN/16 activation tiles of (k/32) blocks x 576 bytes (kQ8ActTileBytes)
+/// at tile index block * BN/16 + wave without checking how many tiles the pass wrote (W8A8BlockedWmmaGEMMKernel: b_live = b_tile < kTokTiles).
+std::uint64_t KernelTilesRead(std::uint64_t rows, std::uint64_t m, std::uint64_t k) {
+  const std::uint64_t bn = rows <= 8 ? (m >= 3 * k ? 32 : 16) : rows < 96 ? 64 : 128;
+  return ((rows + bn - 1) / bn) * (bn / 16);
+}
+
+void CheckQ8ReservationCoversKernel(Report& report) {
+  constexpr std::uint64_t kTileBytes = 576;  // kQ8ActTileBytes: 16 tokens x 32 elements + their scales
+  std::size_t shapes = 0;
+  bool all = true;
+  std::string worst;
+  for (const std::uint64_t k : {1024ULL, 5120ULL, 40960ULL}) {
+    for (const std::uint64_t m : {1024ULL, 5120ULL, 10240ULL, 100352ULL}) {
+      for (std::uint64_t rows = 1; rows <= 600; ++rows) {
+        const std::uint64_t reads = KernelTilesRead(rows, m, k) * (k / 32) * kTileBytes;  // activation bytes the kernel loads
+        const std::uint64_t exact = rocm::Q8ActivationBytes(rocm::Q8KernelReadRows(rows, m, k), k);
+        const std::uint64_t reserved = rocm::Q8ActivationBytes(rocm::Q8ReserveRows(rows), k);
+        ++shapes;
+        if (exact < reads || reserved < exact) {
+          all = false;
+          worst = std::to_string(rows) + " rows, m " + std::to_string(m) + ", k " + std::to_string(k);
+        }
+      }
+    }
+  }
+  // The case of the review: "K projection, Q8_0 1024 x 5120" at 15 and 16 rows. One tile of scratch (92,160 bytes of activations, 102,400 with
+  // the sums) was reserved before; the BN = 64 kernel reads four tiles = 368,640 bytes.
+  for (const std::uint64_t rows : {15ULL, 16ULL}) {
+    const std::uint64_t reads = KernelTilesRead(rows, 1024, 5120) * 160 * kTileBytes;
+    Require(reads == 368640, "the kernel reads four 92,160-byte tiles at " + std::to_string(rows) + " rows");
+    const std::uint64_t before = rocm::Q8ActivationBytes(rows, 5120);
+    const std::uint64_t now = rocm::Q8ActivationBytes(rocm::Q8ReserveRows(rows), 5120);
+    Require(before == 102400 && before < reads, "the old reservation (one tile) was short of what the kernel reads");
+    Require(now >= reads, "the reservation of " + std::to_string(rows) + " rows covers the " + std::to_string(reads) + " bytes the kernel reads");
+  }
+  std::printf("  8-bit scratch: the reservation covers what the Q8_0 kernel reads in %zu (rows 1..600, 12 weight shapes) cases%s; 15 and 16 rows of "
+              "the 1024 x 5120 case: 102,400 bytes before, %llu now, kernel reads 368,640\n",
+              shapes, all ? "" : (" -- NOT at " + worst).c_str(),
+              static_cast<unsigned long long>(rocm::Q8ActivationBytes(rocm::Q8ReserveRows(16), 5120)));
+  ++report.checks;
+  if (!all) ++report.failures;
+}
+
 // ---- the whole run --------------------------------------------------------------------------------------------------------------
 void RunAll() {
   const Backend& be = TheBackend();
@@ -1148,6 +1196,7 @@ void RunAll() {
   t0 = Clock::now();
   RunProjectQ8(*a, *b, rng, report, be.gpu);
   std::printf("  (8-bit projection route: %.1f s)\n", Seconds(t0));
+  CheckQ8ReservationCoversKernel(report);
 
   if (!be.gpu) {
     // Twins: one wrong index in the naive side's ring arithmetic must fail the comparison.

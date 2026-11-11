@@ -36,6 +36,24 @@ RICURSIVE_HD std::uint64_t Q8ActivationBytes(std::uint64_t rows, std::uint64_t c
   return ((rows + 15) / 16) * (cols / 32) * (576 + 64);
 }
 
+/// Rows of the Q8_1 activation scratch that the vendored Q8_0 kernel W8A8BlockedWmmaGEMMKernel READS for a pass of `rows` rows
+/// (hip/ggml/prefill_quant_gemm.hip.cpp, LaunchBatchedQuantGEMMPreQuantized): the kernel loads one activation tile per token subtile of
+/// its macro tile without checking how many tiles the pass wrote, so it reads whole macro tiles: BN = 16 or 32 rows for up to 8 rows
+/// (32 when m >= 3k), 64 for 9 to 95 rows, 128 from 96 rows. The result columns past `rows` are never stored; the bytes only have to
+/// belong to the allocation (the review of stage 2b, finding 3). The K-quant kernels clamp their tile index and need `rows` only.
+RICURSIVE_HD std::uint64_t Q8KernelReadRows(std::uint64_t rows, std::uint64_t m, std::uint64_t k) {
+  if (rows <= 8) return m >= 3 * k ? 32 : 16;
+  const std::uint64_t bn = rows < 96 ? 64 : 128;
+  return ((rows + bn - 1) / bn) * bn;
+}
+
+/// The same for a reservation made before the weights are known: the largest of Q8KernelReadRows over every `m` (never below `rows`).
+/// Non-decreasing in `rows`, so the reservation for the largest pass covers every smaller one. The drafter's plan reserves
+/// Q8ActivationBytes(Q8ReserveRows(rows), cols), and so must every test that calls Ops::ProjectQ8 on its own.
+RICURSIVE_HD std::uint64_t Q8ReserveRows(std::uint64_t rows) {
+  return rows <= 8 ? 32 : Q8KernelReadRows(rows, 0, 1);
+}
+
 /// Partial top-k lists per logits row: the vocabulary in blocks of kDraftSelectTokensPerBlock.
 RICURSIVE_HD std::uint32_t DraftSelectPartials(std::uint32_t vocab_size) {
   return (vocab_size + kDraftSelectTokensPerBlock - 1) / kDraftSelectTokensPerBlock;

@@ -209,7 +209,7 @@ class Ops {
   /// (at or below it the FP32 small-batch kernels, about 3 times a one-row pass at 16 rows). Rows are NOT bit-equal to
   /// `Project`'s: they differ by the activation rounding, which the drafter tolerates (it only changes how many drafts the
   /// verifier accepts). F32 and BF16 weights have no 8-bit route and take `Project`'s. Needs the scratch of
-  /// ReserveProjection(rows, w.cols) reserved beforehand (it never allocates inside a pass). The host operations have no
+  /// ReserveProjection(rocm::Q8ReserveRows(rows), w.cols) reserved beforehand (the Q8_0 kernel reads whole token macro tiles) (it never allocates inside a pass). The host operations have no
   /// model of the activation rounding: they compute `Project`'s result and count the call (HostOpsOptions::counters).
   /// Only the drafter calls it; `Project` and its callers are unchanged.
   virtual void ProjectQ8(const WeightView& w, const float* x, int rows, float* y) = 0;

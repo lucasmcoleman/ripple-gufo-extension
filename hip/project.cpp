@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "hip/drafter_math.hpp"
 #include "hip/ggml/gemm.hpp"
 
 namespace gufo::models::ricursive::rocm {
@@ -206,10 +207,14 @@ void DispatchW8A8(const DeviceTensor& w, const float* x, int rows, float* y, Scr
     }
     return;
   }
-  if (ggml::QuantizedActivationBytes(n, k) > scratch.capacity()) {
+  // The Q8_0 kernel reads whole token macro tiles (Q8KernelReadRows) whatever the pass wrote; the scratch must hold what it reads.
+  // The activations are still quantized for `n` rows, so the sum sidecar sits where the kernel for `n` rows expects it.
+  const std::size_t read_rows = w.type == GgmlType::kQ8_0 ? static_cast<std::size_t>(Q8KernelReadRows(n, m, k)) : n;  // >= n
+  const std::size_t need = ggml::QuantizedActivationBytes(read_rows, k);
+  if (need > scratch.capacity()) {
     Fail("the Q8_1 scratch holds " + std::to_string(scratch.capacity()) + " bytes, " + std::to_string(rows) + " rows of " +
-         std::to_string(k) + " need " + std::to_string(ggml::QuantizedActivationBytes(n, k)) +
-         " (reserve it before the pass: a reservation inside it synchronizes)");
+         std::to_string(k) + " need " + std::to_string(need) + " (" + std::to_string(read_rows) +
+         " rows are read; reserve it before the pass: a reservation inside it synchronizes)");
   }
   ggml::LaunchQuantizeActivationQ8_1FromFp32(x, scratch.data(), n, k, stream);
   ggml::LaunchBatchedQuantGEMMPreQuantized(w.type, w.data, scratch.data(), y, n, m, k, stream);
