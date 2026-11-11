@@ -117,7 +117,7 @@ void DrafterIngest::Rewound(std::uint32_t position) noexcept {
 void DrafterIngest::Replaced(std::uint32_t position) noexcept {
   if (health_ != nullptr) {
     if (position == 0) health_->Clear();  // a new conversation: try the drafter again
-    else health_->Restored();             // a restore began with Replaced(0): it continues the conversation
+    else health_->Restored();             // a restore began with Replaced(0): the slot keeps its record (not the conversation's)
   }
   if (health_ != nullptr && health_->disabled()) return;
   try {
