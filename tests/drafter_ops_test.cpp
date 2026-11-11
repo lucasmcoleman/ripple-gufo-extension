@@ -797,7 +797,8 @@ void TinyCase(const ricursive_test::Model& target, const std::string& dir) {
   const bool host = !TheBackend().gpu;
   const bool f32 = host || !TheBackend().f16, f16 = host || TheBackend().f16;
   const auto base = [&](const std::string& label) { return f32 ? F32Walk(label) : F16Walk(label); };
-  std::printf("  backend %s\n", TheBackend().name.c_str());
+  std::printf("  backend %s, attention kernel %s (DrafterOptions::attention_kernel after EffectiveOptions)\n", TheBackend().name.c_str(),
+              EffectiveOptions(DrafterOptions{}).attention_kernel.c_str());
   if (host) {  // host code only: the functions the GPU kernels share with the host operations
     CheckDequantAt();
     CheckVisibleKeys();
@@ -841,7 +842,8 @@ void TinyCase(const ricursive_test::Model& target, const std::string& dir) {
       what = e.what();
     }
     RequireContains(what, "attention kernel", "an unknown attention kernel name");
-    std::printf("  attention kernel by name: 'default' is built, an unknown name is refused (%s)\n", what.c_str());
+    std::printf("  attention kernel by name: '%s' (the kernel of this run) is built, an unknown name is refused (%s)\n",
+                EffectiveOptions(DrafterOptions{}).attention_kernel.c_str(), what.c_str());
   }
   // 4. twins of 1.
   {
@@ -920,6 +922,7 @@ int Real(int argc, char** argv) {
       o.q8 = ParseDrafterRoutes(routes);
       std::printf("  projection routes on the 8-bit path: %s\n", ToString(o.q8).c_str());
     }
+    std::printf("  attention kernel %s\n", EffectiveOptions(o).attention_kernel.c_str());
     auto engine = MakeEngine(d, target, o);
     DrafterExecutor& exec = engine->executor();
     const std::size_t F = d.w.config.FeatureWidth();
@@ -1032,8 +1035,8 @@ int Long(int argc, char** argv) {
     const std::uint32_t B = d.w.config.block_size - 1, K = d.w.config.selector_top_k;
     std::vector<LongDraft> drafts;
     const auto t0 = std::chrono::steady_clock::now();
-    std::printf("  backend %s: a context of up to %u rows built from the %zu rows of the dump, repeated\n", TheBackend().name.c_str(), anchors.back(),
-                dump.n);
+    std::printf("  backend %s, attention kernel %s: a context of up to %u rows built from the %zu rows of the dump, repeated\n", TheBackend().name.c_str(),
+                EffectiveOptions(DrafterOptions{}).attention_kernel.c_str(), anchors.back(), dump.n);
     for (const std::uint32_t s : anchors) {
       while (engine->End() < s) {
         const std::size_t first = engine->End(), n = std::min<std::size_t>(2048, s - first);
