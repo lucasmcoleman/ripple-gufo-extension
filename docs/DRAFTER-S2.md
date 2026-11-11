@@ -55,7 +55,7 @@ projections of the new rows (at most `max_append_rows` = 512 per pass) and one `
 at its slot at once; nothing is copied afterwards. `TruncateTo(p)` sets the end (a plain truncation needs no copy). `ResetTo(base)` sets base and end.
 The slack is what makes truncation work with a bounded ring: after `TruncateTo(p)` the rows `[p - window, p)` must still be in the ring, which holds
 the last `capacity` rows below the **highest row ever held** since the last reset; a truncation that drops `ring_slack` rows or more below that mark
-resets the context at `p` instead (`Base() == p`, the drafter then drafts with a shorter context until rows below `p`... never return; acceptance drops, output
+resets the context at `p` instead (`Base() == p`, the drafter then drafts with a shorter context until rows below `p`... never return; acceptance drops, output **[SUPERSEDED, stage 2b item 4: such a truncation now keeps the rows the rings still hold (the base rises to the oldest row every layer has); the context is emptied only when no row is left below `p`. See "Stage 2b".]**
 never changes, the same degradation as a restored cache in stage 4). One row less than the slack still serves an anchor one row below the new end.
 `Draft(anchor <= End())` reads the rows `[max(anchor - window, Base(), ring begin), anchor)` and reports them in `Block::context_first / end`.
 
@@ -64,7 +64,7 @@ side 0), q / k / v projections, `DraftQkNormRope` (q in place; the block's K and
 `DynamicConv` side 1 **accumulating into the residual**, `RmsNorm`, the FFN convolution, gate and up, `SiluMul`, down, the second convolution accumulating. Then the final norm, the
 **output head and the selector's hidden projection for rows 1..d only** (`Project` of d rows), `DraftSelect` for d rows. Block K and V stay fp32; only the context ring is F16
 (a difference to the CPU reference, which keeps context K/V in float32; measured below).
-Projections are called with 16 rows at most for a block pass: `rocm::Project` runs its FP32 small-batch kernels there (bit-equal per row to the GEMV). Context passes of more than 16 rows run the
+Projections are called with 16 rows at most for a block pass: `rocm::Project` runs its FP32 small-batch kernels there (bit-equal per row to the GEMV). Context passes of more than 16 rows run the **[Stage 2b item 2: `DrafterOptions::q8` can send any group of these projections down the 8-bit route (`Ops::ProjectQ8`) instead; the default is this text.]**
 W8A8 GEMM (activation rounding) unless `DrafterOptions::exact` (set for the exact test backends).
 
 **Memory on the real model** (Ripple-65B-Preview-DFlash2, Q4_K_M or Q8_0; computed from the configuration by `DrafterSessionBytes`, the same table the executor allocates from):
@@ -76,7 +76,7 @@ W8A8 GEMM (activation rounding) unless `DrafterOptions::exact` (set for the exac
 | per session: context rings, F16 | sliding layers 5,120 rows x 4 KiB = 20.0 MiB each (4 layers), the full layer 17,408 rows = 68.0 MiB: **148.0 MiB** (128.0 MiB without the slack) |
 | per session: the context pass (512 rows: features 50 MiB, projections, K/V) | 74.0 MiB |
 | per session: the block pass (16 rows of hidden, q, o, 2 x 16 x 40,960 FFN, logits of 15 rows 5.7 MiB) and the selector's scratch | 14.0 MiB + 0.2 MiB |
-| per session, total | **236.2 MiB** (the design estimated 130 MiB for the rings alone; it forgot the activations of a 512-row pass) |
+| per session, total | **236.2 MiB** (the design estimated 130 MiB for the rings alone; it forgot the activations of a 512-row pass) | **[SUPERSEDED, stage 2b item 4: 252.1 MiB with F16 rings; the figure omitted the projection scratch and the MASK rows. See "Stage 2b".]**
 
 ## Where to look first on the GPU (every place the GPU code differs from the host code that was tested)
 
@@ -88,7 +88,7 @@ The host operations and the kernels have the same loops, bounds, indexing and pa
    `head_dim` must be a multiple of 32 on the GPU (one thread per dimension, wave32); the host takes any even head dimension. Untested on the GPU: a context longer than 1,024 keys (the tiny
    walk reaches 87 rows, the real p02 prompt 4,351).
 2. **`DraftSelect`**: the host merges the partial lists by sequential insertion; the GPU by per-thread lists and a tree merge in LDS (32 KB, 273 B of private arrays per thread). Equal logits
-   at the 32nd place (or equal final scores) can be resolved differently (host: lowest token id; GPU: the lower slot of the merge). No such tie occurred on the tiny fixtures or the real prompts. The transition
+   at the 32nd place (or equal final scores) can be resolved differently (host: lowest token id; GPU: the lower slot of the merge). No such tie occurred on the tiny fixtures or the real prompts. The transition **[SUPERSEDED, stage 2b item 1, "Tie rules".]**
    sum has the same lanes (4 per candidate, strided ranks, added in lane order) and the same decode function (`DequantAt`, bit-equal to `quant::DequantizeRow`, tested on the host).
    `DraftFinalizeKernel` is one block, 15 rows in sequence: its latency, not its throughput, is what a step pays (expected well under 1 ms).
 3. **`DraftQkNormRope`**: device `powf`, `cosf`, `sinf` (a few ulp from the host libm) and a wave-shuffle sum of squares (the host sums in double): relative 1e-7 differences, and the rotary angle
@@ -128,7 +128,7 @@ candidate scores, worst relative RMSE over all anchors:
 (every hidden stage is unaffected, as for stage 1's selector twin).
 
 **3. Bookkeeping**: the engine and the reference get the same operations: appends of 1, 3, 16, 17, 5, 2, 24 and 20 rows (88 rows, more than the full ring's 72; the engine chunks passes at 5 rows), a draft at the end
-and one row below it after each; truncations inside the slack (88 -> 86 -> 81, the edge), a rewrite, a truncation one row past the slack (80, which resets the context there: `Base() == 80`, and the reference is reset to the same base),
+and one row below it after each; truncations inside the slack (88 -> 86 -> 81, the edge), a rewrite, a truncation one row past the slack (80, which resets the context there: `Base() == 80`, and the reference is reset to the same base), **[SUPERSEDED, stage 2b item 4: truncating to 80 now keeps rows 72 to 79.]**
 a reset to base 40 and 48 appended rows, a deep truncation onto that base (60), a reset to 0, a context shorter than both windows, truncation to the base (an empty context) and to the end (no change): 31 drafts, all with the
 reference's tokens and the same rows read (`Block::context_first/end`), and `Base()` / `End()` equal the reference's after every operation.
 
@@ -174,11 +174,11 @@ checked with the oracle's own drafts (PASS) and with corrupted ones (FAIL) on th
    fixtures, and no q for context rows. `DraftQkNormRope` is new.
 3. **Top-k 32 is more than raising a constant** (design: "raise `kMaxSelectorTopK` 16 -> 32"): the per-thread lists, the merge buffers, the transition lanes (128 threads / 32 = 4 lanes per candidate instead of 8) and the LDS (32 KB) follow;
    the real files' codebooks are Q8_0 and Q4_K, not BF16, so the selector decodes elements (`DequantAt`).
-4. **The 16-row W8A8 route is not available** (design section 4: "the drafter need not be bit-exact, so it may use the fastest width route"; section 5 leaves its speed at 16 rows open): `rocm::Project` switches to W8A8 above 16 rows, so a 16-row block pass
+4. **The 16-row W8A8 route is not available** (design section 4: "the drafter need not be bit-exact, so it may use the fastest width route"; section 5 leaves its speed at 16 rows open): `rocm::Project` switches to W8A8 above 16 rows, so a 16-row block pass **[SUPERSEDED, stage 2b item 2: a drafter-only route exists, `Ops::ProjectQ8`; whether it pays is for the bench.]**
    runs the FP32 small-batch kernels, whose cost on the target is 3.08 x the 1-row time (design 5: 41 ms if the drafter behaves like the target's). Changing `kSplitRows` or the route is a change to an existing kernel path (rule 5): **a decision for the coordinator**
    if the bench says the 16-row projections dominate (STAGE2-GPU.md).
-5. **Session memory is 236 MiB, not 130 MiB** (design 3.3: rings only; the 512-row context pass adds 74 MiB of activations and the block pass 14 MiB). The per-pass rows (`max_append_rows`) trade activation memory against the number of passes.
-6. **`TruncateTo` may reset** (DRAFTER-S4: "TruncateTo drops the rows at positions >= p"): with a bounded ring a truncation more than `ring_slack` (1,024) rows below the highest row held cannot keep the rows below it; the engine then
+5. **Session memory is 236 MiB, not 130 MiB** (design 3.3: rings only; the 512-row context pass adds 74 MiB of activations and the block pass 14 MiB). The per-pass rows (`max_append_rows`) trade activation memory against the number of passes. **[SUPERSEDED, stage 2b item 4: 252.1 MiB, see "Stage 2b".]**
+6. **`TruncateTo` may reset** (DRAFTER-S4: "TruncateTo drops the rows at positions >= p"): with a bounded ring a truncation more than `ring_slack` (1,024) rows below the highest row held cannot keep the rows below it; the engine then **[SUPERSEDED, stage 2b item 4.]**
    resets there, `Base() == p`. A conversation edited more than 1,023 rows back loses its older context for drafting (lower acceptance, never a different output; the same degradation as after a cache restore). The CPU reference engine keeps all rows.
    A larger slack costs 4 KiB per layer per row. Whether 1,024 is enough is a measurement for stage 6 / the coordinator.
 7. **F16 context storage flips a few near-tie tokens** on random tiny drafters (3 of 80 blocks on the top-k 32 fixture, 0 of 80 on the others), each a near-tie of the executor's own scores (gap <= 3.4e-4), reported by the tests; on the real weights (31 anchors) it flipped none.

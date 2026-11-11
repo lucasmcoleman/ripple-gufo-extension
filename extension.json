@@ -301,6 +301,12 @@
       ],
       "role": "test"
     },
+    "ricursive_drafter_op_shapes_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
     "ricursive_drafter_bench": {
       "requires": [
         "hip",
