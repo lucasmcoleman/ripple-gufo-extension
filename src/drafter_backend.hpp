@@ -85,6 +85,8 @@ class DrafterHealth {
   void Failed(std::string_view where, std::string_view what, bool in_ingest) noexcept;
   /// A proposal whose draft succeeded: ends a run of failures unless rows failed to arrive since the previous one.
   void DraftSucceeded() noexcept;
+  /// A drafter that was built: ends a run of failed builds.
+  void BuildSucceeded() noexcept { consecutive_ = 0; }
   [[nodiscard]] std::size_t failures() const noexcept { return failures_; }
   [[nodiscard]] std::size_t consecutive() const noexcept { return consecutive_; }
   [[nodiscard]] bool disabled() const noexcept { return disabled_; }

@@ -539,6 +539,117 @@ void FailTests(const TinyFixture& f, const DraftBackend& be, const std::string& 
               checked);
 }
 
+/// Item 1 (stage 4c): a drafter that cannot be BUILT (the engine, or the shared device upload) costs speed, never the request.
+/// `builds` counts the attempts of each kind across the setup; a build that fails in a row 3 times switches drafting off for the session
+/// and nothing is attempted after that.
+void BuildFailTests(const TinyFixture& f, const DraftBackend& be, const std::string& dir) {
+  const auto base = Setup(f, dir, 4);
+  const std::size_t limit = 16;
+  const Tokens prompt = ToTokens(SyntheticTokens(55 + f.window, 27));
+  struct Counts {
+    std::size_t engines{0}, uploads{0};
+  };
+  enum class Kind { kEngine, kUpload };
+  struct Case {
+    const char* name;
+    Kind kind;
+    std::size_t fail_first;  ///< the first n attempts throw
+  };
+  const std::vector<Case> cases = {
+      {"the engine factory throws at every build", Kind::kEngine, SIZE_MAX},
+      {"the shared upload throws at every build", Kind::kUpload, SIZE_MAX},
+      {"the engine factory throws once, then builds", Kind::kEngine, 1},
+  };
+  std::size_t checked = 0;
+  for (const Case& c : cases) {
+    const auto counts = std::make_shared<Counts>();
+    auto setup = std::make_shared<SpeculativeSetup>(*base);
+    const auto inner = base->engine_factory;
+    const std::size_t fail_first = c.fail_first;
+    const Kind kind = c.kind;
+    setup->engine_factory = [inner, counts, kind, fail_first](const SpeculativeSetup& s, const EngineModel& m) -> std::unique_ptr<DrafterEngine> {
+      if (kind == Kind::kEngine && counts->engines++ < fail_first) throw std::runtime_error("injected engine build failure");
+      return inner(s, m);
+    };
+    setup->shared_factory = [counts, kind, fail_first](const SpeculativeSetup&, const EngineModel&) -> std::shared_ptr<void> {
+      if (kind == Kind::kUpload && counts->uploads++ < fail_first) throw std::runtime_error("the GPU drafter could not be uploaded: injected");
+      return std::make_shared<int>(0);
+    };
+    const auto spec_model = ArmedModel(f, be, *setup);
+    const auto plain_model = PlainModel(f, be);
+    Serve spec(CreateRunnerForModel(spec_model, "", setup), spec_model), plain(CreateRunnerForModel(plain_model, "", nullptr), plain_model);
+    const std::string what = be.name + "/" + f.name + " C build (" + c.name + ")";
+    Tokens next = prompt;
+    std::size_t drafted_after_first = 0;
+    for (int turn = 0; turn < 5; ++turn) {
+      Result rs, rp;
+      try {
+        rs = spec.Run(next, limit);
+      } catch (const std::exception& e) {
+        Require(false, what + ": request " + std::to_string(turn + 1) + " failed: " + e.what());
+      }
+      rp = plain.Run(next, limit);
+      Require(rs.published == rp.published, what + ": request " + std::to_string(turn + 1) + "'s tokens differ from plain's");
+      RequireSameState(plain, spec, what + ", request " + std::to_string(turn + 1));
+      if (turn > 0) drafted_after_first += rs.drafted;
+      next = Extend(rp.checkpoint_tokens, 7, 5 + turn);
+    }
+    const DrafterHealth* health = DraftingHealthOf(*spec.state);
+    Require(health != nullptr, what + ": the session has no health record");
+    const std::size_t attempts = kind == Kind::kEngine ? counts->engines : counts->uploads;
+    if (c.fail_first == SIZE_MAX) {
+      Require(attempts == DrafterHealth::kLimit, what + ": " + std::to_string(attempts) + " builds were attempted, not " + std::to_string(DrafterHealth::kLimit) +
+                                                      " (after the third failure no further build is attempted)");
+      Require(health->failures() == DrafterHealth::kLimit && health->disabled(),
+              what + ": the health record counted " + std::to_string(health->failures()) + " failures" + (health->disabled() ? "" : ", still on"));
+      Require(DraftingOf(*spec.state) == nullptr && drafted_after_first == 0, what + ": drafting must stay off");
+    } else {
+      Require(health->failures() == 1 && !health->disabled() && health->consecutive() == 0,
+              what + ": the health record must show one failure, recovered (" + std::to_string(health->failures()) + " failures)");
+      Require(DraftingOf(*spec.state) != nullptr && drafted_after_first > 0, what + ": a later bind must build the drafter and draft");
+    }
+    ++checked;
+  }
+  // The drafter exists but its context cannot be brought to the session's position at the bind (ResetTo throws there): that request
+  // runs as plain generation, is counted, and the next bind builds on what the sink kept.
+  {
+    const auto plan = std::make_shared<FaultPlan>();
+    const auto setup = Flaky(*base, plan);
+    const auto spec_model = ArmedModel(f, be, *setup);
+    const auto plain_model = PlainModel(f, be);
+    Serve spec(CreateRunnerForModel(spec_model, "", setup), spec_model), plain(CreateRunnerForModel(plain_model, "", nullptr), plain_model);
+    const std::string what = be.name + "/" + f.name + " C build (ResetTo throws at the bind)";
+    const Result r1 = spec.Run(prompt, limit), p1 = plain.Run(prompt, limit);
+    Require(r1.published == p1.published && r1.drafted > 0, what + ": the first request must draft and equal plain");
+    DraftedSession* ds = DraftingOf(*spec.state);
+    Require(ds != nullptr, what + ": no drafting");
+    Require(ds->engine().End() > 1, what + ": the engine holds too few rows");
+    ds->engine().TruncateTo(ds->engine().End() - 1);  // a context that does not end at the session's position
+    plan->pending_resets = 1;
+    const Tokens next2 = Extend(p1.checkpoint_tokens, 7, 5);
+    Result r2, p2;
+    try {
+      r2 = spec.Run(next2, limit);
+    } catch (const std::exception& e) {
+      Require(false, what + ": the request failed: " + e.what());
+    }
+    p2 = plain.Run(next2, limit);
+    Require(r2.published == p2.published && r2.drafted == 0, what + ": the request must run as plain (no drafts) with plain's tokens");
+    RequireSameState(plain, spec, what);
+    Require(DraftingHealthOf(*spec.state)->failures() == 1 && DraftingOf(*spec.state) == nullptr, what + ": the failed bind must be counted once and leave drafting off for it");
+    const Tokens next3 = Extend(p2.checkpoint_tokens, 7, 6);
+    const Result r3 = spec.Run(next3, limit), p3 = plain.Run(next3, limit);
+    Require(r3.published == p3.published, what + ": the request after the failed bind differs from plain's");
+    Require(r3.drafted > 0 && DraftingHealthOf(*spec.state)->failures() == 1,
+            what + ": the next bind must draft again (drafted " + std::to_string(r3.drafted) + ", failures " + std::to_string(DraftingHealthOf(*spec.state)->failures()) + ")");
+    RequireSameState(plain, spec, what + ", next request");
+    ++checked;
+  }
+  std::printf("  %s/%s: C build. %zu plans (the engine factory throws, the shared upload throws, ResetTo throws at the bind): every request completes with plain's tokens and end state, the health record counts the "
+              "failed builds, after the third in a row no build is attempted, a build that recovers drafts again\n",
+              be.name.c_str(), f.name.c_str(), checked);
+}
+
 // ---- D: requests the way gufo's pool and scheduler issue them -------------------------------------------------------
 // gufo's TextRunnerPool and ComponentTextCache live in gufo's serving library, which an out-of-tree extension may not
 // link (cmake/GufoExtensionDiscovery.cmake rejects gufo_serving) and which no public header declares. Serve::Run is the
@@ -655,6 +766,7 @@ int main(int argc, char** argv) {
         }
         if (wants("fail", f)) {
           FailTests(f, be, dir);
+          BuildFailTests(f, be, dir);
           ++groups;
         }
       }

@@ -512,8 +512,10 @@ std::shared_ptr<ext::TextModelRunner> CreateRunnerForModel(std::shared_ptr<Model
 
 #if defined(ENGINE_ENABLE_HIP)
 DraftedSession* DraftingOf(ext::TextRunnerState& state) { return Get(state).drafting(); }
+const DrafterHealth* DraftingHealthOf(ext::TextRunnerState& state) { return DraftingHealthOf(Get(state).session()); }
 
-DraftedSession::DraftedSession(Session& session, const SpeculativeSetup& setup) : session_(&session), setup_(&setup) {
+DraftedSession::DraftedSession(Session& session, const SpeculativeSetup& setup, std::shared_ptr<DrafterHealth> health)
+    : session_(&session), setup_(&setup) {
   PinSharedDrafter(setup, session.model());
   auto engine = MakeDrafterEngine(setup, session.model());
   if (!engine) throw std::runtime_error("this build has no drafter implementation");
@@ -522,7 +524,7 @@ DraftedSession::DraftedSession(Session& session, const SpeculativeSetup& setup) 
   }
   engine_ = engine.get();
   engine->ResetTo(session.Position());  // rows the session already holds were never delivered
-  health_ = std::make_unique<DrafterHealth>();
+  health_ = health ? std::move(health) : std::make_shared<DrafterHealth>();
   ingest_ = std::make_unique<DrafterIngest>(*engine, health_.get());
   auto backend = std::make_unique<DFlash2DraftBackend>(std::move(engine), setup.faults, health_.get());
   backend_ = backend.get();
@@ -532,20 +534,78 @@ DraftedSession::DraftedSession(Session& session, const SpeculativeSetup& setup) 
 
 DraftedSession::~DraftedSession() { session_->SetTapSink(nullptr); }
 
-std::shared_ptr<DraftedSession> DraftedSession::For(Session& session, const SpeculativeSetup& setup) {
-  if (auto held = std::static_pointer_cast<DraftedSession>(session.attachment())) {
-    if (held->setup_ == &setup) {
+namespace {
+/// What a session carries for drafting (its attachment): the health record, which outlives a drafter that could not be
+/// built, and the drafting itself once one was.
+struct SessionDrafting {
+  const SpeculativeSetup* setup{nullptr};
+  std::shared_ptr<DrafterHealth> health = std::make_shared<DrafterHealth>();
+  std::shared_ptr<DraftedSession> drafted;
+};
+
+void WarnOff(std::string_view what, std::string_view why) noexcept {
+  try {
+    std::cerr << "ricursive: drafting is off for this request: " << what << " (" << why << "); it generates without drafts\n";
+  } catch (...) {
+  }
+}
+
+std::string DescribeCurrent() noexcept {
+  try {
+    throw;
+  } catch (const std::exception& e) {
+    return e.what();
+  } catch (...) {
+    return "unknown exception";
+  }
+}
+}  // namespace
+
+const DrafterHealth* DraftingHealthOf(Session& session) {
+  const auto held = std::static_pointer_cast<SessionDrafting>(session.attachment());
+  return held ? held->health.get() : nullptr;
+}
+
+std::shared_ptr<DraftedSession> DraftedSession::For(Session& session, const SpeculativeSetup& setup) noexcept {
+  try {
+    auto held = std::static_pointer_cast<SessionDrafting>(session.attachment());
+    if (held && held->setup != &setup) {
+      session.SetAttachment(nullptr);  // another setup: detach the old sink before the new one attaches
+      held.reset();
+    }
+    if (!held) {
+      held = std::make_shared<SessionDrafting>();
+      held->setup = &setup;
+      session.SetAttachment(held);
+    }
+    if (held->drafted) {
       // The sink told the engine of every change since the last request; a context that does not end at the
       // session's position (it cannot, short of a missed event) restarts there.
-      if (held->engine_->End() != session.Position()) held->engine_->ResetTo(session.Position());
-      held->decoder_->Restart();
-      return held;
+      try {
+        if (held->drafted->engine_->End() != session.Position()) held->drafted->engine_->ResetTo(session.Position());
+      } catch (...) {
+        const std::string why = DescribeCurrent();
+        held->health->Failed("reset at the bind", why, false);
+        WarnOff("the drafter's context could not be brought to the session's position", why);
+        return nullptr;
+      }
+      held->drafted->decoder_->Restart();
+      return held->drafted;
     }
-    session.SetAttachment(nullptr);  // another setup: detach the old sink before the new one attaches
+    if (held->health->disabled()) return nullptr;
+    try {
+      held->drafted = std::make_shared<DraftedSession>(session, setup, held->health);
+    } catch (...) {
+      const std::string why = DescribeCurrent();
+      held->health->Failed("build", why, false);
+      WarnOff("the drafter could not be built", why);
+      return nullptr;
+    }
+    held->health->BuildSucceeded();
+    return held->drafted;
+  } catch (...) {
+    return nullptr;  // not even the bookkeeping could be made (memory): plain generation
   }
-  auto made = std::make_shared<DraftedSession>(session, setup);
-  session.SetAttachment(made);
-  return made;
 }
 #endif
 

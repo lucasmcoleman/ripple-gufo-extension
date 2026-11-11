@@ -92,14 +92,18 @@ std::shared_ptr<ext::TextModelRunner> CreateRunnerForModel(std::shared_ptr<Model
 /// must outlive it or be destroyed with it.
 class DraftedSession {
  public:
-  /// Throws when the build has no drafter or the model does not capture the drafter's layers.
-  DraftedSession(Session& session, const SpeculativeSetup& setup);
+  /// Throws when the build has no drafter, the model does not capture the drafter's layers or the drafter cannot be built.
+  /// `health`: the record this drafter counts its failures in (default: its own).
+  DraftedSession(Session& session, const SpeculativeSetup& setup, std::shared_ptr<DrafterHealth> health = {});
   /// The session's own drafting: the one attached to it (Session::SetAttachment) when there is one for this
   /// setup, else a new one, attached. gufo binds a new runner state over a cached slot on every acquire; the
   /// drafter's context belongs to the slot's session, so a conversation that continues on its live slot keeps
   /// it. The context is the session's when it ends at the session's position; a restore or a reset told it
   /// through the tap sink.
-  [[nodiscard]] static std::shared_ptr<DraftedSession> For(Session& session, const SpeculativeSetup& setup);
+  /// Never throws: nullptr when drafting is off for this bind, because the drafter could not be built (or its context
+  /// could not be brought to the session's position), or because 3 builds in a row failed. The failure is counted in the
+  /// session's health record (DraftingHealthOf) and the request runs as plain generation does (docs/DRAFTER-S4.md, item 1 of stage 4c).
+  [[nodiscard]] static std::shared_ptr<DraftedSession> For(Session& session, const SpeculativeSetup& setup) noexcept;
   ~DraftedSession();
   DraftedSession(const DraftedSession&) = delete;
   DraftedSession& operator=(const DraftedSession&) = delete;
@@ -115,13 +119,16 @@ class DraftedSession {
   const SpeculativeSetup* setup_;
   DrafterEngine* engine_;
   DFlash2DraftBackend* backend_;
-  std::unique_ptr<DrafterHealth> health_;
+  std::shared_ptr<DrafterHealth> health_;
   std::unique_ptr<DrafterIngest> ingest_;
   std::unique_ptr<SpeculativeDecoder> decoder_;
 };
 
-/// The drafting of a runner state (nullptr: speculation off). Tests.
+/// The drafting of a runner state (nullptr: speculation off, or drafting could not be built for this bind). Tests.
 [[nodiscard]] DraftedSession* DraftingOf(ext::TextRunnerState& state);
+/// The health record of the state's session (nullptr: speculation off). Tests.
+[[nodiscard]] const DrafterHealth* DraftingHealthOf(ext::TextRunnerState& state);
+[[nodiscard]] const DrafterHealth* DraftingHealthOf(Session& session);
 #else
 class DraftedSession {  // stand-in: drafting is refused before one is built (HaveDrafterEngine() is false)
  public:
