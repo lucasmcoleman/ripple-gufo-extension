@@ -372,14 +372,18 @@ thread is an iteration over `tid`, a barrier is the end of a loop over all threa
   (A) against the existing host operation `DraftAttention` (B), at all 14 context situations of the test (87, 500 and 4,096 rows, the sliding ring just full, one past the sliding wrap, a
   second lap with the block across a slot boundary, position 20,000, full layer at 87, 500, 4,096 rows, a base above 0, 16,384 rows, one past the full ring's wrap with the 16,384-row clamp,
   position 30,000), F32 and F16 rings: **28 of 28 within the tolerance 5e-5** (the GPU's attention tolerance of the test header: the twin computes in fp32 as the GPU does); worst
-  3.69e-6 (sliding, ring just full, F16), largest F32 3.21e-6 (full, 16,384 rows). 31 checks, 0 failed, 161.1 s (`perf/stage2c-op-shapes-tiled.log`).
+  3.69e-6 (sliding, ring just full, F16), largest F32 3.21e-6 (full, 16,384 rows). 31 checks, 0 failed, 161.1 s (`perf/stage2c-op-shapes-tiled.log`). **Added after the review (finding 3):** one tiled-only case at the real 16 block
+  rows with several tiles per split (sliding, 4,096 context rows: 16 splits of 8 tiles, 320 threads; before it every case of 4,096 rows or more ran 4 rows and the 16-row cases had at
+  most one tile per split): F32 2.75e-6, F16 2.41e-6; the rerun has 30 attention cases, worst 3.21e-6, 33 checks, 0 failed, 87.8 s (`perf/stage2cfix-ctest-affected.log`; the twins'
+  numbers there differ from the ones below because the extra case shifts the random inputs; all three fail as before). In the GPU modes each tiled invocation runs 15 checks.
 - **Twins that must fail it** (through the structural twin, `HostOpsOptions::tiled_fault`, on three cases: sliding 500 rows, one past the sliding wrap, full at position 30,000):
   every tile one key late (a tile boundary off by one key): fails, worst 1.22 / 0.468 / 0.176; the splits combined without rescaling to the common maximum: fails, 1.31 / 1.23 / 1.29;
   the ring slot without its wrap check: fails on both wrapping cases by the host's slot check ("a context key's ring slot is not below the capacity"; on the GPU this would read past
   the ring), and on the non-wrapping case (500 rows) it passes with 1.91e-6, as it must (no slot wraps there). **This twin fails through the host's own slot guard, which the kernel does
   not have: it is evidence that the guard catches a missing wrap, not numeric evidence that the comparison would** (the comparison never sees the wrong values). The first two twins fail
   by the comparison itself. None passed; none had to be strengthened.
-- **The tiny walks with the twin** (`RICURSIVE_TEST_ATTENTION=tiled ricursive_drafter_ops_test tiny`, ctest `ricursive.drafter_ops_tiled`; `perf/stage2c-drafter-ops-tiled.log`): every
+- **The tiny walks with the twin** (`RICURSIVE_TEST_ATTENTION=tiled ricursive_drafter_ops_test tiny`, ctest `ricursive.drafter_ops_tiled`; `perf/stage2c-drafter-ops-tiled.log`; since the
+  review (finding 6) the log names the kernel in use, `backend host, attention kernel tiled (...)`: `perf/stage2cfix-ctest-affected.log`): every
   stage-1 check against `DrafterReference` passes as with the default kernel: Q8_0 F32 80 of 80 anchors, worst stage 1.05e-6 (1e-5); Q4_K F32 80, 1.42e-6; Q8_0 F16 80, 2.89e-4 (1e-3);
   top-k 32 F32 80, 1.17e-6; top-k 32 F16 77 of 80 with 3 near-ties (gap at most 3.33e-4; stage 2's table above reports 3 near-tie blocks for the default kernel too; whether they are the same blocks was not compared); the bookkeeping, the slack sweep, the accounting
   (`DeviceBytes() == DrafterSessionBytes` in 96 configurations, now with the tiled scratch) and the twins of stage 2 (window off by one, rotary, convolution: all fail) as before.
