@@ -655,9 +655,9 @@ void DisabledBindTests(const TinyFixture& f, const DraftBackend& be, const std::
   std::string failure;
   try {
     for (int turn = 0; turn < 10; ++turn) {
-      next = Extend(rp.checkpoint_tokens, 7, 5 + turn);
-      rs = spec.Run(next, limit);
-      rp = plain.Run(next, limit);
+      next = Extend(rp.checkpoint_tokens, 2, 5 + turn);  // short requests: ten turns must fit the tiny fixtures' context cap
+      rs = spec.Run(next, 4);
+      rp = plain.Run(next, 4);
       if (rs.published != rp.published) throw std::runtime_error("request " + std::to_string(turn + 2) + "'s tokens differ from plain's");
     }
   } catch (const std::exception& e) {
