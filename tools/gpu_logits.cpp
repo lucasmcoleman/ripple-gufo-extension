@@ -17,13 +17,14 @@
 // only the logits after the final token ([1][vocab]) and the other passes skip
 // the head. Prints load time, tokens per second for the passes, and device
 // memory in use (GPU backend). Exit 0 = written and finite, 1 = failure or any
-// NaN/Inf logit (the file is still written for inspection), 2 = usage.
+// NaN/Inf logit (OUT is then NOT written; the logits are kept as OUT.bad; finite output goes to OUT.tmp, renamed to OUT), 2 = usage.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <span>
@@ -245,13 +246,24 @@ int main(int argc, char** argv) {
 
       std::size_t bad = 0;
       for (const float x : logits) bad += std::isfinite(x) ? 0 : 1;
-      std::ofstream out(out_path, std::ios::binary);
+      // Never leave a full-size file with NaN/Inf under the final name: finite -> OUT.tmp, renamed to OUT;
+      // not finite -> OUT.bad (for inspection) and exit 1 below.
+      const std::string written = out_path + (bad == 0 ? ".tmp" : ".bad");
+      std::ofstream out(written, std::ios::binary);
       out.write(reinterpret_cast<const char*>(logits.data()),
                 static_cast<std::streamsize>(logits.size() * sizeof(float)));
       out.close();
       if (!out) {
-        std::cerr << "cannot write " << out_path << '\n';
+        std::cerr << "cannot write " << written << '\n';
         return 1;
+      }
+      if (bad == 0) {
+        std::error_code ec_rename;
+        std::filesystem::rename(written, out_path, ec_rename);
+        if (ec_rename) {
+          std::cerr << "cannot rename " << written << " to " << out_path << ": " << ec_rename.message() << '\n';
+          return 1;
+        }
       }
 
       const double pass_s = Seconds(t0, t1);
@@ -278,8 +290,8 @@ int main(int argc, char** argv) {
       }
       std::fflush(stdout);
       if (bad != 0) {
-        std::cerr << "ERROR: " << bad << " of " << logits.size() << " logits are NaN or Inf in "
-                  << out_path << "; the output file is not usable\n";
+        std::cerr << "ERROR: " << bad << " of " << logits.size() << " logits are NaN or Inf in text "
+                  << ji + 1 << "; kept as " << written << ", " << out_path << " was not written\n";
         return 1;
       }
     }
