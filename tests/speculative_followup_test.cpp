@@ -3,8 +3,10 @@
 //
 //   reuse  A. the drafter's context survives from one request to the next on a live slot: every request binds
 //             a NEW runner state over the same session, as gufo's component cache does on every acquire
-//   end    B. a request that ends by its token limit (or by a stop token, or is cancelled) leaves the session
+//   end    B. a request that ends by its token limit (or by a stop token) leaves the session
 //             and its checkpoint where plain generation leaves them, given the same call sequence
+//   endcut B. a stop sequence or a cancellation leaves a checkpoint that extends plain's (exact back ends only: on the
+//             production route the extra rows change the next request's pass boundaries)
 //   fail   C. a drafter that throws costs speed, never the request
 //   flow   D. flows through the runner as gufo's pool issues them (interleaving, cancel, cut by limit, restore)
 //
@@ -62,6 +64,7 @@ struct Serve {
     multi = runner->Descriptor().capabilities.multi_token_decode;
   }
   Session& session() { return rig->session(); }
+  std::vector<std::pair<std::size_t, std::size_t>> prefill;  ///< the prefill passes of the request in progress (readable from its hooks)
 
   /// Component cache Acquire: a NEW runner state over the slot's session, the old one gone first.
   void Acquire() {
@@ -82,11 +85,13 @@ struct Serve {
     const bool prefix = live.size() < prompt.size() && std::equal(live.begin(), live.end(), prompt.begin());
     if (!prefix && session().Position() != 0) Require(rig->adapter->Invalidate(*rig->slot), "cold start: invalidate");
     r.cached = prefix ? live.size() : 0;
+    prefill.clear();
     runner->ReconcileComponentState(*state, r.cached);
     if (r.cached > 0) runner->PreparePrefixReuse(*state, std::span<const ext::TextRunnerToken>(prompt).first(r.cached));
     for (std::size_t offset = r.cached; offset < prompt.size();) {
       const auto step = runner->Prefill(*state, prompt, offset, std::size_t{1} << 20);
       Require(step.consumed_tokens > 0, "prefill made no progress");
+      prefill.emplace_back(offset, step.consumed_tokens);
       offset += step.consumed_tokens;
     }
     if (hooks.after_prefill) hooks.after_prefill(*this);
@@ -199,6 +204,15 @@ void RequireLive(Serve& s, const Result& r, const std::string& what) {
           what + ": the session does not hold the checkpoint's tokens");
 }
 
+/// The passes wider than the 16 rows the production route computes row by row (a wider pass rounds activations across its rows).
+std::vector<std::pair<std::size_t, std::size_t>> WidePasses(const std::vector<std::pair<std::size_t, std::size_t>>& passes) {
+  std::vector<std::pair<std::size_t, std::size_t>> wide;
+  for (const auto& p : passes) {
+    if (p.second > 16) wide.push_back(p);
+  }
+  return wide;
+}
+
 Tokens Extend(Tokens t, std::size_t extra, std::size_t salt) {
   for (std::size_t i = 0; i < extra; ++i) t.push_back(static_cast<ext::TextRunnerToken>((i * 13 + salt) % 256));
   return t;
@@ -248,7 +262,20 @@ void ReuseTests(const TinyFixture& f, const DraftBackend& be, const std::string&
 
   // Second turn of conversation A: a new runner state over the same live session, the prompt extends the first conversation.
   const Tokens prompt2 = Extend(a1.checkpoint_tokens, 7, 5);
-  const Truth truth2 = RunTruth(m.spec, std::vector<std::int32_t>(prompt2.begin(), prompt2.end()), limit);
+  // The truth for the second turn is plain decoding given the SAME call sequence as the live session saw (stage 4c, item 3): the first turn's
+  // prompt, its generated tokens one row at a time, then the second turn's prefill. A fresh Sync of prompt 2 has other pass boundaries (the
+  // taps of a pass wider than 16 rows differ on the production route, where wide passes round activations).
+  const std::vector<std::pair<std::size_t, std::size_t>> first_passes = a.prefill;
+  Truth first;
+  first.prompt = std::vector<std::int32_t>(prompt1.begin(), prompt1.end());
+  first.gen = std::vector<std::int32_t>(a1.checkpoint_tokens.begin() + static_cast<std::ptrdiff_t>(prompt1.size()), a1.checkpoint_tokens.end());
+  const std::vector<std::int32_t> prompt2_ids(prompt2.begin(), prompt2.end());
+  const Truth truth2 = RunTruthAfter(m.spec, first, first.gen.size(), prompt2_ids, limit);
+  if (be.exact) {
+    // Exact back end: also the fresh plain session (nothing in it depends on pass boundaries).
+    const Truth fresh = RunTruth(m.spec, prompt2_ids, limit);
+    Require(truth2.gen == fresh.gen && SameBits(truth2.rows, fresh.rows), be.name + "/" + f.name + " A: plain through the call sequence differs from a fresh plain session");
+  }
   std::unique_ptr<ProposalCheck> check;
   std::size_t compared = 0;
   Hooks hooks;
@@ -257,6 +284,12 @@ void ReuseTests(const TinyFixture& f, const DraftBackend& be, const std::string&
     Require(ds != nullptr, "the state has no drafting");
     const std::string e = Ledger(*ds, 0);
     Require(e.empty(), be.name + "/" + f.name + " A: after the second turn's prefill " + e);
+    // The pass boundaries of the oracle are the live session's: every pass wider than 16 rows (where activations round on the production
+    // route) covers the same positions.
+    auto live = first_passes;
+    live.insert(live.end(), s.prefill.begin(), s.prefill.end());
+    Require(WidePasses(live) == WidePasses(truth2.passes), be.name + "/" + f.name + " A: the second turn's oracle has other prefill pass boundaries than the live session (" +
+                                                              std::to_string(WidePasses(live).size()) + " wide passes live, " + std::to_string(WidePasses(truth2.passes).size()) + " in the oracle)");
     check = std::make_unique<ProposalCheck>(*m.setup, *m.spec, truth2, 0);
     check->Skip(*ds);
   };
@@ -361,7 +394,15 @@ struct EndCase {
   std::size_t n;
 };
 
-void EndTests(const TinyFixture& f, const DraftBackend& be, const std::string& dir) {
+/// `cuts`: the stop-sequence and cancellation endings (group `endcut`, exact back ends only: the checkpoint they leave extends plain's by rows that came from
+/// verification passes, so on the production route the next request's pass boundaries differ from plain's by construction, docs/DRAFTER-S4.md "Known
+/// divergences from plain"); else the limit and stop-token endings (group `end`, every back end).
+void EndTests(const TinyFixture& f, const DraftBackend& be, const std::string& dir, bool cuts) {
+  if (cuts && !be.exact) {
+    std::printf("  %s/%s: B (cuts). skipped: a stop sequence or a cancellation leaves more rows than plain does, so on the production route the next request's pass boundaries differ (exact back ends only)\n",
+                be.name.c_str(), f.name.c_str());
+    return;
+  }
   const Models m = MakeModels(f, be, dir);
   const std::size_t limit = 22;
   const Truth running = FindTruth(m.spec, 23, 100 + 23 * 7, limit + 18, false);
@@ -378,6 +419,7 @@ void EndTests(const TinyFixture& f, const DraftBackend& be, const std::string& d
   };
   std::size_t checked = 0;
   for (const EndCase& c : cases) {
+    if ((c.ending != Ending::kLimit) != cuts) continue;
     Serve spec(m.spec_runner, m.spec), plain(m.plain_runner, m.plain);
     const Result rs = spec.Run(c.prompt, c.limit, c.ending, c.n), rp = plain.Run(c.prompt, c.limit, c.ending, c.n);
     const std::string what = be.name + "/" + f.name + " B (" + c.name + ")";
@@ -414,10 +456,10 @@ void EndTests(const TinyFixture& f, const DraftBackend& be, const std::string& d
     }
     ++checked;
   }
-  std::printf("  %s/%s: B. %zu request endings (limits inside a draft, a stop token, a cancellation, a stop sequence): limit and stop-token requests leave the session, "
-              "its frontier logits and every checkpoint component byte-equal to plain's, the next request with prefix reuse gives plain's output; "
-              "cancelled and stop-sequence requests leave a checkpoint that extends plain's\n",
-              be.name.c_str(), f.name.c_str(), checked);
+  std::printf("  %s/%s: B%s. %zu request endings (%s): %s\n", be.name.c_str(), f.name.c_str(), cuts ? " (cuts)" : "", checked,
+              cuts ? "a cancellation, a stop sequence" : "limits inside a draft, a stop token",
+              cuts ? "the requests leave a checkpoint that extends plain's, the next request gives plain's output"
+                   : "the requests leave the session, its frontier logits and every checkpoint component byte-equal to plain's, the next request with prefix reuse gives plain's output");
 }
 
 // ---- C: a drafter that fails costs speed, never the request ------------------------------------------------------
@@ -757,7 +799,11 @@ int main(int argc, char** argv) {
           ++groups;
         }
         if (wants("end", f)) {
-          EndTests(f, be, dir);
+          EndTests(f, be, dir, false);
+          ++groups;
+        }
+        if (wants("endcut", f)) {
+          EndTests(f, be, dir, true);
           ++groups;
         }
         if (wants("flow", f)) {

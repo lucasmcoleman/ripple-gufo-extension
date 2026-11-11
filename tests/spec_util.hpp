@@ -99,6 +99,8 @@ struct Truth {
   std::vector<float> rows;     ///< logits after position P-1 (the prompt), then after each generated token
   std::vector<float> taps;     ///< [position][tap][hidden] when captured
   std::size_t vocab{0}, tap_width{0};
+  /// [first position, rows) of every prefill pass this run's Syncs made (decode rows are one-row passes and not listed).
+  std::vector<std::pair<std::size_t, std::size_t>> passes;
 
   [[nodiscard]] std::span<const float> Row(std::size_t position) const {
     const std::size_t index = position + 1 - prompt.size();
@@ -118,6 +120,15 @@ struct Truth {
   }
 };
 
+/// The passes of a Sync that continues a session holding `held` tokens (its tokens a prefix of the target, less the last one) to `target_size` tokens.
+void AddPasses(std::vector<std::pair<std::size_t, std::size_t>>& passes, std::size_t from, std::size_t target_size, std::size_t max_rows) {
+  for (std::size_t at = from; at < target_size;) {
+    const std::size_t n = std::min(max_rows, target_size - at);
+    passes.emplace_back(at, n);
+    at += n;
+  }
+}
+
 /// Plain greedy decoding: Sync(prompt), then one-row steps, at most `limit` tokens, until a stop token.
 Truth RunTruth(const std::shared_ptr<EngineModel>& model, const std::vector<std::int32_t>& prompt, std::size_t limit) {
   Truth t;
@@ -133,6 +144,7 @@ Truth RunTruth(const std::shared_ptr<EngineModel>& model, const std::vector<std:
     t.taps.insert(t.taps.end(), taps.data.begin(), taps.data.end());
   };
   Require(s->Sync(prompt, &error), "truth sync: " + error);
+  AddPasses(t.passes, 0, prompt.size(), model->PrefillRows());
   take(0, prompt.size());
   t.rows.insert(t.rows.end(), s->Logits().begin(), s->Logits().end());
   while (t.gen.size() < limit) {
@@ -145,6 +157,57 @@ Truth RunTruth(const std::shared_ptr<EngineModel>& model, const std::vector<std:
     const std::size_t position = s->Position();
     Require(s->Evaluate(token, &error), "truth evaluate: " + error);
     take(position, 1);
+    t.rows.insert(t.rows.end(), s->Logits().begin(), s->Logits().end());
+  }
+  return t;
+}
+
+/// Plain decoding of `second` given the same call sequence as a drafted session saw (copied from tests/speculative_test.cpp): `first`'s prompt
+/// (Sync), its first `first_used` generated tokens one row at a time (a drafted request ends with every token evaluated), then Sync(second) and
+/// one-row steps. Taps cover every position of `second` (below the rewind they are the first run's); `passes` lists the prefill passes of
+/// both Syncs, which are the pass boundaries the live session's prefill had.
+Truth RunTruthAfter(const std::shared_ptr<EngineModel>& model, const Truth& first, std::size_t first_used,
+                    const std::vector<std::int32_t>& second, std::size_t limit) {
+  Truth t;
+  t.prompt = second;
+  t.vocab = model->VocabSize();
+  t.tap_width = model->executor_config().capture_layers.size() * model->weights().config.embedding_length;
+  std::string error;
+  auto s = NewSession(model);
+  const auto take = [&] {
+    auto taps = s->TakeTaps();
+    if (t.tap_width == 0 || taps.rows == 0) return;
+    Require(taps.first_position * t.tap_width <= t.taps.size(), "truth: a hole in the taps");
+    t.taps.resize(taps.first_position * t.tap_width);
+    t.taps.insert(t.taps.end(), taps.data.begin(), taps.data.end());
+  };
+  Require(s->Sync(first.prompt, &error), "truth sync: " + error);
+  AddPasses(t.passes, 0, first.prompt.size(), model->PrefillRows());
+  take();
+  for (std::size_t i = 0; i < first_used; ++i) {
+    Require(s->Evaluate(first.gen[i], &error), "truth evaluate: " + error);
+    take();
+  }
+  {
+    // Where the second Sync starts forwarding: the common prefix, less nothing (the last token's logits are needed: at most size - 1).
+    const auto& held = s->tokens();
+    std::size_t common = 0;
+    const std::size_t most = std::min(held.size(), second.size() - 1);
+    while (common < most && held[common] == second[common]) ++common;
+    AddPasses(t.passes, common, second.size(), model->PrefillRows());
+  }
+  Require(s->Sync(second, &error), "truth second sync: " + error);
+  take();
+  t.rows.insert(t.rows.end(), s->Logits().begin(), s->Logits().end());
+  while (t.gen.size() < limit) {
+    const std::int32_t token = Argmax(s->Logits());
+    if (model->IsStopToken(token)) {
+      t.stopped = true;
+      break;
+    }
+    t.gen.push_back(token);
+    Require(s->Evaluate(token, &error), "truth evaluate: " + error);
+    take();
     t.rows.insert(t.rows.end(), s->Logits().begin(), s->Logits().end());
   }
   return t;
