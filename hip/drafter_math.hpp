@@ -28,6 +28,14 @@ RICURSIVE_HD bool DraftRanksAbove(float score, std::int32_t id, float score2, st
   return score > score2 || (score == score2 && id < id2);
 }
 
+/// Bytes of the tiled Q8_1 activation scratch of the 8-bit projection route for `rows` rows of `cols` inputs (the layout of
+/// hip/ggml/prefill_quant_gemm.hpp: 16-token tiles x 32-element blocks x (576 payload + 64 sum sidecar) bytes). The executor's
+/// memory plan and the host operations' model of the scratch use this; the GPU's real allocation is
+/// ggml::QuantizedActivationBytes (a gate check compares the two: DrafterSessionBytes == DeviceBytes on the GPU).
+RICURSIVE_HD std::uint64_t Q8ActivationBytes(std::uint64_t rows, std::uint64_t cols) {
+  return ((rows + 15) / 16) * (cols / 32) * (576 + 64);
+}
+
 /// Partial top-k lists per logits row: the vocabulary in blocks of kDraftSelectTokensPerBlock.
 RICURSIVE_HD std::uint32_t DraftSelectPartials(std::uint32_t vocab_size) {
   return (vocab_size + kDraftSelectTokensPerBlock - 1) / kDraftSelectTokensPerBlock;

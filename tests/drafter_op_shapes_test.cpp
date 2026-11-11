@@ -33,6 +33,14 @@
 //                     16,384 keys, each 6e-8). Queries are scaled so the scores have standard deviation 2 (softmax weights
 //                     concentrate on a few dozen keys; a wrong key changes the output by far more than the tolerance).
 //   DynamicConv       rel to the sum of the absolute terms <= 1e-6 (four fp32 additions and a product each).
+//   ProjectQ8         (item 2) cpu mode: the host operations against a double-precision product of the dequantized weights,
+//                     relative RMSE per row <= 1e-6 (the host does not round activations). GPU modes: the W8A8 route
+//                     against the host's exact activations, relative RMSE per row <= 1.2e-2: Q8_1 rounds each 32-element
+//                     block of activations to int8 with step amax/127, an error of step/sqrt(12) per element, and
+//                     amax of 32 Gaussian values is about 2.2 sigma, so the output's relative RMSE is about
+//                     2.2 / (127 * sqrt(12)) = 0.5%, and the tolerance is 2.4 times that. Shapes: attention q (Q4_K
+//                     10,240 x 5,120), a K projection (Q8_0 1,024 x 5,120), the FFN down projection (Q4_K 5,120 x
+//                     40,960, the widest activation), the output head (Q6_K 100,352 x 5,120), rows 1, 3, 15 and 16.
 //   SiluMul           element rel <= 3e-6 (fp32 expf and one division, a few ulp; the GPU's expf one or two more).
 //   DraftSelect       candidate ids (by logit, equal logits by lowest token id) must be equal EXACTLY: logits are inputs.
 //                     Candidate scores: |diff| <= 5e-6 * (|logit| + sum of the 256 |terms|) (68 sequential fp32 additions
@@ -174,6 +182,14 @@ struct SelectCase {
   std::vector<std::uint8_t> pred, succ;  ///< [kVocab] encoded rows
   bool exact_ties{false};                ///< built to contain exact ties: no near-tie forgiveness
 };
+struct ProjectCase {
+  std::string what;
+  core::GgmlType type{core::GgmlType::kQ4_K};
+  std::uint32_t m{0}, k{0};
+  int rows{0};
+  std::vector<std::uint8_t> weights;
+  std::vector<float> x;
+};
 struct SelectOut {
   std::vector<std::int32_t> tokens, ids;
   std::vector<float> scores;
@@ -187,6 +203,7 @@ class Side {
   virtual std::vector<float> Conv(const ConvCase&) = 0;
   virtual std::vector<float> Silu(const SiluCase&) = 0;
   virtual SelectOut Select(const SelectCase&) = 0;
+  virtual std::vector<float> ProjectQ8(const ProjectCase&) = 0;
 };
 
 // ---- a side that runs through Ops (host or GPU operations) --------------------------------------------------------------------
@@ -236,6 +253,23 @@ class OpsSide final : public Side {
     const float* up = Up(c.up);
     ops_->SiluMul(gate, up, static_cast<std::uint32_t>(c.gate.size()));
     auto result = Down<float>(gate, c.gate.size());
+    Release();
+    return result;
+  }
+  std::vector<float> ProjectQ8(const ProjectCase& c) override {
+    std::vector<std::uint8_t> padded = c.weights;
+    padded.resize(c.weights.size() + 4096, 0);  // the uploader's zeroed tail
+    WeightView w;
+    w.data = UpBytes(padded.data(), padded.size());
+    w.type = c.type;
+    w.rows = c.m;
+    w.cols = c.k;
+    w.bytes = c.weights.size();
+    const float* x = Up(c.x);
+    float* y = Alloc<float>(std::size_t{static_cast<std::size_t>(c.rows)} * c.m);
+    ops_->ReserveProjection(static_cast<std::size_t>(c.rows), c.k);
+    ops_->ProjectQ8(w, x, c.rows, y);
+    auto result = Down<float>(y, std::size_t{static_cast<std::size_t>(c.rows)} * c.m);
     Release();
     return result;
   }
@@ -445,6 +479,25 @@ class NaiveSide final : public Side {
       out[i] = static_cast<float>(g / (1.0 + std::exp(-g)) * static_cast<double>(c.up[i]));
     }
     return out;
+  }
+
+  std::vector<float> ProjectQ8(const ProjectCase& c) override {
+    const std::size_t n = static_cast<std::size_t>(c.rows), row_bytes = quant::QuantizedRowBytes(c.type, c.k);
+    std::vector<float> y(n * c.m);
+#pragma omp parallel
+    {
+      std::vector<float> row(c.k);
+#pragma omp for schedule(static)
+      for (std::int64_t o = 0; o < static_cast<std::int64_t>(c.m); ++o) {
+        if (!quant::DequantizeRow(c.type, c.weights.data() + static_cast<std::size_t>(o) * row_bytes, row.data(), c.k)) std::abort();
+        for (std::size_t r = 0; r < n; ++r) {
+          double acc = 0.0;
+          for (std::size_t i = 0; i < c.k; ++i) acc += static_cast<double>(row[i]) * c.x[r * c.k + i];
+          y[r * c.m + static_cast<std::size_t>(o)] = static_cast<float>(acc);
+        }
+      }
+    }
+    return y;
   }
 
   SelectOut Select(const SelectCase& c) override {
@@ -800,7 +853,7 @@ SelectCase RandomSelect(Rng& rng, const std::string& what, core::GgmlType pred, 
 
 /// Top-k membership around exact ties: in every row six tokens spread over different partial lists (and different
 /// thread slots) get one logit value between the 28th and 29th largest, so the cut at 32 falls inside the tie.
-void InjectLogitTies(Rng& rng, SelectCase& c) {
+void InjectLogitTies(SelectCase& c) {
   c.exact_ties = true;
   for (std::uint32_t r = 0; r < c.rows; ++r) {
     float* lg = &c.logits[std::size_t{r} * kVocab];
@@ -949,7 +1002,7 @@ void RunSelect(Side& a, Side& b, Rng& rng, Report& report) {
   }
   {
     SelectCase c = RandomSelect(rng, "six equal logits straddling the cut at 32 in every row", q8, q4);
-    InjectLogitTies(rng, c);
+    InjectLogitTies(c);
     run_one(c);
   }
   {
@@ -965,6 +1018,83 @@ void RunSelect(Side& a, Side& b, Rng& rng, Report& report) {
            std::to_string(st.rows_compared) + " compared rows (share " + Sci(share) + ", limit 2e-2), worst candidate score error " +
            Sci(st.worst_score) + " of its bound" + (v.ok ? "" : "  -> FAILS");
   report.Add(v);
+}
+
+// ---- the 8-bit projection route (item 2) ---------------------------------------------------------------------------------------
+/// Random encoded weight rows of Q4_K, Q8_0 or Q6_K (finite scales, elements of order 0.1 to 1).
+std::vector<std::uint8_t> RandomMatrix(Rng& rng, core::GgmlType type, std::uint32_t m, std::uint32_t k) {
+  const std::size_t row_bytes = quant::QuantizedRowBytes(type, k);
+  Require(row_bytes != 0, "matrix type");
+  std::vector<std::uint8_t> w(row_bytes * m);
+  std::uint64_t bits = 0;
+  for (std::size_t i = 0; i < w.size(); ++i) {
+    if (i % 8 == 0) bits = rng.Next();
+    w[i] = static_cast<std::uint8_t>(bits >> (8 * (i % 8)));
+  }
+  const auto set_half = [&](std::size_t at, float x) {
+    const std::uint16_t h = HalfBits(x);
+    w[at] = static_cast<std::uint8_t>(h & 0xFF);
+    w[at + 1] = static_cast<std::uint8_t>(h >> 8);
+  };
+  for (std::uint32_t r = 0; r < m; ++r) {
+    const std::size_t row = r * row_bytes;
+    if (type == core::GgmlType::kQ8_0) {
+      for (std::size_t b = 0; b < row_bytes; b += 34) set_half(row + b, 0.004F * static_cast<float>(1 + rng.Below(8)));
+    } else if (type == core::GgmlType::kQ4_K) {
+      for (std::size_t b = 0; b < row_bytes; b += 144) {
+        set_half(row + b, 0.0008F * static_cast<float>(1 + rng.Below(8)));
+        set_half(row + b + 2, 0.0008F * static_cast<float>(1 + rng.Below(8)));
+      }
+    } else {  // Q6_K: the scale d is the last two bytes of a 210-byte block
+      for (std::size_t b = 0; b < row_bytes; b += 210) set_half(row + b + 208, 0.0002F * static_cast<float>(1 + rng.Below(8)));
+    }
+  }
+  return w;
+}
+
+void RunProjectQ8(Side& a, Side& b, Rng& rng, Report& report, bool gpu) {
+  struct Shape {
+    const char* name;
+    core::GgmlType type;
+    std::uint32_t m, k;
+  };
+  const Shape shapes[] = {{"attention q, Q4_K 10240 x 5120", core::GgmlType::kQ4_K, 10240, kE},
+                          {"K projection, Q8_0 1024 x 5120", core::GgmlType::kQ8_0, 1024, kE},
+                          {"FFN down, Q4_K 5120 x 40960", core::GgmlType::kQ4_K, kE, kFF},
+                          {"output head, Q6_K 100352 x 5120", core::GgmlType::kQ6_K, kVocab, kE}};
+  const double tol = gpu ? 1.2e-2 : 1e-6;
+  for (const Shape& sh : shapes) {
+    ProjectCase c;
+    c.type = sh.type;
+    c.m = sh.m;
+    c.k = sh.k;
+    c.weights = RandomMatrix(rng, sh.type, sh.m, sh.k);
+    double worst = 0.0;
+    const bool head = sh.m == kVocab;
+    for (const int rows : head ? std::vector<int>{15} : std::vector<int>{1, 3, 15, 16}) {
+      c.rows = rows;
+      c.what = std::string(sh.name) + ", " + std::to_string(rows) + " rows";
+      c.x = Normals(rng, static_cast<std::size_t>(rows) * sh.k, 1.0);
+      const auto oa = a.ProjectQ8(c), ob = b.ProjectQ8(c);
+      for (int r = 0; r < rows; ++r) {
+        double num = 0.0, den = 0.0;
+        bool bad = false;
+        for (std::uint32_t o = 0; o < sh.m; ++o) {
+          const float g = oa[static_cast<std::size_t>(r) * sh.m + o], w = ob[static_cast<std::size_t>(r) * sh.m + o];
+          if (!std::isfinite(g) || !std::isfinite(w)) {
+            bad = true;
+            break;
+          }
+          num += (static_cast<double>(g) - w) * (static_cast<double>(g) - w);
+          den += static_cast<double>(w) * w;
+        }
+        const double rel = bad ? INFINITY : std::sqrt(num / std::max(den, 1e-30));
+        if (!(rel <= worst)) worst = rel;
+      }
+    }
+    report.Add(Judge(std::string("8-bit projection route, ") + sh.name + ", rows 1.." + (head ? "15" : "16"), worst, tol,
+                     "relative RMSE per row"));
+  }
 }
 
 // ---- the whole run --------------------------------------------------------------------------------------------------------------
@@ -1004,6 +1134,9 @@ void RunAll() {
   t0 = Clock::now();
   RunSelect(*a, *b, rng, report);
   std::printf("  (selector: %.1f s)\n", Seconds(t0));
+  t0 = Clock::now();
+  RunProjectQ8(*a, *b, rng, report, be.gpu);
+  std::printf("  (8-bit projection route: %.1f s)\n", Seconds(t0));
 
   if (!be.gpu) {
     // Twins: one wrong index in the naive side's ring arithmetic must fail the comparison.

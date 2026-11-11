@@ -176,6 +176,9 @@ class Ops {
   /// every row count (no activation rounding).
   virtual void Project(const WeightView& w, const float* x, int rows, float* y,
                        bool exact) = 0;
+  /// Bytes of device memory the operations hold for the projection scratch (the Q8_1 activations of the 8-bit routes,
+  /// sized by ReserveProjection): what is allocated on the GPU, the same formula on the host (rocm::Q8ActivationBytes).
+  [[nodiscard]] virtual std::uint64_t ProjectionScratchBytes() const noexcept = 0;
   virtual void QkNormRopeAppend(float* q, const float* k, const float* v,
                                 const float* q_gamma, const float* k_gamma,
                                 void* k_cache, void* v_cache, KvType type,
@@ -201,6 +204,15 @@ class Ops {
                           std::uint32_t src_rows, std::uint32_t dim) = 0;
 
   // ---- the drafter's operations (docs/DRAFTER-S2.md) --------------------
+  /// A projection on the 8-bit activation route at ANY row count (docs/DRAFTER-S2.md, "Stage 2b"): the activations are
+  /// quantized to Q8_1 blocks and multiplied by the weights on the W8A8 GEMM, which `Project` takes only above 16 rows
+  /// (at or below it the FP32 small-batch kernels, about 3 times a one-row pass at 16 rows). Rows are NOT bit-equal to
+  /// `Project`'s: they differ by the activation rounding, which the drafter tolerates (it only changes how many drafts the
+  /// verifier accepts). F32 and BF16 weights have no 8-bit route and take `Project`'s. Needs the scratch of
+  /// ReserveProjection(rows, w.cols) reserved beforehand (it never allocates inside a pass). The host operations have no
+  /// model of the activation rounding: they compute `Project`'s result and count the call (HostOpsOptions::counters).
+  /// Only the drafter calls it; `Project` and its callers are unchanged.
+  virtual void ProjectQ8(const WeightView& w, const float* x, int rows, float* y) = 0;
   // Additions for the DFlash2 drafter (hip/drafter_executor.cpp); the target's
   // executor never calls them. Their GPU kernels are hip/drafter_kernels.hip.cpp,
   // adapted from gufo's Qwen DFlash kernels; the host versions below use the same
@@ -274,6 +286,14 @@ class Ops {
                            std::uint32_t selector_top_k) = 0;
 };
 
+/// Calls the host operations received (docs/DRAFTER-S2.md, "Stage 2b": the route selection is tested by counting).
+struct HostOpsCounters {
+  std::uint64_t project{0};      ///< Project calls
+  std::uint64_t project_q8{0};   ///< ProjectQ8 calls
+  std::uint64_t q8_rows{0};      ///< rows of the ProjectQ8 calls
+  std::vector<const void*> q8_weights;  ///< the weight data pointer of every ProjectQ8 call, in order
+};
+
 /// Test-only deliberate defects of the host operations (docs/DRAFTER-S2.md, the twins).
 struct HostOpsOptions {
   bool lenient_capacity{false};   ///< see HostOpsExecutor::Options
@@ -281,6 +301,8 @@ struct HostOpsOptions {
   /// DynamicConv reads the rows of the block's end for taps that reach before its start
   /// (a cyclic buffer instead of zero padding).
   bool conv_across_block_start{false};
+  /// Counts the projection calls here (not owned; must outlive the operations).
+  HostOpsCounters* counters{nullptr};
 };
 /// A host operations object (ops_host.cpp) / a GPU one on its own stream (ops_gpu.cpp, HIP builds).
 [[nodiscard]] std::unique_ptr<Ops> CreateHostOps(const HostOpsOptions& options = {});

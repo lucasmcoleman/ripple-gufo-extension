@@ -57,6 +57,12 @@ struct SpeculativeSetup {
     const std::string& draft_model_path, const core::GgufReader& target_reader,
     std::uint32_t max_draft_tokens, std::string* error);
 
+/// The options the drafter engine of a session of a model on `backend` is built with: the setup's, with the context storage
+/// and the exactness the engine follows from the backend (an F32 cache holds 296 MiB of rings, not 148), and the projection
+/// routes of the environment variable RICURSIVE_DRAFTER_Q8 when the setup names none (docs/DRAFTER-S2.md, "Stage 2b"). The
+/// resource claim and the engine use this one function, so the claim is the memory the engine allocates.
+[[nodiscard]] DrafterOptions EffectiveDrafterOptions(const SpeculativeSetup& setup, const BackendChoice& backend);
+
 /// Applies what drafting needs to the model options (verify rows, the drafter's tap layers).
 void ArmForSpeculation(const SpeculativeSetup& setup, ModelOptions& options);
 

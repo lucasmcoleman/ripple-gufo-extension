@@ -69,6 +69,14 @@ class Scratch {
 void Project(const DeviceTensor& w, const float* x, int rows, float* y, Scratch& scratch,
              hipStream_t stream, bool exact = false);
 
+/// The drafter's route (docs/DRAFTER-S2.md, "Stage 2b"): y = x * W^T with the activations quantized to Q8_1 blocks and the
+/// W8A8 WMMA GEMM at ANY row count (Project takes it only above kSplitRows). Quantized weights only take the 8-bit route
+/// (rows within the activation-rounding envelope of Project's W8A8 path, not bit-equal to the small-batch kernels); F32 and
+/// BF16 weights run Project's per-row GEMV. `scratch` must already hold QuantizedActivationBytes(rows, w.cols)
+/// (Scratch::Reserve): a reservation inside the pass would synchronize the device. Same validation and errors as Project.
+/// `Project` itself is unchanged; only the drafter calls this.
+void ProjectW8A8(const DeviceTensor& w, const float* x, int rows, float* y, Scratch& scratch, hipStream_t stream);
+
 }  // namespace gufo::models::ricursive::rocm
 
 #endif  // GUFO_MODELS_RICURSIVE_HIP_PROJECT_HPP_

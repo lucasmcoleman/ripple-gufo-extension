@@ -15,6 +15,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -24,6 +25,22 @@
 #include "src/weights.hpp"
 
 namespace gufo::models::ricursive {
+
+/// Which groups of the drafter's projections run on the 8-bit activation route (`Ops::ProjectQ8`, docs/DRAFTER-S2.md "Stage 2b")
+/// instead of `Ops::Project` (FP32 small-batch kernels up to 16 rows). All false = today's behaviour. `DrafterOptions::exact`
+/// overrides every route (FP32 activations everywhere).
+struct DrafterRoutes {
+  bool block{false};    ///< the block pass's 9 matrices per layer (16 rows): conv_proj, q, k, v, output, ffn conv_proj, gate, up, down
+  bool head{false};     ///< the output head and the selector's hidden projection (the d drafted rows)
+  bool context{false};  ///< the context pass: fc and the K and V projections of the appended rows (any row count)
+  [[nodiscard]] bool Any() const noexcept { return block || head || context; }
+  friend bool operator==(const DrafterRoutes&, const DrafterRoutes&) = default;
+};
+/// "block,head,context" in any order and any subset; "all"; "none" or "" (nothing). Throws std::invalid_argument otherwise.
+[[nodiscard]] DrafterRoutes ParseDrafterRoutes(std::string_view list);
+/// ParseDrafterRoutes of the environment variable RICURSIVE_DRAFTER_Q8 (unset: nothing).
+[[nodiscard]] DrafterRoutes DrafterRoutesFromEnvironment();
+[[nodiscard]] std::string ToString(const DrafterRoutes& routes);
 
 struct DrafterOptions {
   KvType kv_type{KvType::kF16};          ///< context K/V storage (F32: exact comparison with the reference)
@@ -38,6 +55,7 @@ struct DrafterOptions {
   /// test mode, where the context passes of more than 16 rows would otherwise round activations to int8
   /// blocks). The host operations ignore it.
   bool exact{false};
+  DrafterRoutes q8;  ///< groups of projections on the 8-bit activation route (default: none)
 };
 
 /// Test-only deliberate defects (each a one-line change that must make the checks fail).
@@ -117,6 +135,8 @@ class DrafterExecutor {
 
  private:
   struct Buffers;
+  /// One projection: the 8-bit route when `q8` (and not `exact`), else Ops::Project.
+  void Proj(bool q8, const WeightView& w, const float* x, int rows, float* y);
   void Emit(const DrafterStageFn& stage, std::string_view name, int layer, const float* data,
             std::size_t rows, std::size_t width);
   void EmitRing(const DrafterStageFn& stage, std::string_view name, int layer, const void* ring,

@@ -556,6 +556,53 @@ void CheckBookkeeping(const Tiny& t, const Drafter& d) {
               b.drafts, b.deep);
 }
 
+/// Item 2 of docs/DRAFTER-S2.md "Stage 2b": the route of every group of projections, by call counting on the host operations
+/// (the host has no model of the Q8_1 activation rounding, so the arithmetic of a routed projection is not testable here; on
+/// the GPU the bench and `drafter_ops_test real` against the oracle judge it). For each of the 8 subsets of
+/// {block, head, context}, with and without `exact` (which overrides every route): a context append of 20 rows in two passes
+/// (16 + 4) and one draft of 15 rows; the number of ProjectQ8 calls, their rows and the weights they got are what the routes
+/// say, and the total of projection calls does not depend on the routes.
+void CheckRoutes(const Tiny& t, const Drafter& d) {
+  const DrafterConfig& c = d.w.config;
+  const std::size_t F = c.FeatureWidth();
+  const std::uint64_t layers = c.block_count, ctx = 1 + 2 * layers, block = 9 * layers, head = 2, B = c.block_size, D = B - 1;
+  std::size_t configurations = 0;
+  for (int mask = 0; mask < 8; ++mask) {
+    for (const bool exact : {false, true}) {
+      DrafterOptions o = F32Walk("").opts;
+      o.q8 = {(mask & 1) != 0, (mask & 2) != 0, (mask & 4) != 0};
+      o.exact = exact;
+      HostOpsCounters counters;
+      HostOpsOptions host;
+      host.counters = &counters;
+      auto engine = MakeEngine(d, t.target, o, {}, host);
+      const std::string label = "routes {" + ToString(o.q8) + "}" + (exact ? ", exact" : "");
+      engine->Append(0, std::span(t.dump.taps).subspan(0, 20 * F));  // passes of 16 and 4 rows
+      const bool q8_ctx = o.q8.context && !exact;
+      Require(counters.project_q8 == (q8_ctx ? 2 * ctx : 0) && counters.project + counters.project_q8 == 2 * ctx,
+              label + ": the context pass made " + std::to_string(counters.project_q8) + " ProjectQ8 and " + std::to_string(counters.project) +
+                  " Project calls, expected " + std::to_string(q8_ctx ? 2 * ctx : 0) + " and " + std::to_string(q8_ctx ? 0 : 2 * ctx));
+      Require(counters.q8_rows == (q8_ctx ? ctx * 20 : 0), label + ": rows of the context pass on the 8-bit route");
+      const std::uint64_t before_q8 = counters.project_q8, before_all = counters.project + counters.project_q8;
+      counters.q8_weights.clear();
+      (void)engine->Draft(t.dump.ids[20], 20, static_cast<std::uint32_t>(D));
+      const bool q8_block = o.q8.block && !exact, q8_head = o.q8.head && !exact;
+      const std::uint64_t want_q8 = (q8_block ? block : 0) + (q8_head ? head : 0);
+      Require(counters.project_q8 - before_q8 == want_q8 && counters.project + counters.project_q8 - before_all == block + head,
+              label + ": the draft step made " + std::to_string(counters.project_q8 - before_q8) + " ProjectQ8 calls of " +
+                  std::to_string(block + head) + ", expected " + std::to_string(want_q8));
+      if (q8_head) {  // the head's two matrices, in order, are the last ProjectQ8 calls
+        const auto& w = counters.q8_weights;
+        Require(w.size() >= 2 && w[w.size() - 2] == t.target.weights.output.data && w[w.size() - 1] == d.w.selector_hidden.data,
+                label + ": the head route did not carry the output head and the selector's hidden projection");
+      }
+      ++configurations;
+    }
+  }
+  std::printf("  projection routes: %zu configurations (8 subsets of block/head/context, with and without exact) route exactly the groups chosen "
+              "(by call counting: the host has no model of the 8-bit activation rounding)\n", configurations);
+}
+
 void TinyCase(const ricursive_test::Model& target, const std::string& dir) {
   Tiny t{target, dir, LoadDump(dir + "/stage1/tiny/dump")};
   const Drafter q8 = OpenDrafter(dir + "/stage1/tiny/drafter-q8_0.gguf", target.weights.config);
@@ -592,6 +639,12 @@ void TinyCase(const ricursive_test::Model& target, const std::string& dir) {
     MustFail(t, k32, w, "the selector limited to 16 candidates (top-k 32 fixture)");
   }
   CheckHint(t, q8);
+  if (host) {
+    CheckRoutes(t, q8);
+    Walk w = F16Walk("");
+    w.opts.q8 = {true, true, true};
+    MustPass(t, q8, w, "1. Q8_0 drafter, F16 context storage, every projection group on the 8-bit route (host: the same arithmetic)");
+  }
   // 3. bookkeeping.
   CheckBookkeeping(t, q8);
   // 4. twins of 1.
@@ -667,6 +720,10 @@ int Real(int argc, char** argv) {
     std::vector<std::size_t> anchors(anchors_rec.i.begin(), anchors_rec.i.end());
     const std::size_t max_anchor = *std::max_element(anchors.begin(), anchors.end());
     DrafterOptions o;  // production options: F16 context storage
+    if (const char* routes = std::getenv("RICURSIVE_TEST_Q8")) {  // e.g. block,head,context (the host ignores the rounding)
+      o.q8 = ParseDrafterRoutes(routes);
+      std::printf("  projection routes on the 8-bit path: %s\n", ToString(o.q8).c_str());
+    }
     auto engine = MakeEngine(d, target, o);
     const std::size_t F = d.w.config.FeatureWidth();
     const auto t0 = std::chrono::steady_clock::now();

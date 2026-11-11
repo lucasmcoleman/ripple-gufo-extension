@@ -35,6 +35,9 @@ struct Sizes {
   std::uint64_t block{0};         ///< floats of the block buffers
   std::uint64_t select{0};        ///< 4-byte elements of the selector's buffers
   std::uint64_t rings{0};         ///< bytes of the K/V rings
+  std::uint64_t scratch{0};       ///< bytes of the projection scratch (Q8_1 activations)
+  /// The (rows, cols) pairs ReserveProjection is called with; scratch is the largest of their sizes.
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> reserve;
   std::uint32_t window{0};
   std::uint32_t append_rows{0};
   std::vector<std::uint32_t> capacity;
@@ -62,10 +65,52 @@ Sizes Plan(const DrafterConfig& c, std::uint32_t vocab, const DrafterOptions& o)
   // h a x0 attn fin (E), q o (Q), kb vb bk bv (KV), dyn, g u (FF), logits, hproj
   s.block = 5 * B * E + 2 * B * Q + 4 * B * KV + B * DYN + 2 * B * FF + R * vocab + R * c.selector_rank;
   s.select = B /*tokens*/ + 2 * R * K /*candidates*/ + 2 * R * P * K /*partials*/;
+  // The projection scratch holds the Q8_1 activations of the 8-bit routes only: the context pass at more than 16 rows
+  // (Project's own W8A8 route) or on the chosen route, the block pass and the head when chosen. `exact` uses none.
+  // The widest input of the context pass is fc's (F); of the block pass the FFN down projection's (FF); of the head E.
+  if (!o.exact) {
+    if (o.q8.context || M > 16) s.reserve.emplace_back(M, F);
+    if (o.q8.block) s.reserve.emplace_back(B, std::max({E, Q, FF}));
+    if (o.q8.head) s.reserve.emplace_back(R, E);
+  }
+  for (const auto& [rows, cols] : s.reserve) s.scratch = std::max(s.scratch, km::Q8ActivationBytes(rows, cols));
   return s;
 }
 
 }  // namespace
+
+DrafterRoutes ParseDrafterRoutes(std::string_view list) {
+  DrafterRoutes r;
+  std::size_t at = 0;
+  while (at <= list.size()) {
+    std::size_t end = list.find(',', at);
+    if (end == std::string_view::npos) end = list.size();
+    const std::string_view item = list.substr(at, end - at);
+    if (item == "block") r.block = true;
+    else if (item == "head") r.head = true;
+    else if (item == "context") r.context = true;
+    else if (item == "all") r = DrafterRoutes{true, true, true};
+    else if (!item.empty() && item != "none") {
+      throw std::invalid_argument("ricursive drafter: unknown projection route group '" + std::string(item) +
+                                  "' (block, head, context, all or none)");
+    }
+    at = end + 1;
+  }
+  return r;
+}
+
+DrafterRoutes DrafterRoutesFromEnvironment() {
+  const char* env = std::getenv("RICURSIVE_DRAFTER_Q8");
+  return env != nullptr ? ParseDrafterRoutes(env) : DrafterRoutes{};
+}
+
+std::string ToString(const DrafterRoutes& routes) {
+  std::string out;
+  for (const auto& [on, name] : {std::pair{routes.block, "block"}, std::pair{routes.head, "head"}, std::pair{routes.context, "context"}}) {
+    if (on) out += (out.empty() ? "" : ",") + std::string(name);
+  }
+  return out.empty() ? "none" : out;
+}
 
 std::shared_ptr<DrafterHandles> BuildHostDrafterHandles(const DrafterWeights& w) {
   auto h = std::make_shared<DrafterHandles>();
@@ -110,7 +155,7 @@ DrafterTarget BuildHostDrafterTarget(const ModelWeights& target) {
 std::uint64_t DrafterSessionBytes(const DrafterConfig& config, std::uint32_t vocab_size,
                                   const DrafterOptions& options) {
   const Sizes s = Plan(config, vocab_size, options);
-  return s.rings + 4 * (s.context_pass + s.block + s.select);
+  return s.rings + s.scratch + 4 * (s.context_pass + s.block + s.select);
 }
 
 // ---- buffers -------------------------------------------------------------------------------
@@ -285,12 +330,20 @@ DrafterExecutor::DrafterExecutor(std::unique_ptr<Ops> ops, std::shared_ptr<const
     b.kr.push_back(b.Take<std::byte>(std::size_t{capacity_[l]} * KV * esize));
     b.vr.push_back(b.Take<std::byte>(std::size_t{capacity_[l]} * KV * esize));
   }
-  ops_->ReserveProjection(std::max<std::size_t>(M, B), std::max<std::size_t>({F, E, Q, FF}));
+  for (const auto& [rows, cols] : plan.reserve) ops_->ReserveProjection(rows, cols);
 }
 
 DrafterExecutor::~DrafterExecutor() = default;
 
-std::uint64_t DrafterExecutor::DeviceBytes() const noexcept { return buf_->total; }
+std::uint64_t DrafterExecutor::DeviceBytes() const noexcept { return buf_->total + ops_->ProjectionScratchBytes(); }
+
+void DrafterExecutor::Proj(bool q8, const WeightView& w, const float* x, int rows, float* y) {
+  if (q8 && !options_.exact) {
+    ops_->ProjectQ8(w, x, rows, y);
+  } else {
+    ops_->Project(w, x, rows, y, options_.exact);
+  }
+}
 
 bool DrafterExecutor::LayerHasRope(std::size_t layer) const noexcept {
   return drafter_->config.rope[layer] || faults_.rope_on_nope_layer;
@@ -356,15 +409,15 @@ void DrafterExecutor::AppendContext(std::span<const float> features, std::size_t
     if (prof_) LapStart(true);
     ops_->CopyIn(b.feats, features.data() + done * F, std::size_t{n} * F * sizeof(float));
     Lap("ctx_upload");
-    ops_->Project(drafter_->fc, b.feats, static_cast<int>(n), b.proj, options_.exact);
+    Proj(options_.q8.context, drafter_->fc, b.feats, static_cast<int>(n), b.proj);
     Lap("ctx_fc");
     ops_->RmsNorm(b.proj, drafter_->enc_output_norm, b.ctx, n, static_cast<std::uint32_t>(E), c.rms_eps);
     Lap("ctx_norm");
     Emit(stage, "ctx_h", -1, b.ctx, n, E);
     for (std::uint32_t l = 0; l < c.block_count; ++l) {
       const DrafterLayerHandles& L = drafter_->layers[l];
-      ops_->Project(L.attn_k, b.ctx, static_cast<int>(n), b.kt, options_.exact);
-      ops_->Project(L.attn_v, b.ctx, static_cast<int>(n), b.vt, options_.exact);
+      Proj(options_.q8.context, L.attn_k, b.ctx, static_cast<int>(n), b.kt);
+      Proj(options_.q8.context, L.attn_v, b.ctx, static_cast<int>(n), b.vt);
       Lap("ctx_kv_proj");
       // Norm and rotary of the K rows, then the rows into the ring at slot position % capacity.
       ops_->DraftQkNormRope(nullptr, b.kt, b.vt, L.attn_q_norm, L.attn_k_norm, b.kr[l], b.vr[l],
@@ -426,14 +479,14 @@ DrafterExecutor::Draft DrafterExecutor::DraftStep(std::int32_t anchor_token, std
     ops.RmsNorm(b.h, L.attn_norm, b.a, B, E, c.rms_eps);
     Lap("norm");
     Emit(stage, "attn_norm", il, b.a, B, E);
-    ops.Project(L.attn_conv_proj, b.a, static_cast<int>(B), b.dyn, options_.exact);
+    Proj(options_.q8.block, L.attn_conv_proj, b.a, static_cast<int>(B), b.dyn);
     Lap("conv_proj");
     ops.DynamicConv(b.a, b.dyn, L.attn_conv_base, b.x0, B, E, K, c.conv_group_size, 0, false);
     Lap("conv");
     Emit(stage, "attn_conv_in", il, b.x0, B, E);
-    ops.Project(L.attn_q, b.x0, static_cast<int>(B), b.q, options_.exact);
-    ops.Project(L.attn_k, b.x0, static_cast<int>(B), b.kb, options_.exact);
-    ops.Project(L.attn_v, b.x0, static_cast<int>(B), b.vb, options_.exact);
+    Proj(options_.q8.block, L.attn_q, b.x0, static_cast<int>(B), b.q);
+    Proj(options_.q8.block, L.attn_k, b.x0, static_cast<int>(B), b.kb);
+    Proj(options_.q8.block, L.attn_v, b.x0, static_cast<int>(B), b.vb);
     Lap("qkv_proj");
     // q in place; the block's K and V rows go to the block buffers (fp32, row t in slot t).
     ops.DraftQkNormRope(b.q, b.kb, b.vb, L.attn_q_norm, L.attn_k_norm, b.bk, b.bv, KvType::kF32, B, NH, NKV, D,
@@ -444,7 +497,7 @@ DrafterExecutor::Draft DrafterExecutor::DraftStep(std::int32_t anchor_token, std
     ops.DraftAttention(b.q, b.kr[l], b.vr[l], options_.kv_type, capacity_[l], first_row(l), s, b.bk, b.bv, b.o, B,
                        NH, NKV, D, window, scale);
     Lap("attention");
-    ops.Project(L.attn_output, b.o, static_cast<int>(B), b.attn, options_.exact);
+    Proj(options_.q8.block, L.attn_output, b.o, static_cast<int>(B), b.attn);
     Lap("o_proj");
     Emit(stage, "attn_o", il, b.attn, B, E);
     ops.DynamicConv(b.attn, b.dyn, L.attn_conv_base, b.h, B, E, K, c.conv_group_size, 1, true);
@@ -455,17 +508,17 @@ DrafterExecutor::Draft DrafterExecutor::DraftStep(std::int32_t anchor_token, std
     ops.RmsNorm(b.h, L.ffn_norm, b.a, B, E, c.rms_eps);
     Lap("norm");
     Emit(stage, "ffn_norm", il, b.a, B, E);
-    ops.Project(L.ffn_conv_proj, b.a, static_cast<int>(B), b.dyn, options_.exact);
+    Proj(options_.q8.block, L.ffn_conv_proj, b.a, static_cast<int>(B), b.dyn);
     Lap("conv_proj");
     ops.DynamicConv(b.a, b.dyn, L.ffn_conv_base, b.x0, B, E, K, c.conv_group_size, 0, false);
     Lap("conv");
     Emit(stage, "mlp_conv_in", il, b.x0, B, E);
-    ops.Project(L.ffn_gate, b.x0, static_cast<int>(B), b.g, options_.exact);
-    ops.Project(L.ffn_up, b.x0, static_cast<int>(B), b.u, options_.exact);
+    Proj(options_.q8.block, L.ffn_gate, b.x0, static_cast<int>(B), b.g);
+    Proj(options_.q8.block, L.ffn_up, b.x0, static_cast<int>(B), b.u);
     Lap("ffn_gate_up");
     ops.SiluMul(b.g, b.u, B * FF);  // no clamp
     Lap("silu_mul");
-    ops.Project(L.ffn_down, b.g, static_cast<int>(B), b.attn, options_.exact);
+    Proj(options_.q8.block, L.ffn_down, b.g, static_cast<int>(B), b.attn);
     Lap("ffn_down");
     Emit(stage, "mlp_o", il, b.attn, B, E);
     ops.DynamicConv(b.attn, b.dyn, L.ffn_conv_base, b.h, B, E, K, c.conv_group_size, 1, true);
@@ -478,10 +531,10 @@ DrafterExecutor::Draft DrafterExecutor::DraftStep(std::int32_t anchor_token, std
   Emit(stage, "final", -1, b.fin, B, E);
 
   // ---- logits of rows 1..d with the target's output head (multiplier 1, no softcap), then the selector ----
-  ops.Project(target_.output, b.fin + E, static_cast<int>(d), b.logits, options_.exact);
+  Proj(options_.q8.head, target_.output, b.fin + E, static_cast<int>(d), b.logits);
   Lap("head_logits");
   Emit(stage, "logits", -1, b.logits, d, vocab);
-  ops.Project(drafter_->selector_hidden, b.fin + E, static_cast<int>(d), b.hproj, options_.exact);
+  Proj(options_.q8.head, drafter_->selector_hidden, b.fin + E, static_cast<int>(d), b.hproj);
   Lap("selector_proj");
   Emit(stage, "hproj", -1, b.hproj, d, c.selector_rank);
   const std::uint32_t top_k =

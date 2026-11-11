@@ -173,4 +173,55 @@ void Project(const DeviceTensor& w, const float* x, int rows, float* y, Scratch&
   Check(hipGetLastError(), "kernel launch");
 }
 
+namespace {
+
+/// Project's validation (Dispatch, above), then the 8-bit route for quantized weights at any row count.
+void DispatchW8A8(const DeviceTensor& w, const float* x, int rows, float* y, Scratch& scratch, hipStream_t stream) {
+  const std::string type_name(core::ToString(w.type));
+  if (!IsProjectable(w.type)) {
+    Fail("no GPU projection path for type " + type_name +
+         " (supported: F32, BF16, Q8_0, Q4_K, Q5_K, Q6_K)");
+  }
+  if (w.data == nullptr || x == nullptr || y == nullptr) {
+    Fail("null pointer (weight " + type_name + ")");
+  }
+  if (rows < 1 || w.rows == 0 || w.cols == 0) {
+    Fail("empty projection: rows=" + std::to_string(rows) + " weight " + std::to_string(w.rows) +
+         "x" + std::to_string(w.cols) + " " + type_name);
+  }
+  const std::size_t row_bytes = RowBytes(w.type, w.cols);
+  if (row_bytes == 0) {
+    Fail("cols=" + std::to_string(w.cols) + " is not block aligned for type " + type_name);
+  }
+  if (w.bytes != row_bytes * w.rows) {
+    Fail("byte size " + std::to_string(w.bytes) + " does not match " + std::to_string(w.rows) + "x" +
+         std::to_string(w.cols) + " " + type_name + " (" + std::to_string(row_bytes * w.rows) + ")");
+  }
+  const std::size_t n = static_cast<std::size_t>(rows);
+  const std::size_t m = w.rows;
+  const std::size_t k = w.cols;
+  if (IsDense(w.type)) {
+    for (std::size_t r = 0; r < n; ++r) {
+      ggml::LaunchGEMV(w.data, w.type, x + r * k, y + r * m, m, k, stream);
+    }
+    return;
+  }
+  if (ggml::QuantizedActivationBytes(n, k) > scratch.capacity()) {
+    Fail("the Q8_1 scratch holds " + std::to_string(scratch.capacity()) + " bytes, " + std::to_string(rows) + " rows of " +
+         std::to_string(k) + " need " + std::to_string(ggml::QuantizedActivationBytes(n, k)) +
+         " (reserve it before the pass: a reservation inside it synchronizes)");
+  }
+  ggml::LaunchQuantizeActivationQ8_1FromFp32(x, scratch.data(), n, k, stream);
+  ggml::LaunchBatchedQuantGEMMPreQuantized(w.type, w.data, scratch.data(), y, n, m, k, stream);
+}
+
+}  // namespace
+
+void ProjectW8A8(const DeviceTensor& w, const float* x, int rows, float* y, Scratch& scratch,
+                 hipStream_t stream) {
+  (void)hipGetLastError();  // drop an unrelated earlier error so the check below is ours
+  DispatchW8A8(w, x, rows, y, scratch, stream);
+  Check(hipGetLastError(), "kernel launch");
+}
+
 }  // namespace gufo::models::ricursive::rocm

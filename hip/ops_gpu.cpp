@@ -78,6 +78,7 @@ class GpuOps final : public Ops {
   void ReserveProjection(std::size_t rows, std::size_t cols) override {
     scratch_.Reserve(rows, cols);
   }
+  std::uint64_t ProjectionScratchBytes() const noexcept override { return scratch_.capacity(); }
 
   void EmbedRows(const EmbeddingTable& table, std::span<const std::int32_t> tokens,
                  float scale, float* out) override {
@@ -107,6 +108,10 @@ class GpuOps final : public Ops {
   void Project(const WeightView& w, const float* x, int rows, float* y, bool exact) override {
     const rocm::DeviceTensor t{w.data, w.type, w.rows, w.cols, w.bytes};
     rocm::Project(t, x, rows, y, scratch_, stream_, exact);  // throws on refusal
+  }
+  void ProjectQ8(const WeightView& w, const float* x, int rows, float* y) override {
+    const rocm::DeviceTensor t{w.data, w.type, w.rows, w.cols, w.bytes};
+    rocm::ProjectW8A8(t, x, rows, y, scratch_, stream_);  // throws on refusal
   }
   void QkNormRopeAppend(float* q, const float* k, const float* v, const float* q_gamma,
                         const float* k_gamma, void* k_cache, void* v_cache, KvType type,

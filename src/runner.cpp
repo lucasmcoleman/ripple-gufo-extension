@@ -218,7 +218,7 @@ class Runner final : public ext::TextModelRunner {
         .per_request_state_bytes =
             model_->SessionBytes(model_->MaxContext()) +
             (speculative_ ? DrafterSessionBytes(speculative_->weights.config, model_->VocabSize(),
-                                                speculative_->drafter_options)
+                                                EffectiveDrafterOptions(*speculative_, model_->backend()))
                           : 0),
         .temporary_scratch_bytes = 0,
         .retained_snapshot_capacity_bytes = ext::HostSnapshotBudgetBytes(),
@@ -467,6 +467,14 @@ void PinSharedDrafter(const SpeculativeSetup& setup, const Model& model) {
 #endif
 }
 
+DrafterOptions EffectiveDrafterOptions(const SpeculativeSetup& setup, const BackendChoice& backend) {
+  DrafterOptions options = setup.drafter_options;
+  options.kv_type = backend.kv_type;
+  options.exact = backend.exact;
+  if (!options.q8.Any()) options.q8 = DrafterRoutesFromEnvironment();
+  return options;
+}
+
 std::unique_ptr<DrafterEngine> MakeDrafterEngine(const SpeculativeSetup& setup, const Model& model) {
   if (setup.engine_factory) return setup.engine_factory(setup, model);
   return MakeDefaultDrafterEngine(setup, model);
@@ -475,9 +483,7 @@ std::unique_ptr<DrafterEngine> MakeDrafterEngine(const SpeculativeSetup& setup, 
 std::unique_ptr<DrafterEngine> MakeDefaultDrafterEngine(const SpeculativeSetup& setup, const Model& model) {
 #if defined(RICURSIVE_HAVE_GPU_EXECUTOR)
   if (model.backend().uses_device) {
-    DrafterOptions options = setup.drafter_options;
-    options.kv_type = model.backend().kv_type;
-    options.exact = model.backend().exact;
+    const DrafterOptions options = EffectiveDrafterOptions(setup, model.backend());
     std::string error;
     auto engine = MakeGpuDrafterEngine(setup.weights, setup.reader, model.weights(), options, &error);
     if (!engine) throw std::runtime_error("the GPU drafter could not be built: " + error);

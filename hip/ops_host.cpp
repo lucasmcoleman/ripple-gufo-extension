@@ -43,7 +43,8 @@ class HostOps final : public Ops {
   explicit HostOps(const HostOpsOptions& options)
       : lenient_(options.lenient_capacity),
         poison_(options.poison_memory),
-        conv_across_block_start_(options.conv_across_block_start) {}
+        conv_across_block_start_(options.conv_across_block_start),
+        counters_(options.counters) {}
   ~HostOps() override {
     for (auto& [ptr, block] : blocks_) std::free(block.raw);
   }
@@ -99,7 +100,11 @@ class HostOps final : public Ops {
     if (!bad.empty()) Fail("Synchronize", bad);
   }
   bool Usable() noexcept override { return true; }
-  void ReserveProjection(std::size_t, std::size_t) override {}
+  /// No scratch is allocated on the host; the size the GPU would hold is tracked with the same formula (rocm::Q8ActivationBytes).
+  void ReserveProjection(std::size_t rows, std::size_t cols) override {
+    scratch_bytes_ = std::max(scratch_bytes_, km::Q8ActivationBytes(rows, cols));
+  }
+  std::uint64_t ProjectionScratchBytes() const noexcept override { return scratch_bytes_; }
 
   // ---- operators --------------------------------------------------------
   void EmbedRows(const EmbeddingTable& table,
@@ -191,6 +196,20 @@ class HostOps final : public Ops {
 
   void Project(const WeightView& w, const float* x, int rows, float* y,
                bool /*exact*/) override {
+    if (counters_ != nullptr) ++counters_->project;
+    ProjectRows(w, x, rows, y);
+  }
+  /// The host has no model of the Q8_1 activation rounding: the result is Project's (sums in double over the exact
+  /// activations); the call is counted so that the route selection can be tested.
+  void ProjectQ8(const WeightView& w, const float* x, int rows, float* y) override {
+    if (counters_ != nullptr) {
+      ++counters_->project_q8;
+      counters_->q8_rows += static_cast<std::uint64_t>(std::max(rows, 0));
+      counters_->q8_weights.push_back(w.data);
+    }
+    ProjectRows(w, x, rows, y);
+  }
+  void ProjectRows(const WeightView& w, const float* x, int rows, float* y) {
     using core::GgmlType;
     const std::string type(core::ToString(w.type));
     switch (w.type) {
@@ -773,6 +792,8 @@ class HostOps final : public Ops {
   bool lenient_;
   bool poison_;
   bool conv_across_block_start_;
+  HostOpsCounters* counters_;
+  std::uint64_t scratch_bytes_{0};
   std::map<unsigned char*, Block> blocks_;
   std::string corruption_;
 };
