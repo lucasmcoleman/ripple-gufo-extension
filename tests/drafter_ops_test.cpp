@@ -147,19 +147,28 @@ Backend& TheBackend() {
   return b;
 }
 
-std::unique_ptr<OpsDrafterEngine> MakeEngine(const Drafter& d, const ricursive_test::Model& target, const DrafterOptions& requested,
-                                             const DrafterExecFaults& faults = {}, const HostOpsOptions& host = {}) {
+/// The options an engine really runs with on this back end: the host runs what is asked for; the GPU forces `exact` to the
+/// back end's mode (gpu-exact: FP32 activations at every row count, no projection scratch; gpu: the production route, which
+/// plans scratch). Every expectation that depends on the plan (DrafterSessionBytes) must be computed from these, not from the
+/// requested options: with `exact` requested differently the plan differs by the scratch (review of stage 2b, findings 1 and 2).
+/// gpu-exact: exact=true; gpu: exact=false; cpu: as requested.
+DrafterOptions EffectiveOptions(const DrafterOptions& requested) {
   DrafterOptions options = requested;
   if (const char* kernel = std::getenv("RICURSIVE_TEST_ATTENTION")) options.attention_kernel = kernel;  // by name (stage 2c)
+  if (TheBackend().gpu) options.exact = !TheBackend().f16;
+  return options;
+}
+
+std::unique_ptr<OpsDrafterEngine> MakeEngine(const Drafter& d, const ricursive_test::Model& target, const DrafterOptions& requested,
+                                             const DrafterExecFaults& faults = {}, const HostOpsOptions& host = {}) {
+  const DrafterOptions options = EffectiveOptions(requested);
   if (!TheBackend().gpu) return MakeHostOpsDrafterEngine(d.w, target.weights, options, faults, host);
   Require(!host.conv_across_block_start, "the convolution twin exists on the host operations only");
   // The GPU executor of the drafter is built by the factory (weights uploaded once per drafter); the faults are
   // executor options, so build the executor here from the same pieces when a fault is asked for.
   std::string error;
   std::shared_ptr<const gufo::core::GgufReader> target_reader(target.reader.get(), [](const gufo::core::GgufReader*) {});
-  DrafterOptions gpu_options = options;
-  gpu_options.exact = !TheBackend().f16;  // gpu-exact: FP32 activations at every row count
-  auto engine = MakeGpuDrafterEngineWithHead(d.w, d.reader, target.weights, target_reader, gpu_options, &error, faults);
+  auto engine = MakeGpuDrafterEngineWithHead(d.w, d.reader, target.weights, target_reader, options, &error, faults);
   Require(engine != nullptr, "GPU drafter: " + error);
   auto* ops = dynamic_cast<OpsDrafterEngine*>(engine.get());
   Require(ops != nullptr, "the GPU drafter engine is an OpsDrafterEngine");
@@ -706,7 +715,7 @@ void CheckAccounting(const Tiny& t, const Drafter& d) {
           o.ring_slack = slack;
           o.max_append_rows = append;
           auto engine = MakeEngine(d, t.target, o);
-          const std::uint64_t want = DrafterSessionBytes(d.w.config, t.target.weights.output.rows, o);
+          const std::uint64_t want = DrafterSessionBytes(d.w.config, t.target.weights.output.rows, EffectiveOptions(o));
           Require(engine->DeviceBytes() == want, std::string("DeviceBytes() ") + std::to_string(engine->DeviceBytes()) + " but DrafterSessionBytes " +
                                                      std::to_string(want) + " (" + (kv == KvType::kF16 ? "F16" : "F32") + " rings, " +
                                                      (exact ? "exact, " : "") + "routes " + ToString(o.q8) + ", ring slack " + std::to_string(slack) +
@@ -860,7 +869,7 @@ int Real(int argc, char** argv) {
     DrafterExecutor& exec = engine->executor();
     const std::size_t F = d.w.config.FeatureWidth();
     {  // item 4: the memory plan equals what the executor holds, at the real configuration
-      const std::uint64_t claimed = DrafterSessionBytes(d.w.config, target.weights.output.rows, o), allocated = engine->DeviceBytes();
+      const std::uint64_t claimed = DrafterSessionBytes(d.w.config, target.weights.output.rows, EffectiveOptions(o)), allocated = engine->DeviceBytes();
       std::printf("  one session: %.2f MiB allocated (DeviceBytes, projection scratch %.2f MiB included), %.2f MiB claimed (DrafterSessionBytes)\n",
                   static_cast<double>(allocated) / 1048576.0, static_cast<double>(exec.ops().ProjectionScratchBytes()) / 1048576.0,
                   static_cast<double>(claimed) / 1048576.0);
