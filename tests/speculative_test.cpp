@@ -470,7 +470,14 @@ class ProposalCheck {
     while (ref_.ContextRows() < p) {
       ref_.AppendContext(truth_->Taps(ref_.ContextRows()), 1);
     }
-    const auto expect = ref_.DraftStep(sequence[p], p);
+    std::vector<float> logits;  // the reference's logits (the ops drafter's near-tie rule reads them)
+    std::size_t vocab = 0;
+    const auto expect = ref_.DraftStep(sequence[p], p, [&](std::string_view name, int, const float* d, std::size_t rows, std::size_t width) {
+      if (OpsDrafter() && name == "logits") {
+        logits.assign(d, d + rows * width);
+        vocab = width;
+      }
+    });
     const auto& got = backend.last_block();
     ++compared;
     if (got.context_first < base_ || got.context_end > p || got.context_first != expect.context_first || got.context_end != expect.context_end) {
@@ -483,8 +490,8 @@ class ProposalCheck {
     const std::size_t shared = std::min(got.tokens.size(), expect.tokens.size());
     while (row < shared && got.tokens[row] == expect.tokens[row]) ++row;
     if (row < shared || got.tokens.size() > expect.tokens.size()) {
-      // A different token is acceptable only at a near-tie of the reference's own scores (another engine rounds
-      // differently); the rows after it follow another path and are not compared.
+      // A different token is acceptable only at a near-tie of the reference's own scores or logits (another engine
+      // rounds differently); the rows after it follow another path and are not compared.
       const std::size_t KT = expect.candidates.size() / std::max<std::size_t>(expect.tokens.size(), 1);
       const auto score_of = [&](std::int32_t id) -> std::optional<float> {
         for (std::size_t i = 0; i < KT && row < expect.tokens.size(); ++i)
@@ -492,9 +499,31 @@ class ProposalCheck {
         return std::nullopt;
       };
       const auto a = row < shared ? score_of(got.tokens[row]) : std::nullopt, b = row < shared ? score_of(expect.tokens[row]) : std::nullopt;
-      if (OpsDrafter() && a && b && std::fabs(static_cast<double>(*a) - *b) <= 2e-3 * (1.0 + std::fabs(static_cast<double>(*b)))) {
+      const auto near = [](double x, double y) { return std::fabs(x - y) <= 2e-3 * (1.0 + std::fabs(y)); };
+      if (OpsDrafter() && a && b && near(*a, *b)) {
         ++g_proposal_ties;
         return "";
+      }
+      // The same near-tie at the top-k cut of the logits: a token whose logit is within the same tolerance of the
+      // KT-th largest can enter or leave the candidate set by rounding, after which the selector picks among a
+      // different set. Forgiven: the engine's token is not a reference candidate but its logit is at the cut, or the
+      // reference's token is at the cut and the engine's is the reference's best remaining candidate.
+      if (OpsDrafter() && row < shared && vocab != 0) {
+        const float* lr = logits.data() + row * vocab;
+        std::vector<float> ranked(lr, lr + vocab);
+        std::nth_element(ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(KT), ranked.end(), std::greater<float>());
+        const float out_best = ranked[KT];  // the (KT+1)-th largest logit
+        const float in_worst = *std::min_element(ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(KT));
+        const std::int32_t mine = got.tokens[row], theirs = expect.tokens[row];
+        bool best_remaining = a.has_value();
+        for (std::size_t i = 0; i < KT && best_remaining; ++i) {
+          const std::int32_t id = expect.candidates[row * KT + i];
+          if (id != theirs && id != mine && expect.scores[row * KT + i] > *a) best_remaining = false;
+        }
+        if ((!a && near(lr[mine], in_worst)) || (near(lr[theirs], out_best) && best_remaining)) {
+          ++g_proposal_ties;
+          return "";
+        }
       }
       ++mismatched;
       return "the block proposed at position " + std::to_string(p) + " differs from the reference's";
