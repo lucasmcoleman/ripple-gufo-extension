@@ -455,7 +455,7 @@ void MockTests(const TinyFixture& f, const DraftBackend& be) {
 class ProposalCheck {
  public:
   ProposalCheck(const SpeculativeSetup& setup, const EngineModel& model, const Truth& truth, std::uint32_t base)
-      : ref_(setup.weights, model.weights()), truth_(&truth), base_(base) {
+      : ref_(setup.weights, model.weights()), truth_(&truth), base_(base), exact_(model.backend().exact) {
     ref_.ResetTo(base);
   }
   std::string Check(DraftedSession& ds) {
@@ -504,10 +504,16 @@ class ProposalCheck {
         ++g_proposal_ties;
         return "";
       }
-      // The same near-tie at the top-k cut of the logits: a token whose logit is within the same tolerance of the
+      // The same near-tie at the top-k cut of the logits: a token whose logit is within a tolerance of the
       // KT-th largest can enter or leave the candidate set by rounding, after which the selector picks among a
       // different set. Forgiven: the engine's token is not a reference candidate but its logit is at the cut, or the
       // reference's token is at the cut and the engine's is the reference's best remaining candidate.
+      // Tolerance: production as the score rule (its logits differ from the reference's by up to 7.5e-3, 1e-3 of the row's
+      // largest, on tinyA); exact mode 1e-5 * (1 + |logit|): its logits differ by at most 6.3e-6 (8.5e-7 relative) on the
+      // tiny fixtures, the one real exact-mode cut tie measured 3.3e-6, the anchor-token twin's wrong drafts 6.3e-3 and
+      // more (stage 2d follow-up, 2026-11-12).
+      const double cut_rel = exact_ ? 1e-5 : 2e-3;
+      const auto at_cut = [cut_rel](double x, double y) { return std::fabs(x - y) <= cut_rel * (1.0 + std::fabs(y)); };
       if (OpsDrafter() && row < shared && vocab != 0) {
         const float* lr = logits.data() + row * vocab;
         std::vector<float> ranked(lr, lr + vocab);
@@ -520,8 +526,11 @@ class ProposalCheck {
           const std::int32_t id = expect.candidates[row * KT + i];
           if (id != theirs && id != mine && expect.scores[row * KT + i] > *a) best_remaining = false;
         }
-        if ((!a && near(lr[mine], in_worst)) || (near(lr[theirs], out_best) && best_remaining)) {
+        const bool enters = !a && at_cut(lr[mine], in_worst), leaves = at_cut(lr[theirs], out_best) && best_remaining;
+        if (enters || leaves) {
           ++g_proposal_ties;
+          ++cut_forgiven;
+          if (std::getenv("RICURSIVE_DIAG_CUT") != nullptr) DiagCut(ds, p, row, KT, lr, vocab, enters ? mine : theirs, enters ? in_worst : out_best, enters);
           return "";
         }
       }
@@ -530,13 +539,50 @@ class ProposalCheck {
     }
     return "";
   }
-  std::size_t compared{0}, mismatched{0}, range_wrong{0};
+  std::size_t compared{0}, mismatched{0}, range_wrong{0}, cut_forgiven{0};
 
  private:
+  /// RICURSIVE_DIAG_CUT: one line per proposal forgiven at the top-k cut, the reference's and the device's logits at the
+  /// cut (the device's from the same draft recomputed with a stage callback; "same" = it reproduced the proposal).
+  void DiagCut(DraftedSession& ds, std::uint32_t p, std::size_t row, std::size_t KT, const float* lr, std::size_t vocab,
+               std::int32_t tok, float other, bool enters) {
+    const auto& got = ds.backend().last_block();
+    std::vector<float> dl;
+    bool same = false;
+    if (auto* ops = dynamic_cast<OpsDrafterEngine*>(&ds.engine())) {
+      const auto d = ops->executor().DraftStep(static_cast<std::int32_t>(truth_->Sequence()[p]), p, static_cast<std::uint32_t>(got.tokens.size()),
+                                               [&](std::string_view name, int, const float* x, std::size_t rows, std::size_t width) {
+                                                 if (name == "logits" && width == vocab) dl.assign(x, x + rows * width);
+                                               });
+      same = d.tokens == got.tokens;
+    }
+    // the other token at the cut on the reference: the KT-th (enters) or (KT+1)-th (leaves) largest logit
+    std::int32_t other_tok = -1;
+    for (std::size_t i = 0; i < vocab; ++i)
+      if (lr[i] == other && static_cast<std::int32_t>(i) != tok) other_tok = static_cast<std::int32_t>(i);
+    double maxdiff = 0.0, maxabs = 0.0;
+    float d_tok = NAN, d_other = NAN;
+    if (dl.size() >= (row + 1) * vocab) {
+      const float* dr = dl.data() + row * vocab;
+      for (std::size_t i = 0; i < vocab; ++i) {
+        maxdiff = std::max(maxdiff, std::fabs(static_cast<double>(dr[i]) - lr[i]));
+        maxabs = std::max(maxabs, std::fabs(static_cast<double>(lr[i])));
+      }
+      d_tok = dr[tok];
+      d_other = other_tok >= 0 ? dr[other_tok] : NAN;
+    }
+    const double gap = std::fabs(static_cast<double>(lr[tok]) - other);
+    std::printf("DIAG-CUT %s p %u row %zu KT %zu %s: token %d ref %.9g dev %.9g | other %d ref %.9g dev %.9g | ref gap %.3g abs %.3g rel | "
+                "dev gap %.3g | row max |dev-ref| logit %.3g abs %.3g rel | recomputed draft same: %s\n",
+                exact_ ? "exact" : "prod", p, row, KT, enters ? "enters" : "leaves", tok, lr[tok], d_tok, other_tok, other, d_other, gap,
+                gap / (1.0 + std::fabs(static_cast<double>(other))), std::fabs(static_cast<double>(d_tok) - d_other), maxdiff,
+                maxabs > 0 ? maxdiff / maxabs : 0.0, same ? "yes" : "no");
+  }
   DrafterReference ref_;
   const Truth* truth_;
   std::uint32_t base_;
   std::size_t seen_{0};
+  bool exact_{false};
 };
 
 /// The invariants of the drafter's context after every step: it ends exactly at the session's
@@ -603,7 +649,7 @@ void RealTests(const TinyFixture& f, const DraftBackend& be, const std::string& 
   // The scalar reference's own fault; the executor's twins are in tests/drafter_ops_test.cpp.
   if (!OpsDrafter()) twins.push_back({"context one row short", [](SpeculativeSetup& s) { s.engine_faults.context_one_row_short = true; }});
   for (const Twin& twin : twins) {
-    std::size_t twin_proposals = 0, twin_wrong = 0, exact_failures = 0;
+    std::size_t twin_proposals = 0, twin_wrong = 0, twin_cut = 0, exact_failures = 0;
     for (const std::uint32_t d : {1u, 3u, 7u}) {
       auto setup = std::make_shared<SpeculativeSetup>(*base_setup);
       setup->max_draft_tokens = d;
@@ -624,12 +670,13 @@ void RealTests(const TinyFixture& f, const DraftBackend& be, const std::string& 
       Require(ds.health().failures() == 0 && ds.ingest().failures() == 0, "a twin must not make the drafter fail (the fallback would hide it)");
       twin_proposals += ds.backend().proposals();
       twin_wrong += check.mismatched + check.range_wrong;
+      twin_cut += check.cut_forgiven;
     }
     Require(exact_failures == 0, be.name + "/" + f.name + ": the twin '" + twin.name + "' changed the output (the verifier must absorb a bad draft)");
     Require(twin_wrong > 0, be.name + "/" + f.name + ": the twin '" + twin.name + "' passed the proposal check");
     Require(twin_wrong * 2 >= twin_proposals, be.name + "/" + f.name + ": the twin '" + twin.name + "' left most proposals equal to the reference's");
-    std::printf("  %s/%s: 3. twin '%s': output still exact, %zu of %zu proposals differ from the reference\n", be.name.c_str(), f.name.c_str(), twin.name,
-                twin_wrong, twin_proposals);
+    std::printf("  %s/%s: 3. twin '%s': output still exact, %zu of %zu proposals differ from the reference (%zu more forgiven at the top-k cut)\n",
+                be.name.c_str(), f.name.c_str(), twin.name, twin_wrong, twin_proposals, twin_cut);
   }
 }
 
