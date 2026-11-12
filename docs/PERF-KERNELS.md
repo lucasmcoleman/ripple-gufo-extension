@@ -151,3 +151,49 @@ sw.attention stage in the real-model runs moved 1739 -> 1918 ms per pass with un
 
 GPU time at the end of round 3: see `perf/gpu-use.log` (46 wrapped runs, 20.2 minutes, plus the gate script's own lock time); no
 refusals in round 3.
+
+## 9 to 16 rows in one weight pass: measured, not adopted (job 1692, 2026-11-12, branch `drafter-s2e`)
+
+Question: `Project` sends 9..16 rows to `LaunchBatchedQuantGEMMFp32`, which reads the weights in 8-row passes. Would
+`LaunchKQuantSmallBatchDoubleStage` (16 waves x 3 rows, one tile per stage past 8 rows; vendored, never dispatched above
+one row) be faster in one pass? Bench mode `ricursive_kernel_bench gemm16 [REPS]` (`tools/kernel_bench.cpp`; exit 4 on a
+difference): every distinct K-quant (type, shape) the DFlash2 Q4_K_M drafter (GGUF header) and the target's verify
+multiply, synthetic weights (random bytes, fp16 scales 2^-9..2^-6), rotating >= 192 MB of weight copies, split and one
+pass alternating in one process (order swapped each repetition), each call synchronised, after a warm-up over every copy.
+Logs: `perf/gemm16-20261112/02-gemm16-before.log` (40 reps) and `03-gemm16-repeat.log` (60 reps).
+
+Bit-equality: 14 (type, shape) x rows 9, 12, 15, 16 x 3 seeds = 168 cases, outputs `memcmp`-equal in all 168
+(activations with zeros, denormals, values up to 1e30, an all-zero row, an all-denormal row; outputs poisoned with two
+different patterns).
+
+Speed, rows 16 (head also 15), median us, run 1 / run 2 (positive = one pass faster):
+
+| type | shape (M x K) | split | one pass | one pass vs split |
+|---|---|---|---|---|
+| Q4_K | 1024 x 5120 | 74.1 / 74.0 | 59.1 / 59.3 | +20.2 / +19.9 % |
+| Q4_K | 10240 x 5120 | 388.6 / 407.5 | 378.3 / 390.3 | +2.6 / +4.2 % |
+| Q4_K | 256 x 5120 | 52.5 / 53.2 | 42.6 / 42.3 | +18.9 / +20.5 % |
+| Q4_K | 2560 x 5120 | 105.9 / 105.1 | 120.0 / 119.9 | -13.3 / -14.1 % |
+| Q4_K | 40960 x 5120 | 1553.9 / 1548.6 | 1377.9 / 1364.0 | +11.3 / +11.9 % |
+| Q4_K | 5120 x 10240 | 502.1 / 452.5 | 380.1 / 362.9 | +24.3 / +19.8 % |
+| Q4_K | 5120 x 25600 | 1264.8 / 1247.1 | 872.1 / 852.2 | +31.0 / +31.7 % |
+| Q4_K | 5120 x 40960 | 1958.4 / 1977.6 | 1393.4 / 1416.8 | +28.8 / +28.4 % |
+| Q6_K | 1024 x 5120 | 58.3 / 58.6 | 69.8 / 69.7 | -19.7 / -19.0 % |
+| Q6_K | 5120 x 40960 | 1995.6 / 1935.7 | 2081.7 / 2020.5 | -4.3 / -4.4 % |
+| Q6_K | 5120 x 10240 | 492.7 / 488.9 | 498.6 / 485.1 | -1.2 / +0.8 % |
+| Q6_K | 100352 x 5120, 15 rows | 4189.3 / 4046.6 | 3878.7 / 3582.6 | +7.4 / +11.5 % |
+| Q6_K | 100352 x 5120, 16 rows | 4200.6 / 4061.8 | 3908.8 / 3665.2 | +6.9 / +9.8 % |
+| Q5_K | 40960 x 5120 | 1574.0 / 1512.1 | 1615.3 / 1538.2 | -2.6 / -1.7 % |
+| Q5_K | 5120 x 40960 | 1619.5 / 1610.7 | 1871.1 / 1804.0 | -15.5 / -12.0 % |
+
+Rule fixed before measuring: a type moves to one pass only if every bit-equality case passes AND its median is at least
+5 % faster on every shape of that type the models use. Bit-equality holds for all three types; speed fails for each:
+Q4_K on 2560 x 5120 (-13 %) and 10240 x 5120 (+3 to +4 %), Q6_K on 1024 x 5120, 5120 x 40960 and 5120 x 10240, Q5_K on
+both shapes. **Nothing changed in `Project`.**
+
+Why the expected gain is not there: on the shapes of 5120 x 10240 and larger the 16-row one pass streams the weights at only 75..118 GB/s
+(40960 x 5120 Q4_K: 16 rows x 2 FLOP x 210 M weights in 1.37 ms = 4.9 TFLOP/s), so at 16 rows both routes are limited by the kernel's FP32 dequantise-and-FMA
+work, not by reading the weights twice. The split route's times match the real-model profile (gate/up 1.55 ms x 10 =
+15.5 ms against 14.90 measured; down 9.9 against 10.22), so the bench reproduces the stage. Even switching only the shapes
+that win would save about 4.2 ms of the block (3 Q4_K + 2 Q6_K layers, from these deltas) plus 0.3..0.5 ms of head, not
+the 10..19 ms estimated from the traffic.

@@ -4,6 +4,8 @@
 //   kernel_bench attn  KEYS [sliding|full] [REPS]      Attention128, 1 row, 80 heads / 8 KV heads, F16 caches
 //   kernel_bench proj  TYPE M K [REPS]                 Project, 1 row; TYPE = q4k|q5k|q6k|q8_0
 //   kernel_bench suite                                 every case listed in the task brief
+//   kernel_bench gemm16 [REPS]                         9..16 rows: split 8-row passes vs one DoubleStage pass,
+//                                                      memcmp bit-equality and alternating timing (exit 4 on a diff)
 //
 // Each case rotates over several distinct weight / cache copies (so the data is not warm in cache,
 // like a real token that streams 40 GB), times batches of 8 launches with hip events, reports the
@@ -20,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "hip/ggml/gemm.hpp"
 #include "hip/kernels.hpp"
 #include "hip/project.hpp"
 
@@ -312,6 +315,167 @@ void RunProjection(const std::string& tname, int M, int K, int reps) {
   HCHECK(hipFree(y));
 }
 
+// ---- 9..16 rows: split 8-row passes against one LaunchKQuantSmallBatchDoubleStage pass (gemm16-20261112) ----
+
+/// Synthetic K-quant weights: random bytes, every fp16 block scale set to 2^-9..2^-6 (as RunProjection).
+std::vector<std::uint8_t> RandomKQuant(GgmlType type, std::size_t bytes, Rng& rng) {
+  const std::size_t block_bytes = type == GgmlType::kQ4_K ? 144 : type == GgmlType::kQ5_K ? 176 : 210;
+  std::vector<std::size_t> scale_off = type == GgmlType::kQ6_K ? std::vector<std::size_t>{208}
+                                                               : std::vector<std::size_t>{0, 2};
+  std::vector<std::uint8_t> host(bytes + k::kWeightTailBytes, 0);
+  for (std::size_t i = 0; i < bytes; i += 4) {
+    const std::uint32_t r = rng.Next() | (rng.Next() << 16);
+    std::memcpy(&host[i], &r, std::min<std::size_t>(4, bytes - i));
+  }
+  for (std::size_t b = 0; b < bytes / block_bytes; ++b) {
+    for (std::size_t off : scale_off) {
+      const std::uint16_t h = static_cast<std::uint16_t>(0x2000 + (rng.Next() & 0x0FFF));
+      std::memcpy(&host[b * block_bytes + off], &h, 2);
+    }
+  }
+  return host;
+}
+
+/// 16 activation rows of K: uniform [-1, 1) with zeros, denormals and large values mixed in; row 3 all zeros,
+/// row 5 all denormals, row 7 mostly large values (1e3 .. 1e30, both signs).
+std::vector<float> SpecialX(std::size_t k, Rng& rng) {
+  std::vector<float> x(16 * k);
+  const float denormals[4] = {1.0e-39F, -1.4e-45F, 5.9e-39F, -2.3e-41F};
+  const float large[5] = {1.0e3F, -3.7e6F, 2.5e12F, -8.1e20F, 1.0e30F};
+  for (std::size_t r = 0; r < 16; ++r) {
+    for (std::size_t c = 0; c < k; ++c) {
+      float v = rng.Unit();
+      const std::uint32_t pick = rng.Next() % 64;
+      if (pick == 0) v = 0.0F;
+      else if (pick == 1) v = denormals[rng.Next() % 4];
+      else if (pick == 2) v = large[rng.Next() % 5] * (rng.Next() % 2 ? 1.0F : -1.0F);
+      if (r == 3) v = 0.0F;
+      if (r == 5) v = denormals[rng.Next() % 4];
+      if (r == 7 && rng.Next() % 4 != 0) v = large[rng.Next() % 5] * (rng.Next() % 2 ? 1.0F : -1.0F);
+      x[r * k + c] = v;
+    }
+  }
+  return x;
+}
+
+struct Gemm16Case {
+  GgmlType type;
+  int m, k;
+  std::vector<int> time_rows;  ///< row counts timed (16 for the block shapes, 15 and 16 for the head)
+  const char* use;
+};
+
+/// Returns false if any bit-equality case failed. `reps` timed samples per method and row count.
+bool RunGemm16(const Gemm16Case& c, int reps) {
+  namespace gg = gufo::models::ricursive::ggml;
+  const char* tname = c.type == GgmlType::kQ4_K ? "Q4_K" : c.type == GgmlType::kQ5_K ? "Q5_K" : "Q6_K";
+  const std::size_t M = static_cast<std::size_t>(c.m), K = static_cast<std::size_t>(c.k);
+  const std::size_t bytes = M * k::RowBytes(c.type, K);
+  const int copies = static_cast<int>(std::max<std::size_t>(3, std::min<std::size_t>(40, (192u << 20) / bytes)));
+  Rng rng{0x6E3316ULL + M * 131 + K * 7 + static_cast<std::uint64_t>(c.type)};
+  std::vector<void*> w(copies);
+  for (int i = 0; i < copies; ++i) {
+    const auto host = RandomKQuant(c.type, bytes, rng);
+    HCHECK(hipMalloc(&w[i], host.size()));
+    HCHECK(hipMemcpy(w[i], host.data(), host.size(), hipMemcpyHostToDevice));
+  }
+  float *x, *ya, *yb;
+  HCHECK(hipMalloc(&x, 16 * K * 4));
+  HCHECK(hipMalloc(&ya, 16 * M * 4));
+  HCHECK(hipMalloc(&yb, 16 * M * 4));
+  const auto split = [&](int copy, std::size_t rows, float* y) {
+    gg::LaunchBatchedQuantGEMMFp32(c.type, w[copy], x, y, rows, M, K, nullptr);
+  };
+  const auto one = [&](int copy, std::size_t rows, float* y) {
+    if (!gg::LaunchKQuantSmallBatchDoubleStage(c.type, w[copy], x, y, rows, M, K, nullptr)) {
+      std::fprintf(stderr, "LaunchKQuantSmallBatchDoubleStage refused %s %dx%d rows %zu\n", tname, c.m, c.k, rows);
+      std::exit(3);
+    }
+  };
+  // Bit-equality: 3 seeds (weight copy + activations), rows 9, 12, 15, 16; outputs poisoned with different
+  // patterns so an element neither pass writes still differs.
+  bool all_ok = true;
+  int cases = 0, passed = 0;
+  std::vector<float> ha(16 * M), hb(16 * M);
+  for (int seed = 0; seed < 3; ++seed) {
+    Rng xr{0xA11CE5ULL + static_cast<std::uint64_t>(seed) * 7919 + K};
+    const auto hx = SpecialX(K, xr);
+    HCHECK(hipMemcpy(x, hx.data(), hx.size() * 4, hipMemcpyHostToDevice));
+    for (std::size_t rows : {std::size_t{9}, std::size_t{12}, std::size_t{15}, std::size_t{16}}) {
+      HCHECK(hipMemset(ya, 0xFF, 16 * M * 4));
+      HCHECK(hipMemset(yb, 0xFE, 16 * M * 4));
+      split(seed % copies, rows, ya);
+      one(seed % copies, rows, yb);
+      HCHECK(hipDeviceSynchronize());
+      HCHECK(hipMemcpy(ha.data(), ya, rows * M * 4, hipMemcpyDeviceToHost));
+      HCHECK(hipMemcpy(hb.data(), yb, rows * M * 4, hipMemcpyDeviceToHost));
+      ++cases;
+      if (std::memcmp(ha.data(), hb.data(), rows * M * 4) == 0) {
+        ++passed;
+        continue;
+      }
+      all_ok = false;
+      std::size_t i = 0;
+      while (std::memcmp(&ha[i], &hb[i], 4) == 0) ++i;
+      std::size_t ndiff = 0;
+      for (std::size_t j = 0; j < rows * M; ++j) ndiff += std::memcmp(&ha[j], &hb[j], 4) != 0;
+      std::printf("gemm16 DIFF %s %dx%d seed %d rows %zu: first at row %zu col %zu split %.9g one-pass %.9g; %zu of %zu differ\n",
+                  tname, c.m, c.k, seed, rows, i / M, i % M, ha[i], hb[i], ndiff, rows * M);
+    }
+  }
+  std::printf("gemm16 biteq %s %6dx%-6d rows 9,12,15,16 x 3 seeds: %d of %d cases memcmp-equal  %s  (%s)\n", tname, c.m,
+              c.k, passed, cases, passed == cases ? "PASS" : "FAIL", c.use);
+  // Timing: split and one pass alternating (order swapped every repetition), each call synchronised, rotating weights.
+  {
+    Rng xr{0x7173ULL + K};
+    std::vector<float> hx(16 * K);
+    for (auto& v : hx) v = xr.Unit();
+    HCHECK(hipMemcpy(x, hx.data(), hx.size() * 4, hipMemcpyHostToDevice));
+  }
+  hipEvent_t ea, eb;
+  HCHECK(hipEventCreate(&ea));
+  HCHECK(hipEventCreate(&eb));
+  for (int rows : c.time_rows) {
+    int n = 0;
+    const auto sample = [&](bool use_one) {
+      const int copy = n++ % copies;
+      HCHECK(hipDeviceSynchronize());
+      HCHECK(hipEventRecord(ea, nullptr));
+      if (use_one) one(copy, static_cast<std::size_t>(rows), ya);
+      else split(copy, static_cast<std::size_t>(rows), ya);
+      HCHECK(hipEventRecord(eb, nullptr));
+      HCHECK(hipEventSynchronize(eb));
+      float ms = 0;
+      HCHECK(hipEventElapsedTime(&ms, ea, eb));
+      return ms * 1000.0;
+    };
+    for (int i = 0; i < 2 * copies + 4; ++i) (void)sample(i % 2 == 1);  // warm-up, both methods, every copy
+    std::vector<double> ts, to;
+    for (int r = 0; r < reps; ++r) {
+      if (r % 2 == 0) {
+        ts.push_back(sample(false));
+        to.push_back(sample(true));
+      } else {
+        to.push_back(sample(true));
+        ts.push_back(sample(false));
+      }
+    }
+    const double ms_ = Median(ts), mo = Median(to);
+    std::printf("gemm16 time %s %6dx%-6d rows %2d: split median %8.1f us min %8.1f | one-pass median %8.1f us min %8.1f"
+                " | one/split %.3f (%+.1f %%) | one-pass %.1f GB/s  (%d reps each, %d weight copies; %s)\n",
+                tname, c.m, c.k, rows, ms_, *std::min_element(ts.begin(), ts.end()), mo,
+                *std::min_element(to.begin(), to.end()), mo / ms_, (ms_ - mo) / ms_ * 100.0,
+                static_cast<double>(bytes) / (mo * 1e-6) / 1e9, reps, copies, c.use);
+  }
+  HCHECK(hipEventDestroy(ea));
+  HCHECK(hipEventDestroy(eb));
+  for (void* p : w) HCHECK(hipFree(p));
+  HCHECK(hipFree(x));
+  HCHECK(hipFree(ya));
+  HCHECK(hipFree(yb));
+  return all_ok;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -335,6 +499,30 @@ int main(int argc, char** argv) {
     RunAttentionRows(510, 0, 0, 3);
     RunAttentionRows(2048, 0, 0, 3);
     RunAttentionRows(2048, 2048, 0, 3);
+  } else if (mode == "gemm16") {
+    // Every distinct K-quant (type, shape) the drafter (DFlash2 Q4_K_M header) and the target (verify, same
+    // Project) multiply with 9..16 rows; the head at 15 (drafter, d = 15) and 16 rows (target verify).
+    const int reps = argc >= 3 ? std::atoi(argv[2]) : 40;
+    const std::vector<Gemm16Case> cases = {
+        {GgmlType::kQ4_K, 1024, 5120, {16}, "drafter attn_k/v"},
+        {GgmlType::kQ4_K, 10240, 5120, {16}, "drafter+target attn_q"},
+        {GgmlType::kQ4_K, 256, 5120, {16}, "drafter selector_hidden"},
+        {GgmlType::kQ4_K, 2560, 5120, {16}, "drafter conv_proj"},
+        {GgmlType::kQ4_K, 40960, 5120, {16}, "drafter+target ffn_gate/up"},
+        {GgmlType::kQ4_K, 5120, 10240, {16}, "drafter attn_output"},
+        {GgmlType::kQ4_K, 5120, 25600, {16}, "drafter fc"},
+        {GgmlType::kQ4_K, 5120, 40960, {16}, "drafter+target ffn_down"},
+        {GgmlType::kQ6_K, 1024, 5120, {16}, "drafter attn_v L2,L4"},
+        {GgmlType::kQ6_K, 5120, 40960, {16}, "drafter ffn_down L2,L4"},
+        {GgmlType::kQ6_K, 5120, 10240, {16}, "target attn_output"},
+        {GgmlType::kQ6_K, 100352, 5120, {15, 16}, "head"},
+        {GgmlType::kQ5_K, 40960, 5120, {16}, "target ffn_gate/up"},
+        {GgmlType::kQ5_K, 5120, 40960, {16}, "target ffn_down"},
+    };
+    bool ok = true;
+    for (const auto& c : cases) ok = RunGemm16(c, reps) && ok;
+    std::printf("gemm16 bit-equality overall: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 4;
   } else if (mode == "attn-suite") {
     RunAttention(540, true, 60);
     RunAttention(1024, true, 60);
