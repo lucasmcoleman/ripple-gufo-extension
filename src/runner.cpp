@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <gufo/ext/gguf_identity.hpp>
@@ -429,6 +430,24 @@ std::shared_ptr<const SpeculativeSetup> LoadSpeculativeSetup(const std::string& 
     auto setup = std::make_shared<SpeculativeSetup>();
     setup->reader = std::move(reader);
     setup->weights = std::move(*weights);
+    // Measurement aid: RICURSIVE_MAX_DRAFT (1 .. kMaxVerifyRows - 1) replaces the length passed in. Not a setting.
+    if (const char* env = std::getenv("RICURSIVE_MAX_DRAFT")) {
+      const std::string text = env;
+      std::uint32_t value = 0;
+      bool ok = !text.empty() && text.size() <= 3;
+      for (const char c : text) {
+        if (c < '0' || c > '9') ok = false;
+        else value = value * 10 + static_cast<std::uint32_t>(c - '0');
+      }
+      if (!ok || value < 1 || value > kMaxVerifyRows - 1) {
+        SetError(error, "RICURSIVE_MAX_DRAFT=" + text + " is not a whole number from 1 to " +
+                            std::to_string(kMaxVerifyRows - 1));
+        return nullptr;
+      }
+      std::cerr << "ricursive: RICURSIVE_MAX_DRAFT=" << value << " overrides the draft length " << max_draft_tokens
+                << " (measurement aid)\n";
+      max_draft_tokens = value;
+    }
     setup->max_draft_tokens = std::clamp<std::uint32_t>(max_draft_tokens, 1, kMaxVerifyRows - 1);
     return setup;
   } catch (const std::exception& e) {
