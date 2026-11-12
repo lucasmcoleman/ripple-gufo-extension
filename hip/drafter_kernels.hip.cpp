@@ -77,8 +77,16 @@ __device__ __forceinline__ void LoadKeys8(const float* row, int c, float (&kf)[8
 /// grid (tokens, heads + 2 * kv_heads), block head_dim (one thread per dimension). Block index
 /// b < heads: a query head (norm, rotary, in place); the next kv_heads: a key head (norm, rotary,
 /// into k_store); the last kv_heads: a value head (into v_store). Norm: y = (x * (1 / sqrt(mean(x^2)
-/// + eps))) * gamma; rotary: NeoX half split, inv = 1 / theta^(2 pair / head_dim),
-/// angle = float(position) * inv, cosf / sinf (the drafter reference's float32 arithmetic).
+/// + eps))) * gamma; rotary: NeoX half split, inv = 1 / theta^(2 pair / head_dim) computed on the
+/// host (RopeInv), angle = float(position) * inv, cosf / sinf (the drafter reference's float32
+/// arithmetic).
+/// The per-pair factors, computed by the launcher with the host's powf exactly as the host operation
+/// and DrafterReference do: the device's powf differs from glibc's by 1 ulp in 13 of the 64 pairs of
+/// head_dim 128, and float(position) multiplies that into the angle (5e-4 at position 4,351).
+struct RopeInv {
+  float v[kDraftMaxHeadDim / 2];
+};
+
 template<class CacheT>
 __global__ void DraftQkNormRopeKernel(float* __restrict__ q, const float* __restrict__ k,
                                       const float* __restrict__ v,
@@ -88,7 +96,7 @@ __global__ void DraftQkNormRopeKernel(float* __restrict__ q, const float* __rest
                                       std::uint32_t heads, std::uint32_t kv_heads,
                                       std::uint32_t head_dim, float eps, std::uint32_t start_pos,
                                       std::uint32_t slot_start, std::uint32_t capacity, bool rope,
-                                      float theta) {
+                                      RopeInv inv_pair) {
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t b = blockIdx.y;
   const std::uint32_t d = threadIdx.x;
@@ -120,8 +128,7 @@ __global__ void DraftQkNormRopeKernel(float* __restrict__ q, const float* __rest
   if (rope) {
     const std::uint32_t half = head_dim / 2;
     const std::uint32_t pair = d < half ? d : d - half;
-    const float inv = 1.0F / powf(theta, static_cast<float>(2 * pair) / static_cast<float>(head_dim));
-    const float angle = static_cast<float>(start_pos + t) * inv;
+    const float angle = static_cast<float>(start_pos + t) * inv_pair.v[pair];
     const float c = cosf(angle), s = sinf(angle);
     const float xa = normed[pair], xb = normed[pair + half];
     out = d < half ? xa * c - xb * s : xb * c + xa * s;
@@ -652,14 +659,19 @@ bool DraftQkNormRope(float* q, const float* k, const float* v, const float* q_ga
       k_gamma == nullptr || k_store == nullptr || v_store == nullptr)
     return Fail(error, "DraftQkNormRope: null pointer");
   const dim3 grid(tokens, heads + 2 * kv_heads);
+  RopeInv inv{};
+  if (rope) {
+    for (std::uint32_t i = 0; i < head_dim / 2; ++i)  // as hip/ops_host.cpp and DrafterReference::Rope
+      inv.v[i] = 1.0F / std::pow(theta, static_cast<float>(2 * i) / static_cast<float>(head_dim));
+  }
   if (type == KvType::kF16) {
     DraftQkNormRopeKernel<__half><<<grid, head_dim, 0, stream>>>(
         q, k, v, q_gamma, k_gamma, static_cast<__half*>(k_store), static_cast<__half*>(v_store),
-        heads, kv_heads, head_dim, eps, start_pos, slot_start, capacity, rope, theta);
+        heads, kv_heads, head_dim, eps, start_pos, slot_start, capacity, rope, inv);
   } else {
     DraftQkNormRopeKernel<float><<<grid, head_dim, 0, stream>>>(
         q, k, v, q_gamma, k_gamma, static_cast<float*>(k_store), static_cast<float*>(v_store),
-        heads, kv_heads, head_dim, eps, start_pos, slot_start, capacity, rope, theta);
+        heads, kv_heads, head_dim, eps, start_pos, slot_start, capacity, rope, inv);
   }
   return Launched(error, "DraftQkNormRope");
 }

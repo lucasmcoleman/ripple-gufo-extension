@@ -93,6 +93,9 @@ The host operations and the kernels have the same loops, bounds, indexing and pa
    `DraftFinalizeKernel` is one block, 15 rows in sequence: its latency, not its throughput, is what a step pays (expected well under 1 ms).
 3. **`DraftQkNormRope`**: device `powf`, `cosf`, `sinf` (a few ulp from the host libm) and a wave-shuffle sum of squares (the host sums in double): relative 1e-7 differences, and the rotary angle
    `float(position) * inv` of positions above 4,096 loses what float32 loses, as the reference does.
+   **[Stage 2d, 2026-11-12, job 1692]** The device `powf` differed from glibc's by 1 ulp in 13 of the 64 pairs of head_dim 128 (3 of 16 at 32), and the position multiplied that into the angle
+   (q/K 4.9e-4 relative at position 4,351, 1.9e-3 at 16,384+; the first GPU run failed 10 and 11 of 40 checks). The launcher now computes the factors `inv` on the host with the host
+   operation's expression and passes them by value (`RopeInv`); angles are then bit-equal and cos/sin within 1 ulp (q/K 3.6e-7 at worst on the gate).
 4. **Projections**: `ops.Project` on the host dequantizes and sums in double and ignores `exact`; on the GPU rows <= 16 use the FP32 small-batch kernels and rows > 16 (context passes of 17 to 512 rows)
    the W8A8 GEMM unless `exact`. The gates' `gpu-exact` drafter has `exact` set; the production route (`gpu`, F16) and the real-weights comparison run the W8A8 route for long context passes, which
    changes the context K/V by the activation rounding (stage 3's measurement on the target: about 0.2 maximum absolute, mean KL 8e-4) and so can flip near-tie drafts: **a few token rows differing from
