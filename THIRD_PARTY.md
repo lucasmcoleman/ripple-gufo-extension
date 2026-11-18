@@ -28,7 +28,7 @@ The MIT licence of the Gemma 4 extension requires its notice with copied portion
     obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software
     without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute,
     sublicense, and/or sell copies of the Software, subject to the conditions of the full licence text in
-    /server/programming/gufo-ripple/ref-gemma4-ext/LICENSE (to be copied into LICENSES/ before release).
+    `LICENSES/gemma4-gufo-extension-MIT.txt`.
 
 ## Drafter stage 2: kernels adapted from gufo's Qwen DFlash2 drafter
 
